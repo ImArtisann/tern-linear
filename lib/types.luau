@@ -433,6 +433,9 @@ export type ProjectIssuesState = {
 	loading: boolean,
 	-- The last request failed (shown in the tab; what it had stays).
 	error: string?,
+	-- The list needs a full reload: a change it could not reload while hidden (a mutation, a change check's result)
+	-- or a full load that failed. The next show or poll tick reloads it.
+	stale: boolean,
 	-- The server filter's view (model.projectIssueFilter), like Prefs.view.
 	view: "active" | "backlog" | "all",
 	-- Client-side filters (IssueFilters); nil means "any".

@@ -706,7 +706,9 @@ local function issuesTab(state: BlockState, page: ProjectPageState, _project: Pr
 		end
 	end
 	local members, labels = issueOptions(state, tab.items)
-	local failedFirst = tab.fetchedAt == nil and tab.error ~= nil and not tab.loading
+	-- No load succeeded and no shown load runs (every first load is a shown one): the first load failed, whether its
+	-- error shows in the tab or in the page's banner (an env key's auth failure, a rate limit).
+	local failedFirst = tab.fetchedAt == nil and not tab.loading
 	local list: issueList.IssueList = {
 		items = tab.items,
 		truncated = tab.truncated,
@@ -719,8 +721,7 @@ local function issuesTab(state: BlockState, page: ProjectPageState, _project: Pr
 		team = nil,
 		members = members,
 		labels = labels,
-		-- Until the first load the tab shows the loading row too.
-		reloading = tab.loading or (tab.fetchedAt == nil and not failedFirst),
+		reloading = tab.loading,
 		emptyHelp = "all",
 		chromeRows = ISSUES_CHROME_ROWS + banners * BANNER_ROWS,
 	}
@@ -733,7 +734,7 @@ local function issuesTab(state: BlockState, page: ProjectPageState, _project: Pr
 			parts.banner("issues-error", "linear.project-issues-error", "error", "x-circle", failure)
 		)
 	end
-	-- A first load that failed has nothing to show but the error.
+	-- A first load that failed has nothing to show but the banners.
 	if not failedFirst then
 		for _, node in issueList.content(state, cx, list, visible, now) do
 			table.insert(children, node)

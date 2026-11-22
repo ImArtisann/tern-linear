@@ -249,6 +249,7 @@ function projectIssues.new(): types.ProjectIssuesState
 		maxUpdatedAt = nil,
 		loading = false,
 		error = nil,
+		stale = false,
 		view = "active",
 		priority = nil,
 		assignee = nil,
@@ -936,9 +937,13 @@ reloadData = function(state: BlockState, run: Run)
 end
 
 -- Authoritative reload after a mutation: the list on screen (issues mode's or the Issues tab's), and the drawer if open.
+-- A project page's hidden Issues tab (the mutation may have started there) is marked stale: its next show reloads it.
 local function reloadAfterMutation(state: BlockState, run: Run)
+	local page = state.projectPage
 	if model.issuesTab(state) ~= nil then
 		projectIssues.fetch(state, run, false)
+	elseif page ~= nil then
+		page.issues.stale = true
 	elseif not inProjects(state) then
 		reloadIssues(state, run)
 	end
@@ -1223,6 +1228,11 @@ local function closeProjectPage(state: BlockState, run: Run)
 		return
 	end
 	projectIssues.leave(state, run)
+	-- A comment draft typed on the Issues tab belongs to the tab's selection, never to issues mode's: once the tab
+	-- selected an issue, issues mode's own draft was already cleared (selectIssue), so the draft is the tab's.
+	if page.issues.selectedId ~= nil then
+		text.set(state.comment, "")
+	end
 	run.pageToken += 1
 	run.activityToken += 1
 	run.issuesToken += 1
@@ -1377,9 +1387,10 @@ function projectIssues.commit(state: BlockState, run: Run, tab: types.ProjectIss
 	end
 	tab.maxUpdatedAt = newestUpdate(updatedAts)
 	run.issuesFullAt = tern.now()
-	-- Like issues mode: a selection that left the list goes, unless the drawer still holds or loads it.
+	-- Like issues mode, a selection that left the list goes, but only the drawer open over this tab may keep it
+	-- (while it shows or loads that issue): a closed drawer's cached detail would leave it selected and actionable.
 	local id = tab.selectedId
-	if id == nil or state.detailLoading then
+	if id == nil then
 		return
 	end
 	for _, issue in tab.items do
@@ -1387,19 +1398,35 @@ function projectIssues.commit(state: BlockState, run: Run, tab: types.ProjectIss
 			return
 		end
 	end
+	local onScreen = model.issuesTab(state) == tab
 	local detail = state.detail
-	if detail ~= nil and detail.id == id then
+	if onScreen and state.drawerOpen and (state.detailLoading or (detail ~= nil and detail.id == id)) then
 		return
 	end
-	if model.issuesTab(state) == tab then
+	if onScreen then
 		clearSelection(state, run)
 	else
 		tab.selectedId = nil
 	end
 end
 
+-- The tab's server filter changed (view): the old filter's rows, watermark and selection go (the drawer open over
+-- the tab keeps its issue) and the new filter loads like a first load, so no key acts on rows of the old filter and a
+-- failed load leaves nothing to poll with the old watermark.
+function projectIssues.refilter(state: BlockState, run: Run, tab: types.ProjectIssuesState)
+	tab.items = {}
+	tab.truncated = false
+	tab.fetchedAt = nil
+	tab.maxUpdatedAt = nil
+	tab.error = nil
+	if not state.drawerOpen then
+		tab.selectedId = nil
+	end
+	projectIssues.fetch(state, run, true)
+end
+
 -- A full load of the open page's Issues tab. `shown` (first show, view change, `r`, Refresh) shows the loading row;
--- poll and post-mutation reloads stay silent. Failures show in the tab and keep what it had.
+-- poll, post-mutation and stale reloads stay silent. Failures show in the tab, keep what it had and leave it stale.
 function projectIssues.fetch(state: BlockState, run: Run, shown: boolean)
 	local page = state.projectPage
 	local cfg = run.cfg
@@ -1407,6 +1434,7 @@ function projectIssues.fetch(state: BlockState, run: Run, shown: boolean)
 		return
 	end
 	local tab = page.issues
+	tab.stale = false
 	run.issuesToken += 1
 	local token = run.issuesToken
 	run.issuesInFlight = true
@@ -1424,6 +1452,7 @@ function projectIssues.fetch(state: BlockState, run: Run, shown: boolean)
 			projectIssues.commit(state, live, tab, result)
 			tab.error = nil
 		else
+			tab.stale = true
 			fail(state, err or unknownError(), function(message: string)
 				tab.error = message
 			end)
@@ -1432,7 +1461,9 @@ function projectIssues.fetch(state: BlockState, run: Run, shown: boolean)
 	end)
 end
 
--- The tab's change check (IssuesChanged under its filter): something newer than its newest issue reloads it.
+-- The tab's change check (IssuesChanged under its filter): something newer than its newest issue reloads it, or
+-- marks it stale when the tab is no longer on screen. A successful check clears a failed check's error (checks run
+-- only while the last full load succeeded: a failed one leaves the tab stale).
 function projectIssues.check(state: BlockState, run: Run)
 	local page = state.projectPage
 	local cfg = run.cfg
@@ -1455,17 +1486,22 @@ function projectIssues.check(state: BlockState, run: Run)
 				tab.error = message
 			end)
 		else
+			tab.error = nil
 			local known = tab.maxUpdatedAt
 			if newest ~= nil and (known == nil or newest > known) then
-				projectIssues.fetch(state, live, false)
+				if model.issuesTab(state) == tab then
+					projectIssues.fetch(state, live, false)
+				else
+					tab.stale = true
+				end
 			end
 		end
 		state.cx:render()
 	end)
 end
 
--- Shows a tab; the Activity and Issues tabs load the first time they are shown (and after a failed first load).
--- Leaving the Issues tab closes its drawer.
+-- Shows a tab; the Activity and Issues tabs load the first time they are shown (and after a failed first load); a stale
+-- Issues tab reloads silently. Leaving the Issues tab closes its drawer.
 local function selectProjectTab(state: BlockState, run: Run, tab: types.ProjectTab?)
 	local page = state.projectPage
 	if page == nil or tab == nil then
@@ -1477,8 +1513,8 @@ local function selectProjectTab(state: BlockState, run: Run, tab: types.ProjectT
 	page.tab = tab
 	if tab == "activity" and page.activity == nil and not page.activityLoading then
 		fetchActivity(state, run, "shown")
-	elseif tab == "issues" and page.issues.fetchedAt == nil and not page.issues.loading then
-		projectIssues.fetch(state, run, true)
+	elseif tab == "issues" and (page.issues.stale or (page.issues.fetchedAt == nil and not page.issues.loading)) then
+		projectIssues.fetch(state, run, page.issues.fetchedAt == nil)
 	end
 end
 
@@ -1500,12 +1536,12 @@ local function refreshProjectTab(state: BlockState, run: Run)
 	end
 end
 
--- The poll tick on the Issues tab: a full reload before the first load and every FULL_RELOAD_MS, else the change check;
--- the open drawer's issue reloads beside it.
+-- The poll tick on the Issues tab: a full reload before the first load, when stale and every FULL_RELOAD_MS, else the
+-- change check; the open drawer's issue reloads beside it.
 function projectIssues.poll(state: BlockState, run: Run, page: types.ProjectPageState)
 	local tab = page.issues
 	if not run.issuesInFlight then
-		if tab.fetchedAt == nil or tern.now() - run.issuesFullAt >= FULL_RELOAD_MS then
+		if tab.fetchedAt == nil or tab.stale or tern.now() - run.issuesFullAt >= FULL_RELOAD_MS then
 			projectIssues.fetch(state, run, false)
 		else
 			projectIssues.check(state, run)
@@ -2445,7 +2481,7 @@ local function setView(state: BlockState, run: Run, value: any)
 	if tab ~= nil then
 		if parsed ~= nil and parsed ~= tab.view then
 			tab.view = parsed
-			projectIssues.fetch(state, run, true)
+			projectIssues.refilter(state, run, tab)
 		end
 		return
 	end

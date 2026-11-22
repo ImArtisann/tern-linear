@@ -1131,6 +1131,59 @@ async function scenario() {
 		await runner.shot(label);
 	});
 
+	// A comment typed on a project's Issues tab stays there: back in issues mode, reopening the drawer of the issue
+	// selected there shows no draft and posts nothing.
+	await runner.step("comment-draft-stays-on-tab", async () => {
+		const DRAFT = "Draft for the tab's issue only";
+		const selectedIssue = `${role("card")}[data-mark='selected']`;
+		const selectedId = async () => ISSUE_ID.exec(await t.text(selectedIssue))?.[0];
+		// Escape leaves the comment field, then closes the drawer; the selection stays (one more would clear it).
+		await t.key("Escape");
+		await t.wait(300);
+		if (await exists(role("drawer"))) await t.key("Escape");
+		await absent(role("drawer"));
+		await t.waitFor(selectedIssue, opened);
+		await t.key("p");
+		await present(role("project-card"));
+		await t.key("Escape");
+		await absent(SELECTED_CARD);
+		await t.key("j");
+		for (let i = 0; i < 6 && !(await t.text(SELECTED_CARD)).includes("Desktop app"); i += 1) await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await t.key("Enter");
+		await pageOpen("Desktop app");
+		await t.click(role("project-tab-issues"));
+		await present(`${role("project-issues")} ${role("board")}`);
+		await t.key("j");
+		await present(selectedIssue);
+		if ((await selectedId()) === opened) await t.key("j");
+		const tabIssue = await selectedId();
+		if (!tabIssue || tabIssue === opened) throw new Error(`no tab issue other than ${opened} selected: ${tabIssue}`);
+		await t.key("Enter");
+		await present(role("drawer"));
+		await t.waitFor(role("drawer"), issueNamed(tabIssue).title);
+		await t.key("c");
+		await t.type(DRAFT);
+		await t.waitFor(role("comment-editor"), DRAFT);
+		await t.key("Escape");
+
+		await t.key("i");
+		await absent(role("project-header"));
+		await present(role("board"));
+		await t.waitFor(selectedIssue, opened);
+		await t.key("Enter");
+		await present(role("drawer"));
+		await t.waitFor(role("drawer"), issueNamed(opened).title);
+		await see("Comments");
+		if ((await t.text(role("comment-editor"))).includes(DRAFT)) throw new Error(`${opened}'s drawer shows the draft typed for ${tabIssue}`);
+		const before = mark();
+		await t.key("c");
+		await t.key("Ctrl+Enter");
+		await t.key("Escape");
+		await settle();
+		assertEqual(opsSince(before, "CommentCreate").length, 0, "comments posted after reopening the drawer");
+	});
+
 	await runner.step("create-issue", async (label) => {
 		await closeDrawer();
 		const before = mark();
