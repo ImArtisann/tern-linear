@@ -9,7 +9,7 @@ Your Linear projects and issues as a native board in a [Tern](https://stencil.so
 ## What you get
 
 - **Projects** mode (the default): every project of your workspace on a board (one column per project status) or a sortable table, with health, lead, target date, progress and teams. **All projects**, **My projects** (you lead it or are a member) or one team's projects; **Active** (planned, in progress, paused), **Backlog** and **All** views; search plus lead and health filters.
-- **Project page**: open a project for its **Overview**: the summary, the project document as Markdown, its properties (status, health and when it was last updated, priority, lead, members, teams, start and target dates, progress, labels) and its milestones in Linear's order with status, progress and target date. **Back** returns to the list as you left it.
+- **Project page**: open a project for its **Overview**: the summary, the project document as Markdown, its properties (status, health and when it was last updated, priority, lead, members, teams, start and target dates at the precision set in Linear, progress, labels) and its milestones in Linear's order with status, progress and target date. **Back** returns to the list as you left it.
 - **Issues** mode: board (one column per workflow state) or sortable table, switched with one key.
 - **My issues** (assigned to you, across all teams) or any **team** scope.
 - **Active**, **Backlog** and **All** views. Closed issues appear in All only when closed in the last 14 days.
@@ -114,7 +114,7 @@ The setup screen, shown until a key is stored or supplied:
 ## Limits and known issues
 
 - A view loads at most 250 issues or 250 projects. When more match, the filter row shows `Showing first 250`; narrow the view, scope or filters.
-- Projects are read-only: the project page has the Overview only (no project issues, updates or activity yet), milestones are display-only, and there is no editing or creating projects. Archived projects are never shown in the list. A card shows at most five team keys; a project page shows at most 10 teams, 50 members, 25 labels and 50 milestones, and no issue count per milestone (Linear's API has no cheap count).
+- Projects are read-only: the project page has the Overview only (no project issues, updates or activity yet), milestones are display-only, and there is no editing or creating projects. Archived projects are never shown in the list. A card shows at most five team keys; a project page shows at most 10 teams, 50 members, 25 labels and 50 milestones (the count then reads `50+`), and no issue count per milestone (Linear's API has no cheap count).
 - An open project page reloads every 30 seconds; the project list behind it pauses its polling until you go back.
 - Project status changes, health and progress show within about 30 seconds only when Linear bumps the project's `updatedAt`; everything else catches up with the full reload every 5 minutes.
 - No drag and drop: Tern blocks have no pointer drag. Move cards with `[` / `]` or the State select.

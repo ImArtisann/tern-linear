@@ -64,7 +64,7 @@ Project operations and their measured cost (`x-complexity`, `bun run smoke:live`
 | `ProjectStatuses` | `organization { projectStatuses }` (a plain list) | 4 |
 | `Projects` | `projects(filter, first: 50, orderBy: updatedAt)`, `teams(first: 5)` per project | 850 |
 | `ProjectsChanged` | `projects(filter, first: 1, orderBy: updatedAt) { id updatedAt }` | 2 |
-| `Project` | `project(id)`: the list fields plus `content`, `healthUpdatedAt`, `teams(first: 10)`, `members(first: 50)`, `labels(first: 25)`, `projectMilestones(first: 50)` | 298 |
+| `Project` | `project(id)`: the list fields plus `content`, `healthUpdatedAt`, `startDateResolution`, `targetDateResolution`, `teams(first: 10)`, `members(first: 50)`, `labels(first: 25)`, `projectMilestones(first: 50)` with `pageInfo { hasNextPage }` | 355 |
 
 `Project.teams` is capped at 5 in `Projects` because each nested connection multiplies by the page size (5 × 50 rows); the board shows team keys only. `Project` (one project, the project page) affords larger caps. `IssueConnection` has no count, so milestones carry no issue count: it would take a nested `issues` page per milestone.
 
@@ -113,7 +113,7 @@ linear.rate(): RateInfo
 
 Error classification (`ApiError.kind`): `status == 0` or timeout → `network`; HTTP 401 or `AUTHENTICATION_ERROR` → `auth`; 403 or `FORBIDDEN` → `forbidden`; `RATELIMITED` at any status → `rate` (`retryAfterMs` from `retry-after` seconds, else reset headers minus now, floor 60 000); `Entity not found` / `ENTITY_NOT_FOUND` → `notfound`; `userError == true` or `INPUT_ERROR` → `input` with `userPresentableMessage`; anything else → `server`. A mutation payload with `success == false` is `server`. Messages never include the key.
 
-Normalization: `Issue.relations` merges `relations` (direction `outgoing`) and `inverseRelations` (direction `incoming`); `labels` drops nothing; `assignee` is nil when null (note `tern.json.decode` drops null members). `Team.states` is sorted by `model.STATE_TYPES` rank then `position`; group labels and inactive members are removed. `Project.summary` is Linear's short `description` (not the long `content` document); `health` is kept only for `onTrack`/`atRisk`/`offTrack`; `progress` is clamped to 0..1; `teams` are the first 5. `ProjectDetail.project` comes from the same normalizer (teams: first 10); `content` is `""` when null; project labels drop group labels; milestone `progress` is clamped to 0..1 and an unknown `status` reads as `unstarted`. Timeouts: 20 s per request.
+Normalization: `Issue.relations` merges `relations` (direction `outgoing`) and `inverseRelations` (direction `incoming`); `labels` drops nothing; `assignee` is nil when null (note `tern.json.decode` drops null members). `Team.states` is sorted by `model.STATE_TYPES` rank then `position`; group labels and inactive members are removed. `Project.summary` is Linear's short `description` (not the long `content` document); `health` is kept only for `onTrack`/`atRisk`/`offTrack`; `progress` is clamped to 0..1; `teams` are the first 5. `ProjectDetail.project` comes from the same normalizer (teams: first 10); `content` is `""` when null; `startDateResolution` / `targetDateResolution` are Linear's `DateResolutionType` (`month`, `quarter`, `halfYear`, `year`; nil for an exact date); project labels drop group labels; `milestonesTruncated` is the milestones' `hasNextPage`. Linear sends a milestone's `progress` as a percentage (0..100, unlike `Project.progress`): it is divided by 100 and clamped to 0..1; an unknown `status` reads as `unstarted`. Timeouts: 20 s per request.
 
 ### `lib/text.luau`
 
@@ -181,6 +181,9 @@ model.sortProjects(visible, key: string, asc: boolean): {Project}
 model.healthLabel(health: string?): string    -- "On track" …, "No update" for nil
 model.progressLabel(progress: number): string -- 0..1 → "62%" (rounded down, clamped)
 model.shortDate(date: string, now: number): string -- "YYYY-MM-DD" → "Mar 4", or "Mar 4, 2027" in another year
+model.resolvedDate(date: string, resolution: string?, now: number): string
+    -- a date at Linear's DateResolutionType: month "Sep 2026", quarter "Q3 2026", halfYear "H2 2026",
+    -- year "2026"; nil (exact) or unknown is model.shortDate
 
 -- Project page
 model.PROJECT_TABS: {{id: ProjectTab, label: string}} -- the tab bar, in order: {overview "Overview"}
@@ -217,7 +220,7 @@ Saved prefs (`save` / `restorePrefs`; anything invalid falls back to the default
 | `projectSort`, `projectSortAsc` | a `model.PROJECT_SORT_KEYS` key, boolean | `"updated"`, `false` |
 | `projectPage` | `{ id = <project id>, tab = <ProjectTab> }`, saved in projects mode only; an unknown tab restores as `"overview"` | none |
 
-A saved team that no longer exists falls back to My issues / All projects once the team list loads. A restored `projectPage` (mode projects) reopens the page: its `Project` request starts beside the first load and the page shows once the list is ready; a `notfound` answer shows the list with the notice `Project not found`.
+A saved team that no longer exists falls back to My issues / All projects once the team list loads. A restored `projectPage` (mode projects) reopens the page: its `Project` request starts beside the first load and the page shows once the list is ready; a `notfound` answer shows the list with the notice `Project not found`. A `notfound` that arrives while the first load still runs keeps its notice in `Run.readyNotice` until the list shows, so the notice's four seconds start then.
 
 State: projects mode keeps its list in `BlockState.projects: ProjectsState` (`items`, `statuses`, `truncated`, `fetchedAt`, `maxUpdatedAt`, `query`, `selectedId`), beside the issue fields. The project page keeps its own state next to it in `BlockState.projectPage: ProjectPageState?` (nil shows the list):
 
@@ -225,12 +228,12 @@ State: projects mode keeps its list in `BlockState.projects: ProjectsState` (`it
 | --- | --- |
 | `projectId` | the open project |
 | `tab` | `ProjectTab` (a `model.PROJECT_TABS` id); later tabs extend the union and the list, and keep their data in this record |
-| `detail` | `ProjectDetail?` (`project`, `content`, `healthUpdatedAt`, `members`, `labels`, `milestones` sorted by `model.sortMilestones`); nil until the first load |
+| `detail` | `ProjectDetail?` (`project`, `content`, `healthUpdatedAt`, `startDateResolution`, `targetDateResolution`, `members`, `labels`, `milestones` sorted by `model.sortMilestones`, `milestonesTruncated`); nil until the first load |
 | `loading` | a shown detail request is in flight (open, `r`, Refresh); poll reloads keep it false |
-| `error` | the last detail load failed (`linear.project-error` banner; what the page had stays) |
+| `error` | the last detail load failed (`linear.project-error` banner; what the page had stays); never a rate or auth message (those stay in `state.error`) |
 | `fetchedAt` | epoch seconds of the last detail load (the page's `Synced …` label) |
 
-Project page lifecycle: opening (`open-project`, `Enter`, table `activate`) needs the project in `ProjectsState.items`; it selects it, clears search focus, sets `projectPage` with the Overview tab and loads the detail. Until the detail arrives the header and properties show the list item. The detail has its own token (`Run.pageToken`, bumped on open, close and every reload) and never touches `busy`. `notfound` closes the page and shows `Project not found`; other failures go through the usual routing with the page's `error` as the inline target. Back (`project-back`, `Escape`, `Backspace`, `p`) clears `projectPage` and re-selects the project when the list holds it; scope, view, layout, sort, filters and search are untouched. Switching to issues mode closes the page. `resetData` (sign out, auth failure) clears it.
+Project page lifecycle: opening (`open-project`, `Enter`, table `activate`) needs the project in `ProjectsState.items`, and `Enter` needs it among the visible projects too (search and the lead/health filters keep a selection they hide); it selects it, clears search focus, sets `projectPage` with the Overview tab and loads the detail. Until the detail arrives the header and properties show the list item. The detail has its own token (`Run.pageToken`, bumped on open, close and every reload) and never touches `busy`. A successful detail clears the page's `error` only; `state.error` stays with the request that set it (a failed list load stays visible behind Back). `notfound` removes the project from `ProjectsState.items` and the selection, records it in `Run.goneProjects` so a list result from a request that started before then leaves it out (a later request's result is authoritative), closes the page and shows `Project not found`; other failures go through the usual routing with the page's `error` as the inline target. Back (`project-back`, `Escape`, `Backspace`, `p`) clears `projectPage` and re-selects the project when the list holds it; scope, view, layout, sort, filters and search are untouched. Switching to issues mode closes the page. `resetData` (sign out, auth failure) clears it.
 
 Modes: `mode=` / `p` / `i` switch modes. Entering a mode whose list was never loaded (or while a foreground load runs) loads it in the foreground (`reloading`, `Loading projects…` / `Loading issues…`); otherwise the cached list shows at once and reloads in the background. Switching to projects closes the drawer, the link input and any form; switching to issues closes the project page. Every load, poll and reload works on the active mode only; `refresh` reloads the statuses too.
 
@@ -240,9 +243,9 @@ Request discipline (learned from beads-tern):
 2. Background reads set `refreshing` only. They never gate keys or clicks. A background result is dropped if `generation` changed since it started.
 3. Every completion callback first checks liveness: the block's pane is still in `tern.pane.list()` and the run registry still maps the pane to this state (a restart reuses pane ids).
 4. Mutations are followed by an authoritative reload of the board (background) and, if the drawer is open, of the detail. No optimistic updates except applying the returned issue to the list.
-5. A failure sets `state.error` (banner) or `form.error` / `link.error` (inline). `auth` errors return to `phase = "setup"` with `setupError`. `rate` errors set `backoffUntil`.
+5. A failure sets `state.error` (banner) or, for a request with an inline target, that target (`form.error`, `link.error`, the project page's `error`). `auth` errors return to `phase = "setup"` with `setupError`, or (an env key) set `state.error`. `rate` errors set `backoffUntil` and only `state.error`, whose countdown `tick` updates: an inline target never receives a rate or auth message and keeps what it showed.
 
-Polling: every 30 s, when not busy/refreshing, no form open, focus not in `comment`/`form`/`link`, and not backing off: the active mode's change check (`changedSince(serverFilter, maxUpdatedAt)`, or `projectsChanged(projectServerFilter, projects.maxUpdatedAt)`); when it returns something newer, a background reload of that list. Every 5 minutes a background reload of the active mode's list regardless. While the drawer is open, the detail is reloaded on the same 30 s tick. While the project page is open the list's checks and reloads pause and the tick reloads the page's detail instead (unless one is in flight); the first tick after Back resumes the list (a full reload when 5 minutes have passed). In projects mode without loaded statuses the tick retries the foreground load. Polling stops when the block's pane is gone.
+Polling: every 30 s, when not busy/refreshing, no form open, focus not in `comment`/`form`/`link`, and not backing off: the active mode's change check (`changedSince(serverFilter, maxUpdatedAt)`, or `projectsChanged(projectServerFilter, projects.maxUpdatedAt)`); when it returns something newer, a background reload of that list. Every 5 minutes a background reload of the active mode's list regardless. While the drawer is open, the detail is reloaded on the same 30 s tick. While the project page is open the list's checks and reloads pause and the tick reloads the page's detail instead (unless one is in flight); a project change check still in flight when the page opened reloads nothing; the first tick after Back resumes the list (a full reload when 5 minutes have passed). In projects mode without loaded statuses the tick retries the foreground load. Polling stops when the block's pane is gone.
 
 Focus: `state.focus` decides which field gets keys. The controller sends `cx:frame({{"focus", view.fieldId(name)}})` when focus changes and `{"focus", tern.json.null}` when it clears; `ev.ev == "focus"` and `ev.ev == "edit"` are mapped back with `view.fieldName(ev.id)`.
 
@@ -431,7 +434,7 @@ E2E tests, CSS and screenshots rely on these. Every node listed carries `role` (
 | `linear.form-field`, `linear.field-<name>`, `linear.dialog-form` | form rows and controls | field label and control |
 | `linear.project-header` | project page header row (replaces the top bar) | |
 | `linear.project-back` | button | `Back` (keycap `esc`) |
-| `linear.project-name` | project name | the name, or `Loading project…` before a restored page's project is known |
+| `linear.project-name` | project name | the name; before a restored page's project is known `Loading project…`, or `Project unavailable` once its detail load failed |
 | `linear.project-status` | status dot (`linear.state-dot`, `mark` = status type) and name | `In Progress` |
 | `linear.project-open-url` / `linear.project-copy-url` / `linear.project-refresh` | header buttons | `Open in Linear`; icon only (`Copy link`); `Refresh` or `Synced 2m ago` |
 | `linear.project-tabs` | tab bar (`buttons`, one per `model.PROJECT_TABS` entry) | |
@@ -441,8 +444,8 @@ E2E tests, CSS and screenshots rely on these. Every node listed carries `role` (
 | `linear.project-content`, `linear.project-sidebar` | Overview columns (wide) | |
 | `linear.project-summary` | short summary (absent when empty) | the summary |
 | `linear.project-description` / `linear.project-description-empty` / `linear.project-description-loading` | project document | the Markdown; `No description`; a loading line |
-| `linear.project-heading` | section headings | `Properties`; `Milestones` and the count |
-| `linear.project-props`, `linear.project-prop` | property list and rows (`key = prop-<name>`: status, health, priority, lead, members, teams, start, target, progress, labels) | `Status`, `Health` (`updated 3d ago`; `No update`), `Priority`, `Lead` (`No lead`), `Members` (`No members`), `Teams`, `Start date`, `Target date` (`Not set`), `Progress`, `Labels` |
+| `linear.project-heading` | section headings | `Properties`; `Milestones` and the count (`50+` when Linear has more than the first 50) |
+| `linear.project-props`, `linear.project-prop` | property list and rows (`key = prop-<name>`: status, health, priority, lead, members, teams, start, target, progress, labels) | `Status`, `Health` (`updated 3d ago`; `No update`), `Priority`, `Lead` (`No lead`), `Members` (`No members`), `Teams`, `Start date`, `Target date` (`Not set`; at Linear's precision once the detail loaded: `Dec 22`, `Sep 2026`, `Q3 2026`, `H2 2026`, `2026`), `Progress`, `Labels` |
 | `linear.project-meter`, `linear.project-labels` | progress meter; label chips | `62%`; label names |
 | `linear.milestones` | milestones section (sidebar) | heading `Milestones` and the count |
 | `linear.milestone` | one milestone row, `key` = the milestone id, `mark` = its status (`unstarted`, `next`, `overdue`, `done`); the hook for milestone actions | |

@@ -651,6 +651,26 @@ function model.shortDate(date: string, now: number): string
 	return if year == currentYear then label else `{label}, {year}`
 end
 
+-- A date at Linear's DateResolutionType precision, as Linear shows it: month "Sep 2026", quarter "Q3 2026",
+-- halfYear "H2 2026", year "2026"; an exact date (nil or an unknown resolution) is model.shortDate.
+function model.resolvedDate(date: string, resolution: string?, now: number): string
+	local at = model.epoch(string.sub(date, 1, 10))
+	if at == nil then
+		return ""
+	end
+	local year, month = civilFromDays(at // SECONDS_PER_DAY)
+	if resolution == "month" then
+		return `{MONTH_NAMES[month]} {year}`
+	elseif resolution == "quarter" then
+		return `Q{(month - 1) // 3 + 1} {year}`
+	elseif resolution == "halfYear" then
+		return `H{if month <= 6 then 1 else 2} {year}`
+	elseif resolution == "year" then
+		return tostring(year)
+	end
+	return model.shortDate(date, now)
+end
+
 -- Linear ProjectFilter as plain tables; `{}` (no condition) when every project of the organization is wanted.
 -- Archived projects are excluded by the query itself (includeArchived defaults to false).
 function model.projectServerFilter(prefs: Prefs): any

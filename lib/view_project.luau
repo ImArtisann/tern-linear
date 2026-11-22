@@ -55,7 +55,7 @@ local function loadingLine(key: string, role: string): Node
 	return ui.node("shimmer", { key = key, role = role, text = "Loading…" })
 end
 
-local function sectionHeading(title: string, count: number?): Node
+local function sectionHeading(title: string, count: string?): Node
 	local spans: { Span | string } = { ui.span(title, "strong") }
 	if count ~= nil then
 		table.insert(spans, ui.span(`  {count}`, "muted"))
@@ -98,7 +98,12 @@ local function header(page: ProjectPageState, project: Project?, now: number): N
 			}),
 		}
 	else
-		nameNode = muted("name", "Loading project…", "linear.project-name")
+		-- No list item and no detail: a restored page whose project is outside the list, loading or failed.
+		nameNode = muted(
+			"name",
+			if page.error == nil then "Loading project…" else "Project unavailable",
+			"linear.project-name"
+		)
 	end
 	local children = compact({
 		ui.button("Back", {
@@ -180,11 +185,12 @@ local function priorityValue(project: Project): Node
 	return ui.badge(model.priorityLabel(project.priority), tone)
 end
 
-local function dateValue(date: string?, now: number): Node
+-- `resolution` is the date's DateResolutionType, known once the detail has loaded.
+local function dateValue(date: string?, resolution: string?, now: number): Node
 	if date == nil then
 		return plain("Not set", true)
 	end
-	return plain(model.shortDate(date, now))
+	return plain(model.resolvedDate(date, resolution, now))
 end
 
 local function teamsValue(project: Project): Node
@@ -239,8 +245,16 @@ local function properties(project: Project, detail: ProjectDetail?, now: number)
 		propRow("lead", "Lead", if lead ~= nil then plain(lead.displayName) else plain("No lead", true)),
 		propRow("members", "Members", membersValue(detail)),
 		propRow("teams", "Teams", teamsValue(project)),
-		propRow("start", "Start date", dateValue(project.startDate, now)),
-		propRow("target", "Target date", dateValue(project.targetDate, now)),
+		propRow(
+			"start",
+			"Start date",
+			dateValue(project.startDate, if detail ~= nil then detail.startDateResolution else nil, now)
+		),
+		propRow(
+			"target",
+			"Target date",
+			dateValue(project.targetDate, if detail ~= nil then detail.targetDateResolution else nil, now)
+		),
 		propRow(
 			"progress",
 			"Progress",
@@ -315,7 +329,9 @@ local function milestones(page: ProjectPageState, now: number): Node?
 		return nil
 	end
 	local list: { ProjectMilestone } = if detail ~= nil then detail.milestones else {}
-	local children: { Node } = { sectionHeading("Milestones", if detail ~= nil then #list else nil) }
+	-- The query fetches the first 50: past that the count is a lower bound.
+	local count = if detail == nil then nil elseif detail.milestonesTruncated then `{#list}+` else tostring(#list)
+	local children: { Node } = { sectionHeading("Milestones", count) }
 	if detail == nil then
 		table.insert(children, loadingLine("loading", "linear.milestones-loading"))
 	elseif #list == 0 then

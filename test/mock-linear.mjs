@@ -744,6 +744,7 @@ function snapshot(db) {
 			leadId: p.leadId,
 			url: db.projectView(p).url,
 			updatedAt: iso(p.updatedAt),
+			targetDate: p.targetDate,
 			archivedAt: iso(p.archivedAt),
 		})),
 		issues: s.issues.map((i) => ({

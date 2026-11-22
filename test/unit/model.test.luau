@@ -685,6 +685,20 @@ check("shortDate in the current year", model.shortDate("2025-07-01", june) == "J
 check("shortDate in another year", model.shortDate("2026-01-09", june) == "Jan 9, 2026")
 check("shortDate of garbage is empty", model.shortDate("soon", june) == "")
 check(
+	"resolvedDate at Linear's precisions",
+	model.resolvedDate("2025-09-30", "month", june) == "Sep 2025"
+		and model.resolvedDate("2025-09-30", "quarter", june) == "Q3 2025"
+		and model.resolvedDate("2025-10-01", "quarter", june) == "Q4 2025"
+		and model.resolvedDate("2025-06-30", "halfYear", june) == "H1 2025"
+		and model.resolvedDate("2025-07-01", "halfYear", june) == "H2 2025"
+		and model.resolvedDate("2026-12-31", "year", june) == "2026"
+)
+check(
+	"resolvedDate of an exact date is shortDate",
+	model.resolvedDate("2025-07-01", nil, june) == "Jul 1"
+		and model.resolvedDate("2026-01-09", "day", june) == "Jan 9, 2026"
+)
+check(
 	"progressLabel rounds down and clamps",
 	model.progressLabel(0.629) == "62%" and model.progressLabel(1) == "100%" and model.progressLabel(1.5) == "100%"
 )

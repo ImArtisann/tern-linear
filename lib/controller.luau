@@ -57,6 +57,13 @@ type Run = {
 	detailToken: number,
 	-- Bumped whenever the project page's detail request is superseded (page closed, reopened, reloaded).
 	pageToken: number,
+	-- Bumped when a Projects list request starts; see `goneProjects`.
+	projectsSeq: number,
+	-- Projects whose page answered `notfound`, mapped to `projectsSeq` at that moment: a list result from a request
+	-- that started no later leaves them out; a later one is authoritative and drops the entry.
+	goneProjects: { [string]: number },
+	-- A notice reported while the first load runs (the loading view shows none); it starts once the list shows.
+	readyNotice: string?,
 	-- What the in-flight foreground request is: only loads may supersede loads.
 	fgKind: ("load" | "mutation")?,
 	-- tern.now() of the last successful board load.
@@ -444,6 +451,16 @@ local function setNotice(state: BlockState, run: Run, message: string)
 	end)
 end
 
+-- The first load is done: the list shows, and a notice held back while it loaded (`readyNotice`) starts now.
+local function markReady(state: BlockState, run: Run)
+	state.phase = "ready"
+	local pending = run.readyNotice
+	if pending ~= nil then
+		run.readyNotice = nil
+		setNotice(state, run, pending)
+	end
+end
+
 -- ─── Selection and drawer ───────────────────────────────────────────────────
 
 local function dropEditForm(state: BlockState)
@@ -520,6 +537,8 @@ local function resetData(state: BlockState, run: Run)
 	state.form = nil
 	state.error = nil
 	state.notice = nil
+	run.readyNotice = nil
+	run.goneProjects = {}
 	state.backoffUntil = nil
 end
 
@@ -534,6 +553,8 @@ local function enterSetup(state: BlockState, run: Run, message: string?)
 end
 
 -- Routes a failed request: auth → setup, rate → backoff, everything else → inline or banner.
+-- The banner (`state.error`) alone carries the auth and rate messages: `tick` counts the rate message down, so an
+-- inline target never receives it (and keeps what it showed before).
 local function fail(state: BlockState, err: ApiError, inline: ((string) -> ())?)
 	local run = runOf(state)
 	if run == nil then
@@ -550,11 +571,7 @@ local function fail(state: BlockState, err: ApiError, inline: ((string) -> ())?)
 	if err.kind == "rate" then
 		local waitMs = err.retryAfterMs or DEFAULT_BACKOFF_MS
 		state.backoffUntil = nowMs() + waitMs
-		local message = rateMessage(waitMs)
-		state.error = message
-		if inline ~= nil then
-			inline(message)
-		end
+		state.error = rateMessage(waitMs)
 		return
 	end
 	if inline ~= nil then
@@ -626,13 +643,26 @@ local function newestUpdate(updatedAts: { string }): string?
 	return newest
 end
 
-local function commitProjects(state: BlockState, run: Run, page: types.ProjectPage)
+-- `seq` is the request's `run.projectsSeq`: projects evicted after it started stay out (see `goneProjects`).
+local function commitProjects(state: BlockState, run: Run, page: types.ProjectPage, seq: number)
 	local projects = state.projects
-	projects.items = page.projects
+	local items: { Project } = {}
+	for _, project in page.projects do
+		local gone = run.goneProjects[project.id]
+		if gone == nil or seq > gone then
+			table.insert(items, project)
+		end
+	end
+	for id, gone in run.goneProjects do
+		if seq > gone then
+			run.goneProjects[id] = nil
+		end
+	end
+	projects.items = items
 	projects.truncated = page.truncated
 	projects.fetchedAt = os.time()
 	local updatedAts: { string } = {}
-	for _, project in page.projects do
+	for _, project in items do
 		table.insert(updatedAts, project.updatedAt)
 	end
 	projects.maxUpdatedAt = newestUpdate(updatedAts)
@@ -790,10 +820,13 @@ local function reloadIssues(state: BlockState, run: Run)
 end
 
 local function reloadProjects(state: BlockState, run: Run)
+	local seq = 0
 	backgroundRead(state, run, function(cfg: types.Config, done: types.Callback<types.ProjectPage>)
+		run.projectsSeq += 1
+		seq = run.projectsSeq
 		linear.projects(cfg, model.projectServerFilter(state.prefs), done)
 	end, function(page: types.ProjectPage, live: Run)
-		commitProjects(state, live, page)
+		commitProjects(state, live, page, seq)
 	end)
 end
 
@@ -878,7 +911,7 @@ local function loadAll(state: BlockState, dataOnly: boolean)
 		end
 		settle(state, live)
 		if state.phase == "loading" then
-			state.phase = "ready"
+			markReady(state, live)
 		end
 		fail(state, err or unknownError(), nil)
 		state.cx:render()
@@ -896,7 +929,7 @@ local function loadAll(state: BlockState, dataOnly: boolean)
 			end
 			settle(state, live)
 			commitIssues(state, live, page)
-			state.phase = "ready"
+			markReady(state, live)
 			state.error = nil
 			if state.drawerOpen and state.selectedId ~= nil then
 				requestDetail(state, live, 0)
@@ -914,6 +947,8 @@ local function loadAll(state: BlockState, dataOnly: boolean)
 				failed(statusErr)
 				return
 			end
+			run.projectsSeq += 1
+			local seq = run.projectsSeq
 			linear.projects(cfg, model.projectServerFilter(state.prefs), function(page, err)
 				local live = current(state, generation)
 				if live == nil then
@@ -925,8 +960,8 @@ local function loadAll(state: BlockState, dataOnly: boolean)
 				end
 				settle(state, live)
 				state.projects.statuses = statuses
-				commitProjects(state, live, page)
-				state.phase = "ready"
+				commitProjects(state, live, page, seq)
+				markReady(state, live)
 				state.error = nil
 				state.cx:render()
 			end)
@@ -1056,7 +1091,10 @@ local function checkForChanges(state: BlockState, run: Run)
 				fail(state, err, nil)
 			else
 				state.error = nil
-				if newest ~= nil and (known == nil or newest > known) then
+				-- A check still in flight when the project page opened leaves the list alone: the list's polling
+				-- pauses with the page, and the first check after Back finds the same change.
+				local paused = projects and state.projectPage ~= nil
+				if not paused and newest ~= nil and (known == nil or newest > known) then
 					if projects then
 						reloadProjects(state, live)
 					else
@@ -1091,8 +1129,32 @@ local function closeProjectPage(state: BlockState, run: Run)
 	end
 end
 
+-- The open page's project is gone (`notfound`): it leaves the list and the selection, a list result already in
+-- flight cannot bring it back (`goneProjects`), the page closes and the notice says why. During the first load the
+-- notice waits for the list (`readyNotice`).
+local function projectGone(state: BlockState, run: Run, id: string)
+	local kept: { Project } = {}
+	for _, project in state.projects.items do
+		if project.id ~= id then
+			table.insert(kept, project)
+		end
+	end
+	state.projects.items = kept
+	run.goneProjects[id] = run.projectsSeq
+	if state.projects.selectedId == id then
+		clearProjectSelection(state)
+	end
+	closeProjectPage(state, run)
+	if state.phase == "ready" then
+		setNotice(state, run, "Project not found")
+	else
+		run.readyNotice = "Project not found"
+	end
+end
+
 -- Loads the open page's detail. `shown` marks it loading (open, `r`, Refresh); a poll reload stays silent.
--- `notfound` closes the page with a notice; other failures show in the page and keep what it had.
+-- `notfound` drops the project (projectGone); other failures show in the page and keep what it had. Success clears
+-- only the page's own error: `state.error` belongs to the request that set it (a failed list load stays visible).
 local function fetchProjectPage(state: BlockState, run: Run, shown: boolean)
 	local page = state.projectPage
 	local cfg = run.cfg
@@ -1115,12 +1177,10 @@ local function fetchProjectPage(state: BlockState, run: Run, shown: boolean)
 			page.detail = detail
 			page.error = nil
 			page.fetchedAt = os.time()
-			state.error = nil
 		else
 			local failure = err or unknownError()
 			if failure.kind == "notfound" then
-				closeProjectPage(state, live)
-				setNotice(state, live, "Project not found")
+				projectGone(state, live, page.projectId)
 			else
 				fail(state, failure, function(message: string)
 					page.error = message
@@ -2832,9 +2892,20 @@ local PROJECT_KEYS: { [string]: KeyHandler } = {
 	["left"] = projectColumnKey(-1),
 	["l"] = projectColumnKey(1),
 	["right"] = projectColumnKey(1),
-	["enter"] = selectedProjectAction(function(state, run, project)
-		openProjectPage(state, run, project.id)
-	end),
+	-- Only a project the list shows: search and the lead/health filters keep a selection they hide.
+	["enter"] = function(state, run)
+		local id = state.projects.selectedId
+		if id == nil then
+			return false
+		end
+		for _, project in visibleProjects(state) do
+			if project.id == id then
+				openProjectPage(state, run, id)
+				return true
+			end
+		end
+		return false
+	end,
 	["escape"] = function(state, _run)
 		if state.projects.selectedId == nil then
 			return false
@@ -3132,6 +3203,9 @@ local function register(state: BlockState): Run
 		detailTimer = nil,
 		detailToken = 0,
 		pageToken = 0,
+		projectsSeq = 0,
+		goneProjects = {},
+		readyNotice = nil,
 		fgKind = nil,
 		lastFullAt = tern.now(),
 		focusQueued = false,

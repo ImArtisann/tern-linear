@@ -128,7 +128,7 @@ The web app cannot reach the file system or run in the background. A native clie
 - Offline cache of the last 500 issues
 - \`linear://\` deep links
 
-See the [design spec](https://linear.app/acme/document/desktop-spec) and the [old prototype](javascript:alert(1)).`;
+See the [design spec](https://linear.app/acme/document/desktop-spec), the ![tray wireframe](https://uploads.linear.app/acme/tray.png) and the [old prototype](javascript:alert(1)).`;
 
 // The viewer is ada. `members` are handles; `teams` team keys (they double as the project's accessible teams).
 // Dates: `target`/`start` in days from now (negative: past), the rest in ms ago.
@@ -140,13 +140,14 @@ const PROJECTS = [
 		content: DESKTOP_DOC,
 		labels: ["Platform", "Customer request", "Initiatives"],
 		healthUpdated: 3 * DAY,
-		// [name, status, progress, target in days from now (null: none), sortOrder]. Linear's order is the sortOrder:
-		// Alpha, Beta, Accessibility audit, Public launch (neither by name nor by target date).
+		// [name, status, progress in percent (Linear's 0..100), target in days from now (null: none), sortOrder].
+		// Linear's order is the sortOrder: Alpha, Beta, Accessibility audit, Public launch (neither by name nor by
+		// target date).
 		milestones: [
 			["Public launch", "unstarted", 0, 30, 300],
-			["Accessibility audit", "overdue", 0.3, -3, 250],
-			["Beta", "next", 0.45, 10, 200],
-			["Alpha", "done", 1, -20, 100],
+			["Accessibility audit", "overdue", 30, -3, 250],
+			["Beta", "next", 45, 10, 200],
+			["Alpha", "done", 100, -20, 100],
 		],
 		icon: "Computer",
 		color: "#5e6ad2",
@@ -169,8 +170,8 @@ const PROJECTS = [
 		labels: ["Platform"],
 		healthUpdated: 1 * DAY,
 		milestones: [
-			["Protocol draft", "done", 1, -10, 1],
-			["Offline mode", "next", 0.2, 10, 2],
+			["Protocol draft", "done", 100, -10, 1],
+			["Offline mode", "next", 20, 10, 2],
 			["Conflict UI", "unstarted", 0, null, 3],
 		],
 		color: "#f2994a",
@@ -198,6 +199,8 @@ const PROJECTS = [
 		teams: ["DES"],
 		priority: 3,
 		target: 60,
+		// Linear's DateResolutionType: the target is a quarter, not a day.
+		targetResolution: "quarter",
 		created: 12 * DAY,
 		updated: 2 * DAY,
 	},
@@ -691,6 +694,8 @@ function build(now) {
 		sortOrder: (i + 1) * 100,
 		startDate: day(p.start),
 		targetDate: day(p.target),
+		startDateResolution: p.startResolution ?? null,
+		targetDateResolution: p.targetResolution ?? null,
 		createdAt: ago(p.created),
 		updatedAt: ago(p.updated),
 		startedAt: p.start === undefined ? null : now + p.start * DAY,

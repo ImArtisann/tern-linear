@@ -908,7 +908,8 @@ local function normalizeMilestone(raw: Json): types.ProjectMilestone?
 		id = id,
 		name = name,
 		status = text(raw.status) or "unstarted",
-		progress = math.clamp(number(raw.progress) or 0, 0, 1),
+		-- Linear sends a milestone's progress as a percentage (0..100), unlike Project.progress (0..1).
+		progress = math.clamp((number(raw.progress) or 0) / 100, 0, 1),
 		targetDate = text(raw.targetDate),
 		sortOrder = number(raw.sortOrder) or 0,
 	}
@@ -942,13 +943,19 @@ function linear.project(cfg: types.Config, id: string, cb: types.Callback<types.
 				table.insert(milestones, milestone)
 			end
 		end
+		local milestoneInfo: Json = if type(raw.projectMilestones) == "table"
+			then raw.projectMilestones.pageInfo
+			else nil
 		return {
 			project = normalizeProject(raw),
 			content = text(raw.content) or "",
 			healthUpdatedAt = text(raw.healthUpdatedAt),
+			startDateResolution = text(raw.startDateResolution),
+			targetDateResolution = text(raw.targetDateResolution),
 			members = members,
 			labels = labels,
 			milestones = milestones,
+			milestonesTruncated = type(milestoneInfo) == "table" and milestoneInfo.hasNextPage == true,
 		}
 	end, cb)
 end

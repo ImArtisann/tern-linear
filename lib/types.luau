@@ -170,7 +170,7 @@ export type ProjectMilestone = {
 	name: string,
 	-- ProjectMilestoneStatus: "unstarted" | "next" | "overdue" | "done" (computed by Linear)
 	status: string,
-	-- 0..1
+	-- 0..1 (Linear sends 0..100; the normalizer divides)
 	progress: number,
 	-- "YYYY-MM-DD"
 	targetDate: string?,
@@ -186,11 +186,17 @@ export type ProjectDetail = {
 	content: string,
 	-- When the health was last set by a project update.
 	healthUpdatedAt: string?,
+	-- DateResolutionType of `project.startDate` / `project.targetDate`: "month" | "quarter" | "halfYear" | "year";
+	-- nil for an exact date.
+	startDateResolution: string?,
+	targetDateResolution: string?,
 	members: { User },
 	-- Project labels (no group labels).
 	labels: { Label },
 	-- Linear's order (model.sortMilestones): sortOrder, then target date, then name.
 	milestones: { ProjectMilestone },
+	-- The project has more milestones than the query's first 50.
+	milestonesTruncated: boolean,
 }
 
 -- ─── Data layer ─────────────────────────────────────────────────────────────

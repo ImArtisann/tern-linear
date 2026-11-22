@@ -301,6 +301,10 @@ async function scenario() {
 		for (const part of ["Why", "Tray icon with unread counts", "design spec", "old prototype"]) {
 			if (!doc.includes(part)) throw new Error(`the description lacks ${JSON.stringify(part)}: ${doc.slice(0, 300)}`);
 		}
+		// The sanitizer ran: the https link stays a link, the image is a link instead, the javascript: link is text.
+		const links = (await nodesOf(`${role("project-description")} a`)).map((node) => node.text).join(",");
+		assertEqual(links, "design spec,🖼 tray wireframe", "links of the project document");
+		if (await exists(`${role("project-description")} img`)) throw new Error("the project document renders an image");
 		assertEqual(await milestoneNames(), DESKTOP_MILESTONES, "milestones in Linear's order");
 		const rows = (await nodesOf(role("milestone"))).map((node) => node.text ?? "");
 		const row = (name) => rows.find((text) => text.includes(name)) ?? "";
@@ -374,12 +378,22 @@ async function scenario() {
 			what: "the table filtered to Onboarding redesign",
 			interval: 0,
 		});
+		// The selection (Desktop app) is hidden by the search: Enter opens nothing.
+		const hidden = mark();
+		await t.key("Enter");
+		await t.wait(300);
+		if ((await exists(role("project-header"))) || opsSince(hidden, "Project").length > 0) {
+			throw new Error("Enter opened a project the search hides");
+		}
 		// Activating a table row (double-click) opens the page.
 		await t.dblclick(`${role("table")} .sf-tbl-row:not(.head)`);
 		await pageOpen("Onboarding redesign");
 		await t.waitFor(role("project-description-empty"), "No description");
 		await t.waitFor(role("milestones-empty"), "No milestones");
 		await t.waitFor(role("project-props"), "No update");
+		// A quarter-precision target date reads as its quarter, not as a day.
+		const [year, month] = projectNamed("Onboarding redesign").targetDate.split("-").map(Number);
+		await t.waitFor(role("project-props"), `Q${Math.floor((month - 1) / 3) + 1} ${year}`);
 		await runner.shot(label);
 		await t.key("Escape");
 		await absent(role("project-header"));
@@ -424,7 +438,15 @@ async function scenario() {
 		await t.key("r");
 		await absent(role("project-header"));
 		await t.waitFor(role("notice"), "Project not found");
-		await present(role("board"));
+		// The deleted project leaves the list: the search now matches nothing, and Enter reopens nothing.
+		await present(role("empty"));
+		if (await exists(role("project-card"))) throw new Error("the deleted project is still on the board");
+		const reopen = mark();
+		await t.key("Enter");
+		await t.wait(300);
+		if ((await exists(role("project-header"))) || opsSince(reopen, "Project").length > 0) {
+			throw new Error("Enter reopened the deleted project");
+		}
 		await runner.shot(label);
 		await clearSearch("public".length);
 	});
