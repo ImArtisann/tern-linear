@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Projects mode, the new default for a fresh block: the workspace's projects on a board (one column per project status) or a sortable table (name, status, health, lead, target date, progress, updated), with health badges, lead, target date, progress and team keys.
+- Projects / Issues switch in the top bar, with `p` and `i`; the mode is remembered per block.
+- Project scopes All projects, My projects (lead or member) and per team; Active (planned, in progress, paused), Backlog and All views; search over name, lead and team keys; lead and health filters.
+- Project selection with `j`/`k`/`h`/`l`, arrows, clicks on cards and table rows; `o` opens the project in Linear (linear.app links only), `y` copies its link.
+- Live polling of projects: a change check every 30 seconds and a full reload every 5 minutes while Projects mode is on screen.
+
+### Fixed
+
+- A background reload left the block marked as refreshing, which stopped the 30-second polling after the first change it picked up (or after any edit) and kept the Refresh button spinning.
+
 ## [0.1.0] - 2026-11-10
 
 ### Added
