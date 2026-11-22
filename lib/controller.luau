@@ -1286,7 +1286,7 @@ local function fetchProjectPage(state: BlockState, run: Run, shown: boolean)
 	if shown then
 		page.loading = true
 	end
-	linear.project(cfg, page.projectId, function(detail, err)
+	linear.project(cfg, page.projectId, page.issues.milestoneId, function(detail, err)
 		local live = liveRun(state)
 		if live == nil or live.pageToken ~= token or state.projectPage ~= page then
 			return
@@ -1527,7 +1527,7 @@ local function selectProjectTab(state: BlockState, run: Run, tab: types.ProjectT
 end
 
 -- The milestone filter of the Issues tab (a milestone row of the Overview, the tab's milestone select): one of the
--- page's milestones, or nil for all. Shows the Issues tab; a changed filter reloads it as a shown load.
+-- page's milestones, or nil for all. Shows the Issues tab; a changed filter reloads it like a view change.
 function projectIssues.showMilestone(state: BlockState, run: Run, id: string?)
 	local page = state.projectPage
 	if page == nil then
@@ -1537,35 +1537,45 @@ function projectIssues.showMilestone(state: BlockState, run: Run, id: string?)
 	if id ~= nil and (detail == nil or model.milestoneById(detail.milestones, id) == nil) then
 		return
 	end
-	local tab = page.issues
-	local changed = tab.milestoneId ~= id
-	tab.milestoneId = id
-	-- Showing a tab that never loaded loads it, already with the new filter.
-	local firstShow = tab.fetchedAt == nil and not tab.loading
-	selectProjectTab(state, run, "issues")
-	if changed and not firstShow then
-		projectIssues.fetch(state, run, true)
+	if page.issues.milestoneId ~= id then
+		projectIssues.setMilestone(state, run, page, id)
 	end
+	selectProjectTab(state, run, "issues")
+end
+
+-- A new milestone filter. On screen, the tab refilters (projectIssues.refilter: the old filter's rows, watermark and
+-- selection go, the new filter makes a shown load). A hidden tab drops the same and supersedes a load in flight, so
+-- its next show loads the new filter as a first load and no key acts on the old filter's rows meanwhile.
+function projectIssues.setMilestone(state: BlockState, run: Run, page: types.ProjectPageState, id: string?)
+	local tab = page.issues
+	tab.milestoneId = id
+	if model.issuesTab(state) == tab then
+		projectIssues.refilter(state, run, tab)
+		return
+	end
+	run.issuesToken += 1
+	run.issuesInFlight = false
+	tab.loading = false
+	tab.stale = false
+	tab.items = {}
+	tab.truncated = false
+	tab.fetchedAt = nil
+	tab.maxUpdatedAt = nil
+	tab.error = nil
+	tab.selectedId = nil
 end
 
 -- After a detail load: a milestone filter whose milestone the project no longer has (deleted since it was saved or
--- picked) is dropped with a notice; the tab reloads unfiltered on screen, or on its next show.
+-- picked; the detail confirms the filter's milestone by id beside its capped list) is dropped with a notice; the tab
+-- reloads unfiltered on screen, or on its next show.
 function projectIssues.dropMissingMilestone(state: BlockState, run: Run, page: types.ProjectPageState)
 	local tab = page.issues
 	local detail = page.detail
 	if tab.milestoneId == nil or detail == nil or model.milestoneById(detail.milestones, tab.milestoneId) ~= nil then
 		return
 	end
-	tab.milestoneId = nil
 	setNotice(state, run, "Milestone not found; showing all issues")
-	if page.tab == "issues" then
-		projectIssues.fetch(state, run, true)
-	else
-		run.issuesToken += 1
-		run.issuesInFlight = false
-		tab.loading = false
-		tab.fetchedAt = nil
-	end
+	projectIssues.setMilestone(state, run, page, nil)
 end
 
 -- `r` / Refresh on the page: reloads the tab on screen (on the Issues tab, also the open drawer's issue).

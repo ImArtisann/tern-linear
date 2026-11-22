@@ -925,8 +925,11 @@ local function normalizeMilestone(raw: Json): types.ProjectMilestone?
 end
 
 -- The project page's detail. Milestones come in the server's order (the caller sorts them); group labels are dropped.
-function linear.project(cfg: types.Config, id: string, cb: types.Callback<types.ProjectDetail>)
-	run(cfg, "Project", queries.Project, { id = id }, function(data: Json): types.ProjectDetail
+-- `milestoneId` (the Issues tab's milestone filter) is looked up by id too: when it exists but is not among the first
+-- 50, it joins `milestones`, so a milestone list without it means the milestone is gone.
+function linear.project(cfg: types.Config, id: string, milestoneId: string?, cb: types.Callback<types.ProjectDetail>)
+	local variables = { id = id, milestoneId = milestoneId, withMilestone = milestoneId ~= nil }
+	run(cfg, "Project", queries.Project, variables, function(data: Json): types.ProjectDetail
 		local raw: Json = data.project
 		if type(raw) ~= "table" then
 			error(failure("notfound", "Linear could not find that project."))
@@ -946,10 +949,14 @@ function linear.project(cfg: types.Config, id: string, cb: types.Callback<types.
 			end
 		end
 		local milestones: { types.ProjectMilestone } = {}
-		for _, node in nodes(raw.projectMilestones) do
-			local milestone = normalizeMilestone(node)
-			if milestone ~= nil then
-				table.insert(milestones, milestone)
+		local listed: { [string]: boolean } = {}
+		for _, connection in { raw.projectMilestones, raw.filterMilestone } do
+			for _, node in nodes(connection) do
+				local milestone = normalizeMilestone(node)
+				if milestone ~= nil and not listed[milestone.id] then
+					listed[milestone.id] = true
+					table.insert(milestones, milestone)
+				end
 			end
 		end
 		local milestoneInfo: Json = if type(raw.projectMilestones) == "table"

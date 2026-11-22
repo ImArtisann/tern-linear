@@ -891,6 +891,43 @@ async function scenario() {
 		await t.waitFor(role("milestone-filter"), "Beta");
 	});
 
+	// A milestone switch is a new filter: the old milestone's issue opened and closed in the drawer is no key's target
+	// once the new one loads, and a failed switch shows its error, never the old milestone's cards under the new name.
+	await runner.step("project-milestone-switch", async () => {
+		const selectedCard = `${role("card")}[data-mark='selected']`;
+		await settle();
+		await t.key("j");
+		await present(selectedCard);
+		const opened = ISSUE_ID.exec(await t.text(selectedCard))?.[0];
+		if (!opened || !BETA_ACTIVE.split(",").includes(opened)) throw new Error(`no Beta issue selected: ${opened}`);
+		await t.key("Enter");
+		await present(role("drawer"));
+		await t.waitFor(role("drawer"), issueNamed(opened).title);
+		await settle();
+		// One Escape closes the drawer and keeps the selection (another would clear it).
+		await t.key("Escape");
+		await absent(role("drawer"));
+		await t.waitFor(selectedCard, opened);
+
+		let before = mark();
+		await pick("milestone-filter", "Alpha");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === "ENG-140"), { what: "Alpha's Active issue", interval: 0 });
+		if (await exists(selectedCard)) throw new Error(`a card is selected after the switch: ${await t.text(selectedCard)}`);
+		await t.key("x");
+		await settle();
+		assertEqual(opsSince(before, "IssueUpdate").length, 0, `updates from x after ${opened} left the list`);
+
+		mock.failNext("Issues");
+		before = mark();
+		await pick("milestone-filter", "Beta");
+		await present(role("project-issues-error"));
+		await t.waitFor(role("milestone-filter"), "Beta");
+		assertEqual(await cardIds(), "", "cards after a failed switch to Beta");
+		await t.key("r");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "Beta after the retry", interval: 0 });
+		await absent(role("project-issues-error"));
+	});
+
 	// The filter is saved with the page: a restored block reopens the tab filtered; a milestone deleted meanwhile is
 	// dropped with a notice and the tab reloads unfiltered.
 	await runner.step("project-milestone-restore", async (label) => {
@@ -905,6 +942,27 @@ async function scenario() {
 		if (!load || load.variables.filter.and[1].projectMilestone?.id?.eq !== beta) {
 			throw new Error(`the restored tab's first load is not filtered: ${JSON.stringify(load?.variables)}`);
 		}
+		await t.waitFor(role("milestone-filter"), "Beta");
+
+		// 50 newer milestones push Beta out of the detail's first page: the lookup by id still finds it, so the filter
+		// stays (no notice) and the select names it.
+		const desktop = projectNamed("Desktop app").id;
+		mock.addMilestones(desktop, 50);
+		await settle();
+		before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Viewer").length > 0, { what: "the block to restart" });
+		await waitFor(() => opsSince(before, "Project").length > 0, { what: "the restored page's Project request" });
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "Beta past the first 50", interval: 0 });
+		await settle();
+		assertEqual(await cardIds(), BETA_ACTIVE, "the tab after the detail loaded");
+		if (await exists(role("notice"))) throw new Error(`a notice for a milestone past the first 50: ${await t.text(role("notice"))}`);
+		await t.waitFor(role("milestone-filter"), "Beta");
+		for (const milestone of mock.state().projectMilestones) if (milestone.name.startsWith("Filler ")) mock.deleteMilestone(milestone.id);
+		before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Viewer").length > 0, { what: "the block to restart" });
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "the restored filtered tab", interval: 0 });
 		await t.waitFor(role("milestone-filter"), "Beta");
 
 		// Public launch holds no issue: the select picks it, the empty state shows; then Linear deletes it.

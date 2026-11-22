@@ -182,8 +182,10 @@ queries.ProjectsChanged = [[query ProjectsChanged($filter: ProjectFilter) {
 
 -- The project page: the list fields (teams up to 10) plus the overview's document, date precisions, members, labels
 -- and milestones. `Query.project` also returns archived projects. IssueConnection has no count, so milestones carry no
--- issue count: counting would need a nested `issues` page per milestone, multiplying the cost.
-queries.Project = [[query Project($id: String!) {
+-- issue count: counting would need a nested `issues` page per milestone, multiplying the cost. `filterMilestone` (only
+-- with `$milestoneId`) looks up the Issues tab's milestone filter by id, so one outside the first 50 is not taken as
+-- deleted.
+queries.Project = [[query Project($id: String!, $milestoneId: ID, $withMilestone: Boolean = false) {
   project(id: $id) {
     id name url slugId icon color description content priority sortOrder progress health healthUpdatedAt
     startDate startDateResolution targetDate targetDateResolution createdAt updatedAt startedAt completedAt canceledAt
@@ -193,6 +195,9 @@ queries.Project = [[query Project($id: String!) {
     members(first: 50) { nodes { id name displayName avatarUrl } }
     labels(first: 25) { nodes { id name color isGroup } }
     projectMilestones(first: 50) { nodes { id name status progress targetDate sortOrder } pageInfo { hasNextPage } }
+    filterMilestone: projectMilestones(first: 1, filter: { id: { eq: $milestoneId } }) @include(if: $withMilestone) {
+      nodes { id name status progress targetDate sortOrder }
+    }
   }
 }]]
 

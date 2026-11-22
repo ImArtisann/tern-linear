@@ -445,11 +445,13 @@ class Database {
 			members: (args) => connection(project.memberIds.map((id) => this.userView(this.user(id))), args),
 			teams: (args) => connection(project.teamIds.map((id) => this.teamView(this.team(id))), args),
 			labels: (args) => connection(project.labelIds.map((id) => ({ ...this.projectLabel(id) })), args),
-			// Linear documents no order; the highest sortOrder first keeps clients sorting milestones themselves.
+			// Linear documents no order; the highest sortOrder first keeps clients sorting milestones themselves. The
+			// only filter the plugin sends is `{ id: { eq } }` (the Issues tab's milestone filter).
 			projectMilestones: (args) =>
 				connection(
 					this.state_.projectMilestones
 						.filter((m) => m.projectId === project.id && m.archivedAt === null)
+						.filter((m) => args.filter?.id?.eq === undefined || m.id === args.filter.id.eq)
 						.sort((a, b) => b.sortOrder - a.sortOrder)
 						.map((m) => this.milestoneView(m)),
 					args,
@@ -854,6 +856,8 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 	let requestsRemaining = 2500;
 	// operationName → retry-after seconds: the next request of that operation answers RATELIMITED.
 	const rateLimitedOps = new Map();
+	// Operation names whose next request answers HTTP 503 (one per entry): `failNext`.
+	let failures = [];
 
 	const reset = () => {
 		db = new Database(Date.now());
@@ -861,6 +865,7 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		log = [];
 		requestsRemaining = 2500;
 		rateLimitedOps.clear();
+		failures = [];
 	};
 
 	const rateHeaders = () => ({
@@ -892,6 +897,12 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 				{ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED", type: "ratelimited" } }] },
 				{ status: 400, headers: { ...rateHeaders(), "retry-after": String(retryAfter) } },
 			);
+		}
+		const failing = failures.indexOf(operationName);
+		if (failing >= 0) {
+			failures.splice(failing, 1);
+			log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 503 });
+			return json({ errors: [{ message: "Service unavailable" }] }, { status: 503 });
 		}
 		log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 200 });
 		requestsRemaining = Math.max(0, requestsRemaining - 1);
@@ -931,6 +942,10 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		},
 		state: () => snapshot(db),
 		reset,
+		/** The next request of `operationName` fails with HTTP 503 (a server failure the plugin shows and retries). */
+		failNext: (operationName) => {
+			failures.push(operationName);
+		},
 		/** Deletes a project: the list no longer returns it and `project(id)` answers "Entity not found". */
 		deleteProject: (id) => {
 			db.project(id).deleted = true;
@@ -943,6 +958,28 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		deleteMilestone: (id) => {
 			db.projectMilestone(id).archivedAt = db.tick();
 			for (const issue of db.state_.issues) if (issue.projectMilestoneId === id) issue.projectMilestoneId = null;
+		},
+		/** Adds `count` milestones to a project, ahead of its others (a higher sortOrder): Linear's first page fills with them. */
+		addMilestones: (projectId, count) => {
+			const milestones = db.state_.projectMilestones;
+			const top = Math.max(0, ...milestones.map((m) => m.sortOrder));
+			const first = milestones.length;
+			for (let i = 1; i <= count; i += 1) {
+				const at = db.tick();
+				milestones.push({
+					id: uuid("milestone", first + i),
+					projectId,
+					name: `Filler ${i}`,
+					status: "unstarted",
+					progress: 0,
+					targetDate: null,
+					sortOrder: top + i,
+					description: null,
+					createdAt: at,
+					updatedAt: at,
+					archivedAt: null,
+				});
+			}
 		},
 		stop: () => server.stop(true),
 	};

@@ -87,6 +87,21 @@ async function measureComplexity(key) {
 		// The milestone filter (model.projectIssueFilter with a milestone): the project, the milestone, then the view.
 		const milestone = detail.project?.projectMilestones?.nodes?.[0]?.id;
 		if (milestone) {
+			// The page's detail with the tab's milestone filter: the milestone looked up by id beside the capped list.
+			const filtered = await send(
+				"Project",
+				{ id: firstProject, milestoneId: milestone, withMilestone: true },
+				"project page detail with the milestone filter (nodes: milestones)",
+			);
+			const found = filtered.project?.filterMilestone?.nodes ?? [];
+			if (found.length !== 1 || found[0].id !== milestone) throw new Error(`filterMilestone did not find ${milestone}`);
+			// A deleted milestone: no node and no error, so the plugin drops the filter.
+			const gone = await send(
+				"Project",
+				{ id: firstProject, milestoneId: "00000000-0000-4000-8000-000000000000", withMilestone: true },
+				"project page detail with an unknown milestone filter (nodes: milestones)",
+			);
+			if ((gone.project?.filterMilestone?.nodes ?? []).length !== 0) throw new Error("filterMilestone found an unknown id");
 			const milestoneFilter = { and: [tabFilter.and[0], { projectMilestone: { id: { eq: milestone } } }, tabFilter.and[1]] };
 			await send("Issues", { filter: milestoneFilter, first: 50 }, "Issues tab filtered to a milestone, first 50, Active view");
 			await send(
