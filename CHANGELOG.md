@@ -9,8 +9,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - Projects mode, the new default for a fresh block: the workspace's projects on a board (one column per project status) or a sortable table (name, status, health, lead, target date, progress, updated), with health badges, lead, target date, progress and team keys.
 - Projects / Issues switch in the top bar, with `p` and `i`; the mode is remembered per block.
 - Project scopes All projects, My projects (lead or member) and per team; Active (planned, in progress, paused), Backlog and All views; search over name, lead and team keys; lead and health filters.
-- Project selection with `j`/`k`/`h`/`l`, arrows, clicks on cards and table rows; `o` opens the project in Linear (linear.app links only), `y` copies its link.
+- Project selection with `j`/`k`/`h`/`l`, arrows and clicks on table rows; `o` opens the project in Linear (linear.app links only), `y` copies its link.
 - Live polling of projects: a change check every 30 seconds and a full reload every 5 minutes while Projects mode is on screen.
+- Project page: `Enter`, a click on a project card or activating a table row opens the project full-screen with a **Back** button (`Esc`, `Backspace`), status, health, **Open in Linear** (`o`), copy link (`y`), refresh (`r`) and a tab bar. Its **Overview** tab shows the summary, the project document as sanitized Markdown, the properties (status, health with its last update, priority, lead, members, teams, start and target dates, progress, labels) and the milestones in Linear's order with status, progress and target date; two columns on a wide pane, stacked on a narrow one. Back returns to the list with the same mode, scope, view, layout and the project still selected.
+- The open project page and its tab are remembered per block; a restored block reopens the page, or shows the list with a notice when the project is gone. The page reloads on the 30-second poll while the list behind it pauses.
 
 ### Fixed
 
