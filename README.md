@@ -9,7 +9,7 @@ Your Linear projects and issues as a native board in a [Tern](https://stencil.so
 ## What you get
 
 - **Projects** mode (the default): every project of your workspace on a board (one column per project status) or a sortable table, with health, lead, target date, progress and teams. **All projects**, **My projects** (you lead it or are a member) or one team's projects; **Active** (planned, in progress, paused), **Backlog** and **All** views; search plus lead and health filters.
-- **Project page**: open a project for its **Overview**: the summary, the project document as Markdown, its properties (status, health and when it was last updated, priority, lead, members, teams, start and target dates at the precision set in Linear, progress, labels) and its milestones in Linear's order with status, progress and target date. **Back** returns to the list as you left it.
+- **Project page**: open a project for its **Overview**: the summary, the project document as Markdown, its properties (status, health and when it was last updated, priority, lead, members, teams, start and target dates at the precision set in Linear, progress, labels) and its milestones in Linear's order with status, progress and target date. Its **Activity** tab is the project's feed, newest first: project updates (author, health, the Markdown body, an edited marker and their comments behind the comment count) between one-line history events (status and start date changes, renames, description and summary edits, teams, lead team, milestones added and completed), with **Load more** for older items. **Back** returns to the list as you left it.
 - **Issues** mode: board (one column per workflow state) or sortable table, switched with one key.
 - **My issues** (assigned to you, across all teams) or any **team** scope.
 - **Active**, **Backlog** and **All** views. Closed issues appear in All only when closed in the last 14 days.
@@ -80,23 +80,23 @@ Keys work when no text field has focus. Keys with Ctrl, Alt or Cmd are left to T
 | `[` / `]` | Move to the previous / next column's state |
 | `o` | Open the selected issue or project in Linear |
 | `y` | Copy the identifier; in Projects mode the project link |
-| `r` | Refresh (on a project page: the page) |
+| `r` | Refresh (on a project page: the tab on screen) |
 
 In Projects mode the issue keys (`n`, `e`, `c`, `a`, `x`, `[`, `]`) do nothing.
 
-On a project page the list keys do nothing; `Esc` or `Backspace` (or `p`) goes back to the list, `Tab` / `Shift+Tab` switch tabs once a page has several, `o` opens the project in Linear, `y` copies its link, `r` reloads the page and `i` switches to Issues mode.
+On a project page the list keys do nothing; `Esc` or `Backspace` (or `p`) goes back to the list, `Tab` / `Shift+Tab` switch between Overview and Activity, `o` opens the project in Linear, `y` copies its link, `r` reloads the tab on screen and `i` switches to Issues mode.
 
 In fields: `Tab` and `Shift+Tab` move between form fields; `Up`/`Down` (or `Left`/`Right`) step through the options of a choice field; `Enter` submits single-line fields; `Ctrl+Enter` or `Cmd+Enter` submits multi-line fields and the comment box; `Esc` leaves the comment box and cancels forms and the link input. On the setup screen `Enter` connects.
 
-Mouse: click a card to select it and open the drawer or the project page; click a table row to select it, and activate (double-click) a row to open the drawer or the project page. The top bar has the **Projects** / **Issues** switch, the scope selector, view tabs, layout toggle and the **Refresh**, **New issue** (Issues mode) and **Sign out** buttons; the filter row has the priority, assignee and label selects (Issues) or the lead and health selects (Projects); the table has **Sort** buttons. The drawer has buttons for done/reopen, edit, open in Linear, copying the identifier or branch name, and **Add blocker**, **Blocks** and **Related** links. The project page has **Back**, **Open in Linear**, a copy-link button, **Refresh** and its tab bar.
+Mouse: click a card to select it and open the drawer or the project page; click a table row to select it, and activate (double-click) a row to open the drawer or the project page. The top bar has the **Projects** / **Issues** switch, the scope selector, view tabs, layout toggle and the **Refresh**, **New issue** (Issues mode) and **Sign out** buttons; the filter row has the priority, assignee and label selects (Issues) or the lead and health selects (Projects); the table has **Sort** buttons. The drawer has buttons for done/reopen, edit, open in Linear, copying the identifier or branch name, and **Add blocker**, **Blocks** and **Related** links. The project page has **Back**, **Open in Linear**, a copy-link button, **Refresh** and its tab bar; on the Activity tab a project update's comment count shows or hides its comments, and **Load more** fetches older items.
 
 | Detail drawer | Table | Create dialog |
 | --- | --- | --- |
 | ![Issue drawer with description, relations and comments](docs/images/detail.png) | ![Issue table](docs/images/table.png) | ![New issue dialog](docs/images/create.png) |
 
-The project page, Overview tab:
-
-![Project page with the project document, properties and milestones](docs/images/project.png)
+| Project page, Overview | Project page, Activity |
+| --- | --- |
+| ![Project page with the project document, properties and milestones](docs/images/project.png) | ![Activity tab with project updates and history events](docs/images/activity.png) |
 
 The setup screen, shown until a key is stored or supplied:
 
@@ -108,14 +108,15 @@ The setup screen, shown until a key is stored or supplied:
 - **Key storage**: a key pasted into the block is written to `credentials.json` in the plugin's data folder (managed by Tern). On macOS and Linux the write goes through `/bin/sh` with `umask 077`, so the file is created owner-only (`600`) and the data directory is `700`; the key is not passed on the command line. Windows writes the file through Tern's filesystem API. Tern's keychain (`tern.secrets`) is only available to window halves, and this plugin has only a host half, so it cannot use it. A key supplied through `LINEAR_API_KEY` is never stored by the plugin. The key is not logged and is not shown again after you submit it.
 - **Processes**: the only process the plugin starts is that `/bin/sh` write of the key file. It runs no other commands.
 - **Data at rest**: issues, projects, comments and drafts live in memory only. The plugin persists your mode, layout, views, scopes, teams, table sorts and the open project page (project id and tab), nothing else.
-- **Markdown**: issue descriptions, comments and project documents are passed through a sanitizer before Tern renders them. Images become links (nothing loads on its own). Link targets are kept only for `http`, `https` and `mailto`; other targets, including `file:` and custom schemes, are dropped. Code spans and fenced code blocks are left as Linear wrote them.
+- **Markdown**: issue descriptions, comments, project documents and project updates are passed through a sanitizer before Tern renders them. Images become links (nothing loads on its own). Link targets are kept only for `http`, `https` and `mailto`; other targets, including `file:` and custom schemes, are dropped. Code spans and fenced code blocks are left as Linear wrote them.
 - **Test override**: `LINEAR_API_URL` can point the plugin at a mock GraphQL endpoint. It is read only from the Tern daemon's environment, and it is accepted only for `https://api.linear.app/graphql` or an `http`/`https` URL on `127.0.0.1`, `localhost` or `[::1]`. Any other value is ignored: the key is not sent, and the setup screen shows why. Leave it unset.
 
 ## Limits and known issues
 
 - A view loads at most 250 issues or 250 projects. When more match, the filter row shows `Showing first 250`; narrow the view, scope or filters.
-- Projects are read-only: the project page has the Overview only (no project issues, updates or activity yet), milestones are display-only, and there is no editing or creating projects. Archived projects are never shown in the list. A card shows at most five team keys; a project page shows at most 10 teams, 50 members, 25 labels and 50 milestones (the count then reads `50+`), and no issue count per milestone (Linear's API has no cheap count).
-- An open project page reloads every 30 seconds; the project list behind it pauses its polling until you go back.
+- Projects are read-only: the project page has the Overview and Activity tabs (no project issues yet), milestones are display-only, and there is no editing or creating projects, posting project updates or commenting on them. Archived projects are never shown in the list. A card shows at most five team keys; a project page shows at most 10 teams, 50 members, 25 labels and 50 milestones (the count then reads `50+`), and no issue count per milestone (Linear's API has no cheap count).
+- Activity loads 20 project updates and 25 history records at a time (**Load more** for older ones) and shows at most the 10 newest comments of an update (the rest stay in Linear). History events of kinds the plugin does not know are left out, and so are the project's own overview comments. Names in history events come from the people and teams the block already knows (project members, team members, update authors); anyone else reads as "Someone".
+- An open project page reloads every 30 seconds (its Activity tab too, while it is on screen); the project list behind it pauses its polling until you go back.
 - Project status changes, health and progress show within about 30 seconds only when Linear bumps the project's `updatedAt`; everything else catches up with the full reload every 5 minutes.
 - No drag and drop: Tern blocks have no pointer drag. Move cards with `[` / `]` or the State select.
 - Labels are shown and filterable but not editable, neither when editing nor when creating an issue. Project, cycle, estimate and due date are display-only too.
@@ -130,7 +131,7 @@ The setup screen, shown until a key is stored or supplied:
 
 - **"Linear rejected the API key"**: the key is invalid, revoked or mistyped. Create a new one and paste it again. If the key comes from `LINEAR_API_KEY`, fix the variable and restart Tern.
 - **"Your API key is not allowed to do that."**: the key lacks Write permission, or the team is outside the key's team access.
-- **"Rate limited by Linear; retrying in Ns"**: Linear allows 2,500 requests per hour per user for API keys. The plugin polls cheaply (one small change check every 30 seconds per block, a full reload every 5 minutes, and a refresh of the open drawer or project page on each poll) and backs off for the time Linear asks, at least 60 seconds when Linear gives none. Close extra Linear blocks if you run many.
+- **"Rate limited by Linear; retrying in Ns"**: Linear allows 2,500 requests per hour per user for API keys. The plugin polls cheaply (one small change check every 30 seconds per block, a full reload every 5 minutes, and a refresh of the open drawer or project page, plus its Activity tab while shown, on each poll) and backs off for the time Linear asks, at least 60 seconds when Linear gives none. Close extra Linear blocks if you run many.
 - **My issues is empty**: it shows what is assigned to you in the current view. The empty Active view says so and offers **All** and **Choose team** (switches to the next team). `3` and `t` do the same. A filtered empty view offers **Clear filters**.
 - **Logs**: `~/Library/Logs/Tern`. For plugin detail, start Tern with `STENCIL_LOG=warn,tern::plugin=debug`. The key is never logged.
 - **Is it installed?** `tern plugin list` shows `linear`.

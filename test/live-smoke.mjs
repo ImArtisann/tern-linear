@@ -1,5 +1,5 @@
 // Smoke test against the real Linear API (no mock).
-//   bun test/live-smoke.mjs            read-only: projects board, table and a project page, then the issue board, table, detail drawer
+//   bun test/live-smoke.mjs            read-only: projects board, table, a project page and its Activity tab, then the issue board, table, detail drawer
 //   bun test/live-smoke.mjs --write    also creates, comments on and completes one issue
 //
 // It also sends the read-only project queries once directly and prints Linear's `x-complexity` for each
