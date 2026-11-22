@@ -130,6 +130,42 @@ async function pageOpen(name) {
 	});
 }
 
+// The Activity tab of Desktop app, newest first: [kind, text the row contains]. The fixture's unknown kind
+// (`externalSync`), its entry with a string `at` and its empty record never show.
+const DESKTOP_ACTIVITY = [
+	["event", "ada changed the icon"],
+	["event", "ada updated the summary"],
+	["event", "grace changed the lead team from Engineering to Design"],
+	["event", "grace renamed the project from Desktop client to Desktop app"],
+	["update", "Beta is feature-complete"],
+	["event", "ada and grace updated the description"],
+	["event", "Milestone Alpha completed"],
+	["update", "The accessibility audit found two"],
+	["update", "Signing certificates expired"],
+	["event", "ada added team Design"],
+	["event", "grace added milestones Alpha and Beta"],
+	["event", "ada set the start date to"],
+	["event", "ada changed status from Planned to In Progress"],
+];
+
+const ACTIVITY_ITEMS = `${role("activity-update")}, ${role("activity-event")}`;
+
+/** The Activity tab's rows, top to bottom: `{ kind, text }` (the tree carries no roles; update texts tell them apart). */
+async function activityRows() {
+	const updates = new Set((await nodesOf(role("activity-update"))).map((node) => node.text));
+	return (await nodesOf(ACTIVITY_ITEMS)).map((node) => ({ kind: updates.has(node.text) ? "update" : "event", text: node.text ?? "" }));
+}
+
+/** Opens the Activity tab by clicking it and waits until it shows its items or its empty state. */
+async function openActivity() {
+	await t.click(role("project-tab-activity"));
+	await present(role("activity"));
+	await waitFor(async () => (await t.wait(150), (await exists(ACTIVITY_ITEMS)) || exists(role("activity-empty"))), {
+		what: "the Activity tab to load",
+		interval: 0,
+	});
+}
+
 /** Leaves the project page with Escape; the list is back with `name` selected. */
 async function backToList(name) {
 	await t.key("Escape");
@@ -294,7 +330,10 @@ async function scenario() {
 		await present(role("project-open-url"));
 		await present(role("project-refresh"));
 		const tabs = await nodesOf(`${role("project-tabs")} [data-role^='linear.project-tab-']`);
-		assertEqual(tabs.map((node) => node.text).join(","), "Overview", "project tabs");
+		assertEqual(tabs.map((node) => node.text).join(","), "Overview,Activity", "project tabs");
+		// The activity loads when its tab is first shown, not with the Overview.
+		await settle();
+		for (const op of ["ProjectUpdates", "ProjectHistory"]) assertEqual(opsSince(before, op).length, 0, `${op} before the Activity tab`);
 
 		await t.waitFor(role("project-summary"), "The native desktop client");
 		const doc = await t.text(role("project-description"));
@@ -331,6 +370,128 @@ async function scenario() {
 		await runner.shot("project-overview-narrow");
 		await t.ctl("size 1440 900");
 		await present(`${role("project-overview")}[data-mark='wide']`);
+	});
+
+	// The Activity tab of Desktop app: updates and history events in one newest-first feed.
+	await runner.step("project-activity", async (label) => {
+		const desktop = projectNamed("Desktop app").id;
+		let before = mark();
+		await openActivity();
+		for (const op of ["ProjectUpdates", "ProjectHistory"]) {
+			const [request] = opsSince(before, op);
+			if (!request) throw new Error(`no ${op} request when the Activity tab opened`);
+			assertEqual(request.variables.id, desktop, `${op} project`);
+			assertEqual(request.variables.after ?? null, null, `${op} first page`);
+		}
+		await waitFor(async () => (await t.wait(150), (await activityRows()).length === DESKTOP_ACTIVITY.length), {
+			what: `${DESKTOP_ACTIVITY.length} activity rows`,
+			interval: 0,
+		});
+		const rows = await activityRows();
+		DESKTOP_ACTIVITY.forEach(([kind, text], i) => {
+			if (rows[i].kind !== kind || !rows[i].text.includes(text)) {
+				throw new Error(`activity row ${i + 1}: expected ${kind} "${text}", got ${rows[i].kind} "${rows[i].text}"`);
+			}
+		});
+		const all = rows.map((row) => row.text).join("\n");
+		for (const hidden of ["externalSync", "github", "yesterday", "Backlog to Planned", "{"]) {
+			if (all.includes(hidden)) throw new Error(`the activity shows an unknown or malformed entry (${hidden})`);
+		}
+		for (const health of ["onTrack", "atRisk", "offTrack"]) await present(`${role("activity-update")}[data-mark='${health}']`);
+		await t.waitFor(`${role("activity-update")}[data-mark='offTrack']`, "Off track");
+		const body = await t.text(`${role("activity-update")}[data-mark='onTrack'] ${role("activity-body")}`);
+		for (const part of ["Beta is feature-complete", "Tray icon shipped", "release checklist"]) {
+			if (!body.includes(part)) throw new Error(`the update body lacks ${JSON.stringify(part)}: ${body}`);
+		}
+		if (body.includes("**")) throw new Error(`the update body shows raw Markdown: ${body}`);
+		assertEqual((await nodesOf(role("activity-edited"))).length, 1, "edited markers");
+		await present(`${role("activity-update")}[data-mark='atRisk'] ${role("activity-edited")}`);
+		if (await exists(role("activity-more"))) throw new Error("Load more on a project whose activity fits one page");
+
+		// The comment count expands the update's comments, oldest first, and collapses them again.
+		await t.waitFor(role("activity-comments-toggle"), "2 comments");
+		await t.click(role("activity-comments-toggle"));
+		await waitFor(async () => (await t.wait(150), (await nodesOf(role("activity-comment"))).length === 2), {
+			what: "two update comments",
+			interval: 0,
+		});
+		const comments = (await nodesOf(role("activity-comment"))).map((node) => node.text ?? "");
+		if (!comments[0].includes("Which screens fail?") || !comments[1].includes("Settings and onboarding")) {
+			throw new Error(`update comments out of order: ${comments.join(" | ")}`);
+		}
+		await runner.shot(label);
+		await t.click(role("activity-comments-toggle"));
+		await absent(role("activity-comment"));
+
+		// `tab` / `shift+tab` cycle the tabs; a loaded Activity tab does not reload when shown again.
+		await settle();
+		before = mark();
+		await t.key("Tab");
+		await present(role("project-overview"));
+		await t.key("Shift+Tab");
+		await present(role("activity-update"));
+		await t.wait(300);
+		assertEqual(opsSince(before, "ProjectUpdates").length, 0, "activity reloads when the tab shows again");
+
+		// `r` reloads the tab on screen only.
+		await settle();
+		before = mark();
+		await t.key("r");
+		await waitFor(() => opsSince(before, "ProjectUpdates").length > 0 && opsSince(before, "ProjectHistory").length > 0, {
+			what: "an activity reload after r",
+		});
+		assertEqual(opsSince(before, "Project").length, 0, "detail reloads from r on the Activity tab");
+
+		// The poll tick reloads the activity while its tab shows, and the detail beside it ...
+		await settle();
+		before = mark();
+		await t.wait(31_000);
+		await waitFor(() => opsSince(before, "ProjectUpdates").length > 0, { what: "an activity reload on the poll tick" });
+		await waitFor(() => opsSince(before, "Project").length > 0, { what: "a detail reload on the poll tick" });
+		await present(role("activity-update"));
+		// ... and not while the Overview shows.
+		await t.click(role("project-tab-overview"));
+		await present(role("project-overview"));
+		await settle();
+		before = mark();
+		await t.wait(31_000);
+		await waitFor(() => opsSince(before, "Project").length > 0, { what: "a detail reload on the poll tick" });
+		assertEqual(opsSince(before, "ProjectUpdates").length, 0, "activity reloads while the Overview shows");
+		await openActivity();
+		await runner.shot("project-activity");
+	});
+
+	// Sync engine v2 has 24 updates: the first page holds 20, and its older status change waits for Load more.
+	await runner.step("project-activity-more", async (label) => {
+		await backToList("Desktop app");
+		await t.key("k");
+		await t.waitFor(SELECTED_CARD, "Sync engine v2");
+		await t.key("Enter");
+		await pageOpen("Sync engine v2");
+		await openActivity();
+		const updates = async () => (await nodesOf(role("activity-update"))).length;
+		await waitFor(async () => (await t.wait(150), (await updates()) === 20), { what: "the first 20 updates", interval: 0 });
+		if (await exists(role("activity-event"))) throw new Error("an event older than the loaded updates shows before Load more");
+		await t.waitFor(role("activity-more"), "Load more");
+		await runner.shot(label);
+		await settle();
+		const before = mark();
+		await t.click(role("activity-more"));
+		await waitFor(async () => (await t.wait(150), (await updates()) === 24), { what: "all 24 updates", interval: 0 });
+		const [more] = opsSince(before, "ProjectUpdates");
+		if (!more?.variables.after) throw new Error(`Load more did not page: ${JSON.stringify(more?.variables)}`);
+		assertEqual(opsSince(before, "ProjectHistory").length, 0, "history pages without more");
+		await absent(role("activity-more"));
+		const rows = await activityRows();
+		const last = rows[rows.length - 1];
+		if (last.kind !== "event" || !last.text.includes("linus changed status from Planned to In Progress")) {
+			throw new Error(`the oldest row is not the status change: ${JSON.stringify(last)}`);
+		}
+		await backToList("Sync engine v2");
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await t.key("Enter");
+		await pageOpen("Desktop app");
 	});
 
 	await runner.step("project-page-keys", async () => {
@@ -395,6 +556,11 @@ async function scenario() {
 		const [year, month] = projectNamed("Onboarding redesign").targetDate.split("-").map(Number);
 		await t.waitFor(role("project-props"), `Q${Math.floor((month - 1) / 3) + 1} ${year}`);
 		await runner.shot(label);
+		// A project without updates or history.
+		await openActivity();
+		await t.waitFor(role("activity-empty"), "No activity yet");
+		if (await exists(ACTIVITY_ITEMS)) throw new Error("activity rows on a project without activity");
+		await runner.shot("project-activity-empty");
 		await t.key("Escape");
 		await absent(role("project-header"));
 		await present(role("table"));
@@ -413,6 +579,7 @@ async function scenario() {
 		await t.wait(31_000);
 		await waitFor(() => opsSince(before, "Project").length > 0, { what: "a Project reload on the poll tick" });
 		assertEqual(opsSince(before, "ProjectsChanged").length, 0, "list polls while the page is open");
+		assertEqual(opsSince(before, "ProjectUpdates").length, 0, "activity polls while the Overview shows");
 		await present(role("project-header"));
 	});
 
@@ -425,6 +592,18 @@ async function scenario() {
 		await pageOpen("Onboarding redesign");
 		if (opsSince(before, "Project").length === 0) throw new Error("no Project request after restoring the page");
 		await runner.shot(label);
+
+		// A page saved on its Activity tab comes back on that tab and loads its activity.
+		await openActivity();
+		await settle();
+		const again = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(again, "Viewer").length > 0, { what: "the block to restart" });
+		await present(role("project-header"));
+		await t.waitFor(role("activity-empty"), "No activity yet");
+		if (opsSince(again, "ProjectUpdates").length === 0) throw new Error("no ProjectUpdates request after restoring the Activity tab");
+		if (await exists(role("project-overview"))) throw new Error("the restored page shows the Overview");
+		await runner.shot("project-activity-restore");
 		await backToList("Onboarding redesign");
 	});
 
@@ -796,6 +975,9 @@ async function scenario() {
 		await t.key("Enter");
 		await pageOpen("Desktop app");
 		await runner.shot("readme-project");
+		await openActivity();
+		await t.waitFor(role("activity"), "Beta is feature-complete");
+		await runner.shot("readme-project-activity");
 		await t.key("Escape");
 		await absent(role("project-header"));
 

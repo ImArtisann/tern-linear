@@ -20,6 +20,9 @@ local PROJECTS_PAGE_SIZE = 50
 -- Teams carry large nested connections: 5 per page keeps the query far below the 10000 complexity cap.
 local TEAMS_PAGE_SIZE = 5
 local COMMENTS_PAGE_SIZE = 50
+-- The Activity tab's page sizes (measured cost: docs/ARCHITECTURE.md).
+local UPDATES_PAGE_SIZE = 20
+local HISTORY_PAGE_SIZE = 25
 -- Upper bound on follow-up pages of any one listing; guards against a cursor that never ends.
 local MAX_PAGES = 40
 local REQUEST_TIMEOUT_MS = 20000
@@ -1005,6 +1008,137 @@ function linear.issue(cfg: types.Config, id: string, cb: types.Callback<types.Is
 		loaded.comments = sortComments(comments)
 		cb(loaded, nil)
 	end)
+end
+
+-- ─── Project activity ───────────────────────────────────────────────────────
+
+local function normalizeUpdate(raw: Json): types.ProjectUpdate?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local createdAt = text(raw.createdAt)
+	if id == nil or createdAt == nil then
+		return nil
+	end
+	local comments: { types.Comment } = {}
+	for _, node in nodes(raw.comments) do
+		local comment = normalizeComment(node)
+		if comment ~= nil then
+			table.insert(comments, comment)
+		end
+	end
+	local health = text(raw.health)
+	return {
+		id = id,
+		body = text(raw.body) or "",
+		health = if health ~= nil and HEALTHS[health] then health else nil,
+		createdAt = createdAt,
+		editedAt = text(raw.editedAt),
+		commentCount = math.max(number(raw.commentCount) or 0, #comments),
+		url = text(raw.url) or "",
+		user = normalizeUser(raw.user),
+		comments = sortComments(comments),
+	}
+end
+
+local function normalizeHistoryRecord(raw: Json): types.ProjectHistoryRecord?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local createdAt = text(raw.createdAt)
+	local updatedAt = text(raw.updatedAt)
+	if id == nil or createdAt == nil or updatedAt == nil then
+		return nil
+	end
+	local entries: { any } = {}
+	if type(raw.entries) == "table" then
+		for _, entry in ipairs(raw.entries) do
+			if type(entry) == "table" then
+				table.insert(entries, entry)
+			end
+		end
+	end
+	return { id = id, createdAt = createdAt, updatedAt = updatedAt, entries = entries }
+end
+
+-- One page of `project(id).<field>`, normalized; a missing project is `notfound`.
+local function activityPage<T>(data: Json, field: string, normalize: (Json) -> T?): types.ActivitySource<T>
+	local project: Json = data.project
+	if type(project) ~= "table" then
+		error(failure("notfound", "Linear could not find that project."))
+	end
+	local connection: Json = project[field]
+	local items: { T } = {}
+	for _, node in nodes(connection) do
+		local item = normalize(node)
+		if item ~= nil then
+			table.insert(items, item)
+		end
+	end
+	local info: Json = if type(connection) == "table" then connection.pageInfo else nil
+	local cursor = if type(info) == "table" and info.hasNextPage == true then text(info.endCursor) else nil
+	return { items = items, cursor = cursor, hasMore = cursor ~= nil }
+end
+
+local function noPage<T>(): types.ActivitySource<T>
+	return { items = {}, cursor = nil, hasMore = false }
+end
+
+-- The Activity tab's data: ProjectUpdates and ProjectHistory, sent side by side. `after` nil asks for the first page
+-- of both; otherwise only the sources with a cursor are fetched (the others come back empty, without more).
+function linear.projectActivity(
+	cfg: types.Config,
+	id: string,
+	after: types.ActivityCursors?,
+	cb: types.Callback<types.ProjectActivity>
+)
+	local wantUpdates = after == nil or after.updates ~= nil
+	local wantHistory = after == nil or after.history ~= nil
+	local result: types.ProjectActivity = { updates = noPage(), history = noPage() }
+	local pending = (if wantUpdates then 1 else 0) + (if wantHistory then 1 else 0)
+	local finished = false
+	local function settle(err: ApiError?)
+		if finished then
+			return
+		end
+		pending -= 1
+		if err ~= nil then
+			finished = true
+			cb(nil, err)
+		elseif pending <= 0 then
+			finished = true
+			cb(result, nil)
+		end
+	end
+	if pending == 0 then
+		finished = true
+		cb(result, nil)
+		return
+	end
+	if wantUpdates then
+		local variables = { id = id, first = UPDATES_PAGE_SIZE, after = if after ~= nil then after.updates else nil }
+		run(cfg, "ProjectUpdates", queries.ProjectUpdates, variables, function(data: Json): any
+			return activityPage(data, "projectUpdates", normalizeUpdate)
+		end, function(page, err)
+			if page ~= nil then
+				result.updates = page
+			end
+			settle(err)
+		end)
+	end
+	if wantHistory then
+		local variables = { id = id, first = HISTORY_PAGE_SIZE, after = if after ~= nil then after.history else nil }
+		run(cfg, "ProjectHistory", queries.ProjectHistory, variables, function(data: Json): any
+			return activityPage(data, "history", normalizeHistoryRecord)
+		end, function(page, err)
+			if page ~= nil then
+				result.history = page
+			end
+			settle(err)
+		end)
+	end
 end
 
 function linear.lookup(cfg: types.Config, identifier: string, cb: types.Callback<types.IssueRef?>)

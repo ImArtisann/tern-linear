@@ -120,12 +120,13 @@ local function header(page: ProjectPageState, project: Project?, now: number): N
 		ui.node("row", { key = "spacer", grow = 1 }),
 		linkButtons[1],
 		linkButtons[2],
-		ui.button(parts.syncedLabel(page.fetchedAt, now), {
+		-- Refresh reloads the tab on screen: its own loading state and sync time.
+		ui.button(parts.syncedLabel(if page.tab == "activity" then page.activityFetchedAt else page.fetchedAt, now), {
 			key = "refresh",
 			role = "linear.project-refresh",
 			icon = "repeat",
 			keys = { "r" },
-			busy = page.loading,
+			busy = if page.tab == "activity" then page.activityLoading else page.loading,
 			actions = { click = "refresh-project" },
 		}),
 	}, 8)
@@ -386,11 +387,234 @@ local function overview(_state: BlockState, page: ProjectPageState, project: Pro
 	)
 end
 
+-- ─── Activity ───────────────────────────────────────────────────────────────
+
+local function userName(user: types.User?): string
+	if user == nil then
+		return "Linear"
+	end
+	return if user.displayName ~= "" then user.displayName else user.name
+end
+
+-- Who the history's ids resolve to: the viewer, the project's lead and members, the teams' members and the
+-- authors already loaded; team names from the team list and the project.
+local function activityNames(
+	state: BlockState,
+	page: ProjectPageState,
+	project: Project?,
+	activity: types.ProjectActivity
+): model.ActivityNames
+	local users: { types.User } = {}
+	local viewer = state.viewer
+	if viewer ~= nil then
+		table.insert(users, viewer.user)
+	end
+	local lead = if project ~= nil then project.lead else nil
+	if lead ~= nil then
+		table.insert(users, lead)
+	end
+	local detail = page.detail
+	if detail ~= nil then
+		table.move(detail.members, 1, #detail.members, #users + 1, users)
+	end
+	for _, team in state.teams do
+		table.move(team.members, 1, #team.members, #users + 1, users)
+	end
+	for _, update in activity.updates.items do
+		local author = update.user
+		if author ~= nil then
+			table.insert(users, author)
+		end
+		for _, comment in update.comments do
+			local commenter = comment.user
+			if commenter ~= nil then
+				table.insert(users, commenter)
+			end
+		end
+	end
+	local teams: { { id: string, name: string } } = {}
+	for _, team in state.teams do
+		table.insert(teams, { id = team.id, name = team.name })
+	end
+	if project ~= nil then
+		for _, team in project.teams do
+			table.insert(teams, { id = team.id, name = team.name })
+		end
+	end
+	-- History milestone references come with an empty name: the project's milestones name them.
+	return model.activityNames(users, teams, if detail ~= nil then detail.milestones else {})
+end
+
+-- A relative time ("3d") with the absolute time as its tooltip.
+local function timeNode(key: string, at: number, now: number): Node
+	return ui.node("text", {
+		key = key,
+		role = "linear.activity-time",
+		title = model.absoluteTime(at),
+		spans = { ui.span(model.relativeSince(at, now), "muted") },
+	})
+end
+
+local function updateComment(comment: types.Comment, now: number): Node
+	return ui.node("col", { key = comment.id, role = "linear.activity-comment", gap = "xs" }, {
+		ui.node("row", { key = "head", role = "linear.comment-head", gap = "sm" }, {
+			ui.node("text", { key = "author", spans = { ui.span(userName(comment.user), "strong") } }),
+			timeNode("time", model.epoch(comment.createdAt) or 0, now),
+		}),
+		with(ui.md(text.safeMarkdown(comment.body)), { key = "body", role = "linear.comment-body" }),
+	})
+end
+
+-- One project update: author, health, time and edited marker over the Markdown body; the comment count toggles
+-- the loaded comments.
+local function updateNode(update: types.ProjectUpdate, page: ProjectPageState, now: number): Node
+	local head: { Node } = {
+		ui.node("text", {
+			key = "author",
+			role = "linear.activity-author",
+			spans = { ui.span(userName(update.user), "strong") },
+		}),
+	}
+	local badge = parts.healthBadge(update.health)
+	if badge ~= nil then
+		table.insert(head, with(badge, { role = "linear.activity-health" }))
+	end
+	-- The edited marker and the time sit at the end, where the events show their time.
+	table.insert(head, ui.node("row", { key = "spacer", grow = 1 }))
+	local edited = update.editedAt
+	local editedAt = if edited ~= nil then model.epoch(edited) else nil
+	if editedAt ~= nil then
+		table.insert(
+			head,
+			ui.node("text", {
+				key = "edited",
+				role = "linear.activity-edited",
+				title = `Edited {model.absoluteTime(editedAt)}`,
+				spans = { ui.span("edited ·", "muted") },
+			})
+		)
+	end
+	table.insert(head, timeNode("time", model.epoch(update.createdAt) or 0, now))
+	local children: { Node } = {
+		ui.node(
+			"row",
+			{ key = "head", role = "linear.activity-head", gap = "sm", align = "center", wrap = true },
+			head
+		),
+		with(ui.md(text.safeMarkdown(update.body)), { key = "body", role = "linear.activity-body" }),
+	}
+	if update.commentCount > 0 then
+		local expanded = page.expandedUpdates[update.id] == true
+		local count = update.commentCount
+		table.insert(
+			children,
+			ui.button(if count == 1 then "1 comment" else `{count} comments`, {
+				key = "comments-toggle",
+				role = "linear.activity-comments-toggle",
+				variant = "quiet",
+				size = "sm",
+				on = expanded,
+				actions = { click = `activity-comments={update.id}` },
+			})
+		)
+		if expanded then
+			local thread: { Node } = {}
+			for _, comment in update.comments do
+				table.insert(thread, updateComment(comment, now))
+			end
+			local hidden = count - #update.comments
+			if hidden > 0 then
+				table.insert(thread, muted("more", `{hidden} more in Linear`, "linear.activity-comments-more"))
+			end
+			table.insert(
+				children,
+				ui.node("col", { key = "comments", role = "linear.activity-comments", gap = "sm" }, thread)
+			)
+		end
+	end
+	return ui.node("col", {
+		key = update.id,
+		role = "linear.activity-update",
+		mark = update.health or "none",
+		gap = "xs",
+	}, children)
+end
+
+-- One history event: "<actor> <what>" and the time.
+local function eventNode(id: string, event: model.HistoryEvent, now: number): Node
+	local spans: { Span | string } = {}
+	local actor = event.actor
+	if actor ~= nil then
+		table.insert(spans, ui.span(actor, "strong"))
+		table.insert(spans, ` {event.text}`)
+	else
+		table.insert(spans, event.text)
+	end
+	return ui.node(
+		"row",
+		{ key = id, role = "linear.activity-event", mark = event.kind, gap = "sm", align = "start" },
+		{
+			ui.node("text", { key = "text", role = "linear.activity-text", grow = 1, basis = 0, spans = spans }),
+			timeNode("time", event.time, now),
+		}
+	)
+end
+
+-- The Activity tab: updates and history events in one newest-first feed, `Load more` for older pages.
+local function activityTab(
+	state: BlockState,
+	page: ProjectPageState,
+	project: Project?,
+	_cx: BlockCx,
+	now: number
+): Node
+	local children: { Node } = {}
+	local failure = page.activityError
+	if failure ~= nil then
+		table.insert(children, parts.banner("activity-error", "linear.activity-error", "error", "x-circle", failure))
+	end
+	local activity = page.activity
+	if activity == nil then
+		if failure == nil then
+			table.insert(children, loadingLine("loading", "linear.activity-loading"))
+		end
+		return ui.node("col", { key = "tab", role = "linear.activity", gap = "sm" }, children)
+	end
+	local timeline = model.activityTimeline(activity, activityNames(state, page, project, activity), now)
+	if #timeline.items == 0 and not timeline.more then
+		table.insert(children, muted("empty", "No activity yet", "linear.activity-empty"))
+	end
+	for _, item in timeline.items do
+		local update = item.update
+		local event = item.event
+		if update ~= nil then
+			table.insert(children, updateNode(update, page, now))
+		elseif event ~= nil then
+			table.insert(children, eventNode(item.id, event, now))
+		end
+	end
+	if timeline.more then
+		table.insert(
+			children,
+			ui.button("Load more", {
+				key = "more",
+				role = "linear.activity-more",
+				variant = "quiet",
+				busy = page.activityPaging,
+				disabled = page.activityLoading,
+				actions = { click = "activity-more" },
+			})
+		)
+	end
+	return ui.node("col", { key = "tab", role = "linear.activity", gap = "sm" }, children)
+end
+
 type TabRenderer = (BlockState, ProjectPageState, Project?, BlockCx, number) -> Node
 
 -- One renderer per tab id of model.PROJECT_TABS.
 local TAB_CONTENT: { [string]: TabRenderer } = {
 	overview = overview,
+	activity = activityTab,
 }
 
 -- ─── Public API ─────────────────────────────────────────────────────────────

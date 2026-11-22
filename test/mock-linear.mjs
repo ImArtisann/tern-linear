@@ -1,4 +1,4 @@
-// A stateful fake of the Linear GraphQL API for the sixteen operations in lib/queries.luau.
+// A stateful fake of the Linear GraphQL API for the eighteen operations in lib/queries.luau.
 //
 // Requests are executed by graphql-js against Linear's real SDL (.cache/linear-schema.graphql), so variable coercion,
 // validation errors and the shape of every response follow the documents the plugin sends. Resolvers read and mutate an
@@ -441,6 +441,47 @@ class Database {
 						.filter((m) => m.projectId === project.id && m.archivedAt === null)
 						.sort((a, b) => b.sortOrder - a.sortOrder)
 						.map((m) => ({ ...m, createdAt: iso(m.createdAt), updatedAt: iso(m.updatedAt), archivedAt: null })),
+					args,
+				),
+			// Newest first, like Linear's `first` pages.
+			projectUpdates: (args) =>
+				connection(
+					this.state_.projectUpdates
+						.filter((u) => u.projectId === project.id)
+						.sort((a, b) => b.createdAt - a.createdAt)
+						.map((u) => this.projectUpdateView(u, project)),
+					args,
+				),
+			history: (args) => {
+				const key = args.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
+				return connection(
+					this.state_.projectHistory
+						.filter((h) => h.projectId === project.id)
+						.sort((a, b) => b[key] - a[key])
+						.map((h) => ({ ...h, createdAt: iso(h.createdAt), updatedAt: iso(h.updatedAt), archivedAt: null })),
+					args,
+				);
+			},
+			// Project overview comments: the plugin does not read them (unused in the live workspace it was built against).
+			comments: (args) => connection([], args),
+		};
+	}
+
+	projectUpdateView(update, project) {
+		const comments = this.state_.updateComments.filter((c) => c.projectUpdateId === update.id);
+		return {
+			...update,
+			url: `https://linear.app/${this.state_.organization.urlKey}/project/${slugify(project.name)}-${project.slugId}/updates#${update.slugId}`,
+			createdAt: iso(update.createdAt),
+			updatedAt: iso(update.updatedAt),
+			editedAt: iso(update.editedAt),
+			archivedAt: null,
+			user: this.userView(this.user(update.userId)),
+			commentCount: comments.length,
+			// Newest first, like the other comment connections.
+			comments: (args) =>
+				connection(
+					comments.sort((a, b) => b.createdAt - a.createdAt).map((c) => this.commentView(c)),
 					args,
 				),
 		};

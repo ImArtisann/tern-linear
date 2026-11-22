@@ -752,16 +752,284 @@ check(
 )
 check(
 	"projectTab accepts known tabs only",
-	model.projectTab("overview") == "overview" and model.projectTab("gantt") == nil and model.projectTab(nil) == nil
+	model.projectTab("overview") == "overview"
+		and model.projectTab("activity") == "activity"
+		and model.projectTab("gantt") == nil
+		and model.projectTab(nil) == nil
 )
-check("PROJECT_TABS starts with Overview", model.PROJECT_TABS[1].id == "overview")
+check(
+	"PROJECT_TABS: Overview, then Activity",
+	model.PROJECT_TABS[1].id == "overview" and model.PROJECT_TABS[2].id == "activity" and #model.PROJECT_TABS == 2
+)
 local tabCount = #model.PROJECT_TABS
 check(
 	"stepProjectTab wraps around the tab list",
-	model.stepProjectTab("overview", 1) == model.PROJECT_TABS[1 % tabCount + 1].id
-		and model.stepProjectTab("overview", -1) == model.PROJECT_TABS[tabCount].id
+	model.stepProjectTab("overview", 1) == "activity"
+		and model.stepProjectTab("activity", 1) == "overview"
+		and model.stepProjectTab("overview", -1) == "activity"
 		and model.stepProjectTab("overview", tabCount) == "overview"
 )
+
+-- project activity
+
+local NOW = model.epoch("2026-11-22T12:00:00Z") :: number
+local function msAgo(seconds: number): number
+	return (NOW - seconds) * 1000
+end
+local NAMES = model.activityNames({ user("u-ada", "ada"), user("u-grace", "grace"), user("u-ada", "shadow") }, {
+	{ id = "t-eng", name = "Engineering" },
+	{ id = "t-des", name = "Design" },
+}, { { id = "m-alpha", name = "Alpha" }, { id = "m-beta", name = "Beta" } })
+check("activityNames keeps the first name per id", NAMES.users["u-ada"] == "ada" and NAMES.teams["t-des"] == "Design")
+
+local function line(entry: any): string?
+	local event = model.historyEvent(entry, NAMES, NOW)
+	if event == nil then
+		return nil
+	end
+	return if event.actor ~= nil then `{event.actor} {event.text}` else event.text
+end
+
+local AT = msAgo(3600)
+check("status change", line({
+	type = "status",
+	at = AT,
+	actorId = "u-ada",
+	fromStatus = { id = "s1", name = "Planned", type = "planned" },
+	toStatus = { id = "s2", name = "In Progress", type = "started" },
+}) == "ada changed status from Planned to In Progress")
+check(
+	"start date",
+	line({ type = "startDate", at = AT, actorId = "u-grace", to = "2026-11-30" })
+		== "grace set the start date to Nov 30"
+)
+check(
+	"rename",
+	line({ type = "name", at = AT, actorId = "u-ada", from = "Desktop client", to = "Desktop app" })
+		== "ada renamed the project from Desktop client to Desktop app"
+)
+check("icon", line({ type = "icon", at = AT, actorId = "u-ada", to = "Rocket" }) == "ada changed the icon")
+check(
+	"content with several actors",
+	line({ type = "content", at = AT, actorIds = { "u-ada", "u-grace" } }) == "ada and grace updated the description"
+)
+check("description by an integration", line({
+	type = "description",
+	at = AT,
+	actorId = "u-bot",
+	source = { type = "oauthClient", displayName = "Zapier" },
+}) == "Zapier updated the summary")
+check(
+	"an unknown actor reads Someone",
+	line({ type = "description", at = AT, actorId = "u-gone", source = { type = "apiKey" } })
+		== "Someone updated the summary"
+)
+check(
+	"lead team",
+	line({ type = "leadTeamId", at = AT, actorId = "u-ada", from = "t-eng", to = "t-des" })
+			== "ada changed the lead team from Engineering to Design"
+		and line({ type = "leadTeamId", at = AT, actorId = "u-ada", from = "t-x", to = "t-y" })
+			== "ada changed the lead team"
+)
+check(
+	"teams added and removed",
+	line({ type = "teams", at = AT, actorId = "u-ada", added = { "t-des" }, removed = {} }) == "ada added team Design"
+		and line({ type = "teams", at = AT, actorId = "u-ada", added = {}, removed = { "t-eng", "t-x" } }) == "ada removed teams Engineering and 1 other"
+		and line({ type = "teams", at = AT, actorId = "u-ada", added = { "t-x" }, removed = {} })
+			== "ada added a team"
+)
+check("milestones added", line({
+	type = "milestones",
+	at = AT,
+	actorId = "u-grace",
+	added = { { id = "m1", name = "Alpha" }, { id = "m2", name = "Beta" } },
+	removed = { { id = "m3", name = "Gamma" } },
+}) == "grace added milestones Alpha and Beta and removed milestone Gamma")
+local completion = model.historyEvent(
+	{ type = "milestone_completion", at = AT, milestone = { id = "m1", name = "Alpha" } },
+	NAMES,
+	NOW
+)
+check(
+	"milestone completion has no actor",
+	completion ~= nil and completion.actor == nil and completion.text == "Milestone Alpha completed"
+)
+check("event time is epoch seconds", completion ~= nil and completion.time == NOW - 3600)
+-- Linear sends milestone references with an empty name: the project's milestones name them by id.
+check(
+	"milestone references resolve by id",
+	line({ type = "milestone_completion", at = AT, milestone = { id = "m-beta", name = "" } })
+			== "Milestone Beta completed"
+		and line({
+				type = "milestones",
+				at = AT,
+				actorId = "u-grace",
+				added = { { id = "m-alpha", name = "" }, { id = "m-gone", name = "" } },
+				removed = {},
+			})
+			== "grace added milestones Alpha and 1 other"
+)
+check(
+	"unknown milestones read generically",
+	line({ type = "milestone_completion", at = AT, milestone = { id = "m-gone", name = "" } })
+			== "A milestone was completed"
+		and line({
+				type = "milestones",
+				at = AT,
+				actorId = "u-ada",
+				added = { { id = "m-gone", name = "" } },
+				removed = {},
+			})
+			== "ada added a milestone"
+)
+
+check("unknown kinds are skipped", line({ type = "labels", at = AT, actorId = "u-ada", added = { "l1" } }) == nil)
+check("entries without a numeric at are skipped", line({ type = "icon", at = "yesterday", actorId = "u-ada" }) == nil)
+check("entries without a type are skipped", line({ at = AT, actorId = "u-ada" }) == nil)
+check("non-table entries are skipped", line("status") == nil and line(nil) == nil)
+check(
+	"malformed known kinds are skipped",
+	line({ type = "status", at = AT, actorId = "u-ada", fromStatus = { name = "Planned" } }) == nil
+		and line({ type = "startDate", at = AT, actorId = "u-ada", to = "soon" }) == nil
+		and line({ type = "teams", at = AT, actorId = "u-ada", added = { 42 } }) == nil
+		and line({ type = "teams", at = AT, actorId = "u-ada", added = "t-eng" }) == nil
+		and line({ type = "milestones", at = AT, actorId = "u-ada", added = { "m1" } }) == nil
+		and line({ type = "milestones", at = AT, actorId = "u-ada", added = {}, removed = {} }) == nil
+		and line({ type = "milestone_completion", at = AT }) == nil
+)
+
+local function iso(secondsAgo: number): string
+	return os.date("!%Y-%m-%dT%H:%M:%SZ", NOW - secondsAgo) :: string
+end
+
+local function update(id: string, secondsAgo: number): types.ProjectUpdate
+	return {
+		id = id,
+		body = "",
+		health = "onTrack",
+		createdAt = iso(secondsAgo),
+		editedAt = nil,
+		commentCount = 0,
+		url = "",
+		user = nil,
+		comments = {},
+	}
+end
+
+local function record(id: string, updatedAgo: number, entries: { any }): types.ProjectHistoryRecord
+	return { id = id, createdAt = iso(updatedAgo + 600), updatedAt = iso(updatedAgo), entries = entries }
+end
+
+local function icon(secondsAgo: number): any
+	return { type = "icon", at = msAgo(secondsAgo), actorId = "u-ada", to = "Rocket" }
+end
+
+local function itemIds(timeline: model.ActivityTimeline): string
+	local out: { string } = {}
+	for _, item in timeline.items do
+		table.insert(out, item.id)
+	end
+	return table.concat(out, " ")
+end
+
+local function source<T>(items: { T }, cursor: string?): types.ActivitySource<T>
+	return { items = items, cursor = cursor, hasMore = cursor ~= nil }
+end
+
+local complete: types.ProjectActivity = {
+	updates = source({ update("u2", 100), update("u1", 500) }, nil),
+	history = source({
+		record("h2", 200, { icon(300), { type = "future", at = msAgo(250) }, icon(200) }),
+		record("h1", 400, { icon(400), "garbage" }),
+	}, nil),
+}
+local whole = model.activityTimeline(complete, NAMES, NOW)
+check("timeline merges updates and events newest first", itemIds(whole) == "u2 h2:3 h2:1 h1:1 u1")
+check("timeline without more pages", not whole.more and model.activityCursors(complete) == nil)
+
+local tie = model.activityTimeline({
+	updates = source({ update("b", 100) }, nil),
+	history = source({ record("a", 100, { icon(100) }) }, nil),
+}, NAMES, NOW)
+check("equal times order by id", itemIds(tie) == "a:1 b")
+
+-- Updates have another page below u1 (500 s ago): older history events wait for it.
+local partial: types.ProjectActivity = {
+	updates = source({ update("u2", 100), update("u1", 500) }, "c-u"),
+	history = source({ record("h1", 50, { icon(50), icon(800) }) }, nil),
+}
+local held = model.activityTimeline(partial, NAMES, NOW)
+check("items older than a paged source's oldest wait for Load more", itemIds(held) == "h1:1 u2 u1" and held.more)
+local cursors = model.activityCursors(partial)
+check(
+	"activityCursors names only sources with more",
+	cursors ~= nil and cursors.updates == "c-u" and cursors.history == nil
+)
+
+-- History paged by updatedAt: the oldest loaded record's updatedAt is the floor.
+local historyPaged = model.activityTimeline({
+	updates = source({ update("u1", 1000) }, nil),
+	history = source({ record("h1", 300, { icon(900), icon(300) }) }, "c-h"),
+}, NAMES, NOW)
+check("a paged history holds back events older than its oldest record", itemIds(historyPaged) == "h1:2")
+
+local appended = model.activityAppended(partial, {
+	updates = source({ update("u1", 500), update("u0", 900) }, nil),
+	history = source({}, nil),
+}, { updates = "c-u", history = nil })
+check(
+	"Load more appends new items once and takes the page's cursor",
+	#appended.updates.items == 3
+		and appended.updates.items[3].id == "u0"
+		and not appended.updates.hasMore
+		and appended.history == partial.history
+)
+check("after Load more everything shows", itemIds(model.activityTimeline(appended, NAMES, NOW)) == "h1:1 u2 u1 h1:2 u0")
+
+local loadedMore: types.ProjectActivity = {
+	updates = source({ update("u3", 100), update("u2", 200), update("u1", 300) }, "c-old"),
+	history = source({ record("h1", 100, {}) }, nil),
+}
+local reloaded = model.activityReloaded(loadedMore, {
+	updates = source({ update("u4", 10), update("u3", 100) }, "c-fresh"),
+	history = source({ record("h1", 100, { icon(100) }) }, nil),
+})
+local reloadedIds: { string } = {}
+for _, item in reloaded.updates.items do
+	table.insert(reloadedIds, item.id)
+end
+check(
+	"a reload keeps the older pages and their cursor",
+	table.concat(reloadedIds, " ") == "u4 u3 u2 u1" and reloaded.updates.cursor == "c-old"
+)
+check("a reload replaces a source that fits one page", #reloaded.history.items[1].entries == 1)
+local first = model.activityReloaded(nil, complete)
+check("the first load is the fresh data", first == complete)
+local grown = model.activityReloaded(complete, {
+	updates = source({ update("u9", 5) }, "c-new"),
+	history = complete.history,
+})
+check(
+	"a reload over a complete list stays complete",
+	#grown.updates.items == 3 and grown.updates.items[2].id == "u2" and not grown.updates.hasMore
+)
+local caughtUp = model.activityReloaded({
+	updates = source({ update("u2", 100) }, "c-old"),
+	history = complete.history,
+}, {
+	updates = source({ update("u3", 50), update("u2", 100) }, "c-fresh"),
+	history = complete.history,
+})
+check(
+	"a reload that covers every loaded item takes the fresh cursor",
+	#caughtUp.updates.items == 2 and caughtUp.updates.cursor == "c-fresh"
+)
+
+check(
+	"relativeSince matches relativeTime",
+	model.relativeSince(NOW - 7200, NOW) == "2h" and model.relativeSince(NOW - 3 * 86400, NOW) == "3d"
+)
+check("absoluteTime format", string.match(model.absoluteTime(NOW), "^%a%a%a %d+, %d%d%d%d, %d%d:%d%d$") ~= nil)
 
 if failures > 0 then
 	error(`{failures} model test(s) failed`)

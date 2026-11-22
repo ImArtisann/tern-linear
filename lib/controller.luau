@@ -57,6 +57,8 @@ type Run = {
 	detailToken: number,
 	-- Bumped whenever the project page's detail request is superseded (page closed, reopened, reloaded).
 	pageToken: number,
+	-- The same for the page's activity requests (first load, reloads, Load more).
+	activityToken: number,
 	-- Bumped when a Projects list request starts; see `goneProjects`.
 	projectsSeq: number,
 	-- Projects whose page answered `notfound`, mapped to `projectsSeq` at that moment: a list result from a request
@@ -231,6 +233,24 @@ local function emptyProjects(): types.ProjectsState
 	}
 end
 
+-- A project page with nothing loaded yet: the detail loads at once, the activity when its tab is first shown.
+local function newPage(id: string, tab: types.ProjectTab): types.ProjectPageState
+	return {
+		projectId = id,
+		tab = tab,
+		detail = nil,
+		loading = true,
+		error = nil,
+		fetchedAt = nil,
+		activity = nil,
+		activityLoading = false,
+		activityPaging = false,
+		activityError = nil,
+		activityFetchedAt = nil,
+		expandedUpdates = {},
+	}
+end
+
 -- A saved project page (`save().projectPage`): the project id and a known tab, else nil.
 local function restorePage(saved: any): types.ProjectPageState?
 	if type(saved) ~= "table" then
@@ -240,14 +260,7 @@ local function restorePage(saved: any): types.ProjectPageState?
 	if type(page) ~= "table" or type(page.id) ~= "string" or page.id == "" then
 		return nil
 	end
-	return {
-		projectId = page.id,
-		tab = model.projectTab(page.tab) or "overview",
-		detail = nil,
-		loading = true,
-		error = nil,
-		fetchedAt = nil,
-	}
+	return newPage(page.id, model.projectTab(page.tab) or "overview")
 end
 
 local function newState(cx: BlockCx, prefs: Prefs): BlockState
@@ -518,6 +531,7 @@ local function resetData(state: BlockState, run: Run)
 	run.reloadQueued = false
 	supersedeDetail(state, run)
 	run.pageToken += 1
+	run.activityToken += 1
 	state.projectPage = nil
 	run.editAfterLoad = nil
 	state.viewer = nil
@@ -1123,6 +1137,7 @@ local function closeProjectPage(state: BlockState, run: Run)
 		return
 	end
 	run.pageToken += 1
+	run.activityToken += 1
 	state.projectPage = nil
 	if findProject(state, page.projectId) ~= nil then
 		state.projects.selectedId = page.projectId
@@ -1199,14 +1214,89 @@ local function openProjectPage(state: BlockState, run: Run, id: string)
 	if state.focus == "search" then
 		setFocus(state, nil)
 	end
-	state.projectPage = { projectId = id, tab = "overview", detail = nil, loading = true, error = nil, fetchedAt = nil }
+	state.projectPage = newPage(id, "overview")
 	fetchProjectPage(state, run, true)
 end
 
-local function selectProjectTab(state: BlockState, tab: types.ProjectTab?)
+-- The Activity tab's requests, on their own token like the detail and never `busy`:
+-- "shown" (first show, `r`, Refresh on the tab) marks the tab loading, "poll" reloads silently; both reload the first
+-- pages and keep the older pages `Load more` added. "more" fetches the next pages and appends them.
+-- `notfound` closes the page like the detail; other failures show in the tab and keep what it had.
+local function fetchActivity(state: BlockState, run: Run, mode: "shown" | "poll" | "more")
 	local page = state.projectPage
-	if page ~= nil and tab ~= nil then
-		page.tab = tab
+	local cfg = run.cfg
+	if page == nil or cfg == nil then
+		return
+	end
+	local cursors: types.ActivityCursors? = nil
+	if mode == "more" then
+		local loaded = page.activity
+		cursors = if loaded ~= nil then model.activityCursors(loaded) else nil
+		if cursors == nil then
+			return
+		end
+		page.activityPaging = true
+	else
+		page.activityPaging = false
+		if mode == "shown" then
+			page.activityLoading = true
+		end
+	end
+	run.activityToken += 1
+	local token = run.activityToken
+	linear.projectActivity(cfg, page.projectId, cursors, function(result, err)
+		local live = liveRun(state)
+		if live == nil or live.activityToken ~= token or state.projectPage ~= page then
+			return
+		end
+		page.activityLoading = false
+		page.activityPaging = false
+		if result ~= nil then
+			local loaded = page.activity
+			if cursors ~= nil and loaded ~= nil then
+				page.activity = model.activityAppended(loaded, result, cursors)
+			else
+				page.activity = model.activityReloaded(loaded, result)
+				page.activityFetchedAt = os.time()
+			end
+			page.activityError = nil
+		else
+			local failure = err or unknownError()
+			if failure.kind == "notfound" then
+				closeProjectPage(state, live)
+				setNotice(state, live, "Project not found")
+			else
+				fail(state, failure, function(message: string)
+					page.activityError = message
+				end)
+			end
+		end
+		state.cx:render()
+	end)
+end
+
+-- Shows a tab; the Activity tab loads the first time it is shown (and after a failed first load).
+local function selectProjectTab(state: BlockState, run: Run, tab: types.ProjectTab?)
+	local page = state.projectPage
+	if page == nil or tab == nil then
+		return
+	end
+	page.tab = tab
+	if tab == "activity" and page.activity == nil and not page.activityLoading then
+		fetchActivity(state, run, "shown")
+	end
+end
+
+-- `r` / Refresh on the page: reloads the tab on screen.
+local function refreshProjectTab(state: BlockState, run: Run)
+	local page = state.projectPage
+	if page == nil then
+		return
+	end
+	if page.tab == "activity" then
+		fetchActivity(state, run, "shown")
+	else
+		fetchProjectPage(state, run, true)
 	end
 end
 
@@ -1238,11 +1328,15 @@ local function tick(state: BlockState, run: Run)
 		state.cx:render()
 		return
 	end
-	-- While the project page is open the list's polling pauses; the page's detail reloads on the same tick.
+	-- While the project page is open the list's polling pauses; the page's detail reloads on the same tick, and the
+	-- activity too while its tab is shown.
 	local page = if inProjects(state) then state.projectPage else nil
 	if page ~= nil then
 		if not page.loading then
 			fetchProjectPage(state, run, false)
+		end
+		if page.tab == "activity" and not page.activityLoading and not page.activityPaging then
+			fetchActivity(state, run, "poll")
 		end
 		return
 	end
@@ -2487,11 +2581,27 @@ local ACTIONS: { [string]: ActionHandler } = {
 	["project-back"] = function(state, run, _value)
 		closeProjectPage(state, run)
 	end,
-	["project-tab"] = function(state, _run, value)
-		selectProjectTab(state, model.projectTab(value))
+	["project-tab"] = function(state, run, value)
+		selectProjectTab(state, run, model.projectTab(value))
 	end,
 	["refresh-project"] = function(state, run, _value)
-		fetchProjectPage(state, run, true)
+		refreshProjectTab(state, run)
+	end,
+	["activity-more"] = function(state, run, _value)
+		local page = state.projectPage
+		if page ~= nil and page.tab == "activity" and not page.activityLoading and not page.activityPaging then
+			fetchActivity(state, run, "more")
+		end
+	end,
+	["activity-comments"] = function(state, _run, value)
+		local page = state.projectPage
+		if page ~= nil and value ~= nil then
+			if page.expandedUpdates[value] then
+				page.expandedUpdates[value] = nil
+			else
+				page.expandedUpdates[value] = true
+			end
+		end
 	end,
 	["open-project-url"] = function(state, run, value)
 		local project = if value ~= nil then knownProject(state, value) else nil
@@ -2537,6 +2647,8 @@ local ACTION_MODES: { [string]: Mode } = {
 	["project-back"] = "projects",
 	["project-tab"] = "projects",
 	["refresh-project"] = "projects",
+	["activity-more"] = "projects",
+	["activity-comments"] = "projects",
 	["open-project-url"] = "projects",
 	["copy-project-url"] = "projects",
 }
@@ -2929,10 +3041,10 @@ local function handlePageKey(state: BlockState, run: Run, page: types.ProjectPag
 		if #model.PROJECT_TABS < 2 then
 			return false
 		end
-		selectProjectTab(state, model.stepProjectTab(page.tab, if k.shift then -1 else 1))
+		selectProjectTab(state, run, model.stepProjectTab(page.tab, if k.shift then -1 else 1))
 		return true
 	elseif name == "r" then
-		fetchProjectPage(state, run, true)
+		refreshProjectTab(state, run)
 		return true
 	elseif name == "i" then
 		setMode(state, run, "issues")
@@ -3184,8 +3296,13 @@ local function startRun(state: BlockState, run: Run)
 		state.keySource = credentials.source()
 		state.phase = "loading"
 		loadAll(state, false)
-		-- A restored project page loads beside the list; it shows once the list is ready.
+		-- A restored project page loads beside the list (and its Activity tab when that was the saved tab); it
+		-- shows once the list is ready.
 		fetchProjectPage(state, run, true)
+		local page = state.projectPage
+		if page ~= nil then
+			selectProjectTab(state, run, page.tab)
+		end
 	end
 	schedulePoll(state, run)
 end
@@ -3206,6 +3323,7 @@ local function register(state: BlockState): Run
 		projectsSeq = 0,
 		goneProjects = {},
 		readyNotice = nil,
+		activityToken = 0,
 		fgKind = nil,
 		lastFullAt = tern.now(),
 		focusQueued = false,

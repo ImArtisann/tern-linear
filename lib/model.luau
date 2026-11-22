@@ -310,6 +310,11 @@ function model.relativeTime(iso: string, now: number): string
 	if at == nil then
 		return ""
 	end
+	return model.relativeSince(at, now)
+end
+
+-- model.relativeTime of an epoch second.
+function model.relativeSince(at: number, now: number): string
 	local elapsed = now - at
 	if elapsed < 60 then
 		return "now"
@@ -899,6 +904,7 @@ end
 -- The project page's tabs in tab-bar order. A layer that adds a tab appends it here (and to types.ProjectTab).
 local PROJECT_TABS: { { id: ProjectTab, label: string } } = table.freeze({
 	table.freeze({ id = "overview" :: ProjectTab, label = "Overview" }),
+	table.freeze({ id = "activity" :: ProjectTab, label = "Activity" }),
 })
 model.PROJECT_TABS = PROJECT_TABS
 
@@ -968,6 +974,447 @@ function model.namesLabel(names: { string }, max: number): string
 	end
 	local shown = table.move(names, 1, max, 1, {})
 	return `{table.concat(shown, ", ")} +{#names - max}`
+end
+
+-- ─── Project activity ───────────────────────────────────────────────────────
+
+-- Display names the Activity tab resolves ids with: users, teams and the project's milestones, by id.
+export type ActivityNames = {
+	users: { [string]: string },
+	teams: { [string]: string },
+	milestones: { [string]: string },
+}
+
+-- One history event the Activity tab can describe: `actor` (nil for events without one, e.g. a milestone that
+-- completed) and `text` read as one line, "<actor> <text>".
+export type HistoryEvent = {
+	-- The event's `type` (status, startDate, …).
+	kind: string,
+	-- Epoch seconds.
+	time: number,
+	actor: string?,
+	text: string,
+}
+
+-- One row of the Activity tab: a project update or a history event, `time` in epoch seconds.
+export type ActivityItem = {
+	-- Update id, or "<history record id>:<entry index>".
+	id: string,
+	time: number,
+	update: types.ProjectUpdate?,
+	event: HistoryEvent?,
+}
+
+export type ActivityTimeline = {
+	-- Newest first; only items no unloaded page can precede (see model.activityTimeline).
+	items: { ActivityItem },
+	-- A source has another page (`Load more`).
+	more: boolean,
+}
+
+local UNKNOWN_ACTOR = "Someone"
+
+-- Names for `users` (display name), `teams` and `milestones` (name); later entries never replace earlier ones.
+function model.activityNames(
+	users: { types.User },
+	teams: { { id: string, name: string } },
+	milestones: { ProjectMilestone }
+): ActivityNames
+	local names: ActivityNames = { users = {}, teams = {}, milestones = {} }
+	for _, user in users do
+		if names.users[user.id] == nil then
+			names.users[user.id] = if user.displayName ~= "" then user.displayName else user.name
+		end
+	end
+	for _, team in teams do
+		if names.teams[team.id] == nil then
+			names.teams[team.id] = team.name
+		end
+	end
+	for _, milestone in milestones do
+		if names.milestones[milestone.id] == nil then
+			names.milestones[milestone.id] = milestone.name
+		end
+	end
+	return names
+end
+
+local function nonEmpty(value: any): string?
+	return if type(value) == "string" and value ~= "" then value else nil
+end
+
+-- "<a>", "<a> and <b>", "<a>, <b> and <c>".
+local function joinNames(names: { string }): string
+	if #names <= 1 then
+		return names[1] or ""
+	end
+	return `{table.concat(names, ", ", 1, #names - 1)} and {names[#names]}`
+end
+
+-- The actor of an entry: `actorId`, else every `actorIds` member; an id nobody resolves reads "Someone"
+-- (an integration's `source.displayName` when it has one). nil when the entry names no actor.
+local function entryActor(entry: any, names: ActivityNames): string?
+	local ids: { string } = {}
+	if type(entry.actorId) == "string" then
+		table.insert(ids, entry.actorId)
+	elseif type(entry.actorIds) == "table" then
+		for _, id in ipairs(entry.actorIds) do
+			if type(id) == "string" then
+				table.insert(ids, id)
+			end
+		end
+	end
+	if #ids == 0 then
+		return nil
+	end
+	local resolved: { string } = {}
+	local unknown = false
+	for _, id in ids do
+		local name = names.users[id]
+		if name ~= nil then
+			table.insert(resolved, name)
+		else
+			unknown = true
+		end
+	end
+	if unknown then
+		local source = entry.source
+		local via = if type(source) == "table" then nonEmpty(source.displayName) else nil
+		table.insert(resolved, via or UNKNOWN_ACTOR)
+	end
+	return joinNames(resolved)
+end
+
+-- Names of one side (added or removed) of a list event; `unknown` counts ids no name resolves.
+type NamedSide = { names: { string }, unknown: number }
+
+-- A milestone reference `{id, name}`: its name, else the project's name for that id (Linear sends `name` empty).
+-- nil when the value is not such a reference; "" when neither names it.
+local function milestoneName(value: any, names: ActivityNames): string?
+	if type(value) ~= "table" or type(value.id) ~= "string" then
+		return nil
+	end
+	return nonEmpty(value.name) or names.milestones[value.id] or ""
+end
+
+-- The names of a list of milestone references; unnamed ones count as unknown. nil when it is not such a list.
+local function milestoneList(value: any, names: ActivityNames): NamedSide?
+	if type(value) ~= "table" then
+		return nil
+	end
+	local side: NamedSide = { names = {}, unknown = 0 }
+	for _, item in ipairs(value) do
+		local name = milestoneName(item, names)
+		if name == nil then
+			return nil
+		elseif name == "" then
+			side.unknown += 1
+		else
+			table.insert(side.names, name)
+		end
+	end
+	return side
+end
+
+-- Team names of a list of team ids; nil when the value is not a list of strings.
+local function teamList(value: any, names: ActivityNames): NamedSide?
+	if type(value) ~= "table" then
+		return nil
+	end
+	local side: NamedSide = { names = {}, unknown = 0 }
+	for _, id in ipairs(value) do
+		if type(id) ~= "string" then
+			return nil
+		end
+		local name = names.teams[id]
+		if name ~= nil then
+			table.insert(side.names, name)
+		else
+			side.unknown += 1
+		end
+	end
+	return side
+end
+
+-- "added team Design", "added teams Design and Engineering", "added a team", "added 2 teams",
+-- "added teams Design and 1 other"; nil for an empty side.
+local function sidePhrase(verb: string, noun: string, side: NamedSide): string?
+	local count = #side.names + side.unknown
+	if count == 0 then
+		return nil
+	elseif #side.names == 0 then
+		return if count == 1 then `{verb} a {noun}` else `{verb} {count} {noun}s`
+	end
+	local list = table.clone(side.names)
+	if side.unknown > 0 then
+		table.insert(list, if side.unknown == 1 then "1 other" else `{side.unknown} others`)
+	end
+	return `{verb} {if count == 1 then noun else noun .. "s"} {joinNames(list)}`
+end
+
+-- "added milestone Alpha and removed milestones Beta and Gamma"; nil when both sides are empty.
+local function addedRemoved(noun: string, added: NamedSide, removed: NamedSide): string?
+	local add = sidePhrase("added", noun, added)
+	local remove = sidePhrase("removed", noun, removed)
+	if add ~= nil and remove ~= nil then
+		return `{add} and {remove}`
+	end
+	return add or remove
+end
+
+-- Describers per entry `type` (the kinds observed in live data; docs/ARCHITECTURE.md lists them). Each returns the
+-- line's text, or nil when the entry does not have the shape that kind was seen with.
+local HISTORY_KINDS: { [string]: (entry: any, names: ActivityNames, now: number) -> string? } = {
+	status = function(entry)
+		local from = if type(entry.fromStatus) == "table" then nonEmpty(entry.fromStatus.name) else nil
+		local to = if type(entry.toStatus) == "table" then nonEmpty(entry.toStatus.name) else nil
+		if to == nil then
+			return nil
+		end
+		return if from ~= nil then `changed status from {from} to {to}` else `changed status to {to}`
+	end,
+	startDate = function(entry, _names, now)
+		local to = nonEmpty(entry.to)
+		local label = if to ~= nil then model.shortDate(to, now) else ""
+		return if label ~= "" then `set the start date to {label}` else nil
+	end,
+	name = function(entry)
+		local from = nonEmpty(entry.from)
+		local to = nonEmpty(entry.to)
+		if to == nil then
+			return nil
+		end
+		return if from ~= nil then `renamed the project from {from} to {to}` else `renamed the project to {to}`
+	end,
+	icon = function()
+		return "changed the icon"
+	end,
+	content = function()
+		return "updated the description"
+	end,
+	description = function()
+		return "updated the summary"
+	end,
+	leadTeamId = function(entry, names)
+		local from = if type(entry.from) == "string" then names.teams[entry.from] else nil
+		local to = if type(entry.to) == "string" then names.teams[entry.to] else nil
+		if from ~= nil and to ~= nil then
+			return `changed the lead team from {from} to {to}`
+		elseif to ~= nil then
+			return `changed the lead team to {to}`
+		end
+		return "changed the lead team"
+	end,
+	teams = function(entry, names)
+		local added = teamList(entry.added or {}, names)
+		local removed = teamList(entry.removed or {}, names)
+		if added == nil or removed == nil then
+			return nil
+		end
+		return addedRemoved("team", added, removed)
+	end,
+	milestones = function(entry, names)
+		local added = milestoneList(entry.added or {}, names)
+		local removed = milestoneList(entry.removed or {}, names)
+		if added == nil or removed == nil then
+			return nil
+		end
+		return addedRemoved("milestone", added, removed)
+	end,
+	milestone_completion = function(entry, names)
+		local name = milestoneName(entry.milestone, names)
+		if name == nil then
+			return nil
+		end
+		return if name ~= "" then `Milestone {name} completed` else "A milestone was completed"
+	end,
+}
+
+-- Kinds that never name an actor: their text is the whole line.
+local ACTORLESS: { [string]: boolean } = { milestone_completion = true }
+
+-- One raw `ProjectHistory.entries` element as a line, or nil when its kind is unknown or its shape is not the one
+-- observed (no `type`, no numeric `at`, missing fields). Ids resolve through `names`; `now` dates short dates.
+function model.historyEvent(entry: any, names: ActivityNames, now: number): HistoryEvent?
+	if type(entry) ~= "table" or type(entry.type) ~= "string" or type(entry.at) ~= "number" then
+		return nil
+	end
+	local describe = HISTORY_KINDS[entry.type]
+	if describe == nil then
+		return nil
+	end
+	local ok, line = pcall(describe, entry, names, now)
+	if not ok or type(line) ~= "string" then
+		return nil
+	end
+	local actor: string? = nil
+	if not ACTORLESS[entry.type] then
+		actor = entryActor(entry, names) or UNKNOWN_ACTOR
+	end
+	return { kind = entry.type, time = entry.at / 1000, actor = actor, text = line }
+end
+
+-- The oldest time of a source with more pages: anything older may still be preceded by an unloaded item.
+local function sourceFloor<T>(source: types.ActivitySource<T>, timeOf: (T) -> number?): number?
+	if not source.hasMore then
+		return nil
+	end
+	local floor: number? = nil
+	for _, item in source.items do
+		local time = timeOf(item)
+		if time ~= nil and (floor == nil or time < floor) then
+			floor = time
+		end
+	end
+	return floor
+end
+
+local function updateTime(update: types.ProjectUpdate): number?
+	return model.epoch(update.createdAt)
+end
+
+local function recordTime(record: types.ProjectHistoryRecord): number?
+	return model.epoch(record.updatedAt)
+end
+
+-- The Activity tab's timeline: updates and the history events `historyEvent` describes, newest first (ties by
+-- id). Items older than a source's oldest loaded item while that source has more pages are held back, so loading
+-- the next page never inserts anything above an item already shown.
+function model.activityTimeline(activity: types.ProjectActivity, names: ActivityNames, now: number): ActivityTimeline
+	local items: { ActivityItem } = {}
+	for _, update in activity.updates.items do
+		local time = updateTime(update)
+		if time ~= nil then
+			table.insert(items, { id = update.id, time = time, update = update, event = nil })
+		end
+	end
+	for _, record in activity.history.items do
+		for index, entry in record.entries do
+			local event = model.historyEvent(entry, names, now)
+			if event ~= nil then
+				table.insert(items, { id = `{record.id}:{index}`, time = event.time, update = nil, event = event })
+			end
+		end
+	end
+	local cutoff = sourceFloor(activity.updates, updateTime)
+	local historyFloor = sourceFloor(activity.history, recordTime)
+	if historyFloor ~= nil and (cutoff == nil or historyFloor > cutoff) then
+		cutoff = historyFloor
+	end
+	local shown: { ActivityItem } = {}
+	for _, item in items do
+		if cutoff == nil or item.time >= cutoff then
+			table.insert(shown, item)
+		end
+	end
+	table.sort(shown, function(a: ActivityItem, b: ActivityItem): boolean
+		if a.time ~= b.time then
+			return a.time > b.time
+		end
+		return a.id < b.id
+	end)
+	return { items = shown, more = activity.updates.hasMore or activity.history.hasMore }
+end
+
+-- The cursors `Load more` sends: each source with another page; nil when no source has one.
+function model.activityCursors(activity: types.ProjectActivity): types.ActivityCursors?
+	local updates = if activity.updates.hasMore then activity.updates.cursor else nil
+	local history = if activity.history.hasMore then activity.history.cursor else nil
+	if updates == nil and history == nil then
+		return nil
+	end
+	return { updates = updates, history = history }
+end
+
+-- A reloaded first page merged over what was loaded: the fresh page wins, the older pages loaded with `Load more`
+-- stay (items older than the fresh page's oldest, minus the ones the fresh page carries), with their cursor.
+local function reloadSource<T>(
+	old: types.ActivitySource<T>,
+	fresh: types.ActivitySource<T>,
+	idOf: (T) -> string,
+	timeOf: (T) -> number?
+): types.ActivitySource<T>
+	local freshIds: { [string]: boolean } = {}
+	local oldest: number? = nil
+	for _, item in fresh.items do
+		freshIds[idOf(item)] = true
+		local time = timeOf(item)
+		if time ~= nil and (oldest == nil or time < oldest) then
+			oldest = time
+		end
+	end
+	if not fresh.hasMore or oldest == nil then
+		return fresh
+	end
+	local items = table.clone(fresh.items)
+	local kept = 0
+	for _, item in old.items do
+		local time = timeOf(item)
+		if not freshIds[idOf(item)] and time ~= nil and time < oldest then
+			table.insert(items, item)
+			kept += 1
+		end
+	end
+	if kept == 0 then
+		return fresh
+	end
+	return { items = items, cursor = old.cursor, hasMore = old.hasMore }
+end
+
+local function updateId(update: types.ProjectUpdate): string
+	return update.id
+end
+
+local function recordId(record: types.ProjectHistoryRecord): string
+	return record.id
+end
+
+-- A reload of the first pages (`r`, the poll tick) applied over `old` (nil: the first load).
+function model.activityReloaded(old: types.ProjectActivity?, fresh: types.ProjectActivity): types.ProjectActivity
+	if old == nil then
+		return fresh
+	end
+	return {
+		updates = reloadSource(old.updates, fresh.updates, updateId, updateTime),
+		history = reloadSource(old.history, fresh.history, recordId, recordTime),
+	}
+end
+
+local function appendSource<T>(
+	old: types.ActivitySource<T>,
+	page: types.ActivitySource<T>,
+	idOf: (T) -> string
+): types.ActivitySource<T>
+	local seen: { [string]: boolean } = {}
+	local items = table.clone(old.items)
+	for _, item in items do
+		seen[idOf(item)] = true
+	end
+	for _, item in page.items do
+		if not seen[idOf(item)] then
+			seen[idOf(item)] = true
+			table.insert(items, item)
+		end
+	end
+	return { items = items, cursor = page.cursor, hasMore = page.hasMore }
+end
+
+-- The next pages (`Load more` with `cursors`) appended to `old`; sources without a cursor stay as they were.
+function model.activityAppended(
+	old: types.ProjectActivity,
+	page: types.ProjectActivity,
+	cursors: types.ActivityCursors
+): types.ProjectActivity
+	return {
+		updates = if cursors.updates ~= nil then appendSource(old.updates, page.updates, updateId) else old.updates,
+		history = if cursors.history ~= nil then appendSource(old.history, page.history, recordId) else old.history,
+	}
+end
+
+-- "Nov 22, 2026, 19:47" in the host's local time (the title of a relative time).
+function model.absoluteTime(at: number): string
+	local t = os.date("*t", math.floor(at)) :: { [string]: any }
+	return string.format("%s %d, %d, %02d:%02d", MONTH_NAMES[t.month], t.day, t.year, t.hour, t.min)
 end
 
 return model

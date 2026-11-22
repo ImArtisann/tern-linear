@@ -199,6 +199,56 @@ export type ProjectDetail = {
 	milestonesTruncated: boolean,
 }
 
+-- One published project update (Linear's `ProjectUpdate`).
+export type ProjectUpdate = {
+	id: string,
+	-- Markdown.
+	body: string,
+	-- "onTrack" | "atRisk" | "offTrack"; nil for any other value.
+	health: string?,
+	createdAt: string,
+	-- When the author last edited it; nil when never edited.
+	editedAt: string?,
+	-- All comments on the update (`comments` holds the newest UPDATE_COMMENTS of them).
+	commentCount: number,
+	url: string,
+	-- nil for integrations.
+	user: User?,
+	-- The newest UPDATE_COMMENTS (10) comments, ascending by createdAt.
+	comments: { Comment },
+}
+
+-- One record of `Project.history`. Linear groups the events of a time window into one record; `entries` holds
+-- them raw (`ProjectHistory.entries` is untyped JSON, a list of objects with `type` and `at` in epoch ms).
+-- model.historyEvent reads the kinds it knows; see docs/ARCHITECTURE.md.
+export type ProjectHistoryRecord = {
+	id: string,
+	createdAt: string,
+	-- The paging order (`orderBy: updatedAt`): no unloaded record holds an event newer than this.
+	updatedAt: string,
+	entries: { any },
+}
+
+-- The loaded pages of one newest-first connection.
+export type ActivitySource<T> = {
+	items: { T },
+	-- The `after` cursor of the next page; nil when there is none.
+	cursor: string?,
+	hasMore: boolean,
+}
+
+-- The Activity tab's data: project updates (newest createdAt first) and history records (newest updatedAt first).
+export type ProjectActivity = {
+	updates: ActivitySource<ProjectUpdate>,
+	history: ActivitySource<ProjectHistoryRecord>,
+}
+
+-- The next pages to fetch (`Load more`); a nil cursor skips that source.
+export type ActivityCursors = {
+	updates: string?,
+	history: string?,
+}
+
 -- ─── Data layer ─────────────────────────────────────────────────────────────
 
 export type Config = {
@@ -357,7 +407,7 @@ export type ProjectsState = {
 
 -- A tab of the project page. Each tab is one entry of model.PROJECT_TABS (the tab bar's order); a layer that
 -- adds a tab extends this union and that list, and keeps its own data in ProjectPageState.
-export type ProjectTab = "overview"
+export type ProjectTab = "overview" | "activity"
 
 -- The project page: full-screen over projects mode's list, which stays loaded (scope, view, layout and
 -- selection untouched) for Back.
@@ -372,6 +422,19 @@ export type ProjectPageState = {
 	error: string?,
 	-- Epoch seconds of the last successful detail load.
 	fetchedAt: number?,
+
+	-- The Activity tab's data; nil until the tab is first shown and loaded.
+	activity: ProjectActivity?,
+	-- A shown activity request is in flight (first show, `r`, Refresh on the tab); poll reloads keep it false.
+	activityLoading: boolean,
+	-- A `Load more` request is in flight.
+	activityPaging: boolean,
+	-- The last activity request failed (shown in the tab; what it had stays).
+	activityError: string?,
+	-- Epoch seconds of the last successful activity load.
+	activityFetchedAt: number?,
+	-- Project updates whose comments are expanded, by update id.
+	expandedUpdates: { [string]: boolean },
 }
 
 export type BlockState = {

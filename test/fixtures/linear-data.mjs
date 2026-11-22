@@ -22,6 +22,9 @@ const KIND = {
 	projectStatus: 11,
 	projectLabel: 12,
 	milestone: 13,
+	projectUpdate: 14,
+	projectHistory: 15,
+	updateComment: 16,
 };
 
 /** Stable UUID-shaped ids: the first group names the entity kind, the last one its ordinal. */
@@ -130,6 +133,100 @@ The web app cannot reach the file system or run in the background. A native clie
 
 See the [design spec](https://linear.app/acme/document/desktop-spec), the ![tray wireframe](https://uploads.linear.app/acme/tray.png) and the [old prototype](javascript:alert(1)).`;
 
+const HOUR = 60 * MINUTE;
+
+// Project updates: [author, health, age, Markdown body, edited age (null: never), comments [author, age, body]].
+const DESKTOP_UPDATES = [
+	[
+		"ada",
+		"onTrack",
+		3 * DAY,
+		"**Beta** is feature-complete.\n\n- Tray icon shipped\n- Offline cache in review\n\nNext: the [release checklist](https://linear.app/acme/document/release).",
+		null,
+		[],
+	],
+	[
+		"grace",
+		"atRisk",
+		8 * DAY,
+		"The accessibility audit found two `blocking` issues in the settings window.",
+		7 * DAY,
+		[
+			["linus", 8 * DAY - 2 * HOUR, "Which screens fail?"],
+			["grace", 7 * DAY, "Settings and onboarding; fixes are in review."],
+		],
+	],
+	["ada", "offTrack", 15 * DAY, "Signing certificates expired; release builds are blocked until they are renewed.", null, []],
+];
+
+// History records in the shape Linear's `ProjectHistory.entries` has (a list of events with `type` and `at` in epoch
+// ms), observed read-only against a live workspace and anonymized. `r` resolves the seed's ids.
+// [created age, updated age, (r) => entries]. Unknown and malformed entries must never show.
+const DESKTOP_HISTORY = [
+	[
+		40 * DAY,
+		40 * DAY - 10 * MINUTE,
+		(r) => [
+			{ type: "status", at: r.at(40 * DAY), actorId: r.user("ada"), fromStatus: r.status("Planned"), toStatus: r.status("In Progress") },
+			{ type: "startDate", at: r.at(40 * DAY - MINUTE), actorId: r.user("ada"), to: r.day(-40) },
+			{ type: "externalSync", at: r.at(40 * DAY - 2 * MINUTE), actorId: r.user("ada"), target: "github" },
+			{ type: "status", at: "yesterday", actorId: r.user("ada"), fromStatus: r.status("Backlog"), toStatus: r.status("Planned") },
+		],
+	],
+	[
+		20 * DAY,
+		5 * DAY,
+		(r) => [
+			{
+				type: "milestones",
+				at: r.at(20 * DAY),
+				actorId: r.user("grace"),
+				added: [r.milestone("Alpha"), r.milestone("Beta")],
+				removed: [],
+				source: { type: "apiKey" },
+			},
+			{
+				type: "teams",
+				at: r.at(19 * DAY),
+				actorId: r.user("ada"),
+				added: [r.team("DES")],
+				removed: [],
+				source: { type: "oauthClient", id: "oauth-1", displayName: "Acme Sync", oauthTokenUserId: r.user("ada") },
+			},
+			{ type: "milestone_completion", at: r.at(6 * DAY), milestone: r.milestone("Alpha") },
+			{ type: "content", at: r.at(5 * DAY), actorIds: [r.user("ada"), r.user("grace")], source: { type: "apiKey" } },
+		],
+	],
+	[
+		DAY,
+		DAY - 30 * MINUTE,
+		(r) => [
+			{ type: "name", at: r.at(DAY), actorId: r.user("grace"), from: "Desktop client", to: "Desktop app" },
+			{ type: "leadTeamId", at: r.at(DAY - 10 * MINUTE), actorId: r.user("grace"), from: r.team("ENG"), to: r.team("DES") },
+			{ type: "description", at: r.at(DAY - 20 * MINUTE), actorId: r.user("ada"), source: { type: "apiKey" } },
+			{ type: "icon", at: r.at(DAY - 30 * MINUTE), actorId: r.user("ada"), to: "Computer" },
+		],
+	],
+	[2 * DAY, 2 * DAY, () => []],
+];
+
+// More updates than the plugin's first page (20): the rest and the older status change come with `Load more`.
+const SYNC_UPDATES = Array.from({ length: 24 }, (_, i) => [
+	"linus",
+	i % 3 === 0 ? "atRisk" : "onTrack",
+	(i + 1) * DAY,
+	`Day ${24 - i}: merged ${i + 2} CRDT patches.`,
+	null,
+	[],
+]);
+const SYNC_HISTORY = [
+	[
+		30 * DAY,
+		30 * DAY,
+		(r) => [{ type: "status", at: r.at(30 * DAY), actorId: r.user("linus"), fromStatus: r.status("Planned"), toStatus: r.status("In Progress") }],
+	],
+];
+
 // The viewer is ada. `members` are handles; `teams` team keys (they double as the project's accessible teams).
 // Dates: `target`/`start` in days from now (negative: past), the rest in ms ago.
 // "Desktop app" stays first: the issue seed refers to projects by index.
@@ -140,6 +237,8 @@ const PROJECTS = [
 		content: DESKTOP_DOC,
 		labels: ["Platform", "Customer request", "Initiatives"],
 		healthUpdated: 3 * DAY,
+		updates: DESKTOP_UPDATES,
+		history: DESKTOP_HISTORY,
 		// [name, status, progress in percent (Linear's 0..100), target in days from now (null: none), sortOrder].
 		// Linear's order is the sortOrder: Alpha, Beta, Accessibility audit, Public launch (neither by name nor by
 		// target date).
@@ -169,6 +268,8 @@ const PROJECTS = [
 		content: "Replace the polling sync with **CRDT** documents.",
 		labels: ["Platform"],
 		healthUpdated: 1 * DAY,
+		updates: SYNC_UPDATES,
+		history: SYNC_HISTORY,
 		milestones: [
 			["Protocol draft", "done", 100, -10, 1],
 			["Offline mode", "next", 20, 10, 2],
@@ -721,6 +822,67 @@ function build(now) {
 		}
 	});
 
+	// Project updates, their comments and history records. History entries resolve ids the way Linear sends them.
+	const projectUpdates = [];
+	const updateComments = [];
+	const projectHistory = [];
+	let updateOrdinal = 0;
+	let updateCommentOrdinal = 0;
+	let historyOrdinal = 0;
+	const statusRef = (name) => {
+		const status = projectStatuses.find((s) => s.name === name && s.archivedAt === null);
+		return { id: status.id, name: status.name, type: status.type };
+	};
+	PROJECTS.forEach((p, i) => {
+		const projectId = projects[i].id;
+		for (const [author, health, age, body, edited, comments] of p.updates ?? []) {
+			const id = uuid("projectUpdate", ++updateOrdinal);
+			projectUpdates.push({
+				id,
+				projectId,
+				userId: userByHandle.get(author).id,
+				health,
+				body,
+				slugId: id.slice(-8),
+				createdAt: ago(age),
+				updatedAt: ago(edited ?? age),
+				editedAt: edited === null ? null : ago(edited),
+			});
+			for (const [commenter, commentAge, commentBody] of comments) {
+				updateComments.push({
+					id: uuid("updateComment", ++updateCommentOrdinal),
+					projectUpdateId: id,
+					userId: userByHandle.get(commenter).id,
+					body: commentBody,
+					createdAt: ago(commentAge),
+					updatedAt: ago(commentAge),
+					parentId: null,
+				});
+			}
+		}
+		const resolver = {
+			at: ago,
+			day,
+			user: (handle) => userByHandle.get(handle).id,
+			team: (key) => teamByKey.get(key).id,
+			status: statusRef,
+			// Linear sends milestone references with an empty name; clients resolve the id.
+			milestone: (name) => {
+				const milestone = projectMilestones.find((m) => m.projectId === projectId && m.name === name);
+				return { id: milestone.id, name: "" };
+			},
+		};
+		for (const [created, updated, entries] of p.history ?? []) {
+			projectHistory.push({
+				id: uuid("projectHistory", ++historyOrdinal),
+				projectId,
+				createdAt: ago(created),
+				updatedAt: ago(updated),
+				entries: entries(resolver),
+			});
+		}
+	});
+
 	const issues = ISSUES.map((spec, i) => {
 		const team = teamByKey.get(spec.team);
 		const state = team.states.find((s) => s.name === spec.state);
@@ -788,6 +950,9 @@ function build(now) {
 		projects,
 		projectLabels,
 		projectMilestones,
+		projectUpdates,
+		updateComments,
+		projectHistory,
 		teams,
 		issues,
 		relations,

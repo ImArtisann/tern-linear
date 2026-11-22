@@ -60,6 +60,8 @@ async function measureComplexity(key) {
 		const nodes =
 			body.data.projects?.nodes?.length ??
 			body.data.organization?.projectStatuses?.length ??
+			body.data.project?.projectUpdates?.nodes?.length ??
+			body.data.project?.history?.nodes?.length ??
 			body.data.project?.projectMilestones?.nodes?.length;
 		results.push({ operation, request, complexity, nodes });
 		return body.data;
@@ -69,7 +71,15 @@ async function measureComplexity(key) {
 		const data = await send(operation, variables, request);
 		if (operation === "Projects" && !variables.filter) firstProject = data.projects.nodes[0]?.id;
 	}
-	if (firstProject) await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
+	if (firstProject) {
+		await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
+		// The Activity tab's first pages, with the plugin's page sizes (the documents' defaults).
+		await send("ProjectUpdates", { id: firstProject }, "Activity tab, first 20 updates with 10 comments each");
+		const history = await send("ProjectHistory", { id: firstProject }, "Activity tab, first 25 history records");
+		// Only the event kinds, never their content.
+		const kinds = new Set(history.project.history.nodes.flatMap((record) => (Array.isArray(record.entries) ? record.entries : []).map((entry) => entry?.type)));
+		results.historyKinds = [...kinds].filter((kind) => typeof kind === "string").sort();
+	}
 	return results;
 }
 
@@ -200,6 +210,24 @@ async function scenario() {
 		console.log(`note: project page: ${described ? "with" : "without"} a description, ${milestones} milestones`);
 		report.projectPage = { described, milestones };
 		await runner.shot(label);
+
+		// Read-only: the Activity tab of the same project.
+		await t.click(role("project-tab-activity"));
+		await present(role("activity"));
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("activity-error"))) throw new Error(`activity error: ${(await t.text(role("activity-error"))).slice(0, 300)}`);
+				return (await exists(role("activity-update"))) || (await exists(role("activity-event"))) || (await exists(role("activity-empty"))) || (await exists(role("activity-more")));
+			},
+			{ what: "the project activity", timeout: 45_000, interval: 0 },
+		);
+		const updates = ((await t.tree(role("activity-update"))).nodes ?? []).length;
+		const events = ((await t.tree(role("activity-event"))).nodes ?? []).length;
+		const more = await exists(role("activity-more"));
+		console.log(`note: activity tab: ${updates} updates, ${events} history events${more ? ", Load more offered" : ""}`);
+		report.projectActivity = { updates, events, more };
+		await runner.shot("project-activity");
 		await t.key("Escape");
 		await absent(role("project-header"));
 		await present(role("board"));
@@ -211,6 +239,8 @@ async function scenario() {
 		for (const { operation, request, complexity, nodes } of report.complexity) {
 			console.log(`complexity: ${operation} (${request}): ${complexity} of ${MAX_COMPLEXITY}, ${nodes} nodes`);
 		}
+		report.historyKinds = report.complexity.historyKinds ?? [];
+		console.log(`note: history event kinds in the first project's first page: ${report.historyKinds.join(", ") || "none"}`);
 	});
 
 	await runner.step("issues-mode", async (label) => {

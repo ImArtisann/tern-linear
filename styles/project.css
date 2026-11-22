@@ -114,3 +114,60 @@
 .sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-description-empty'] {
 	font-style: italic;
 }
+
+/* ── Activity: one feed, updates as cards between one-line history events ── */
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity'] {
+	max-width: 100ch;
+	padding-bottom: 12px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-update'] {
+	padding: 10px 12px;
+	border: 1px solid var(--l2);
+	border-radius: 8px;
+	background: var(--card);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-body'],
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comment'] [data-role='linear.comment-body'] {
+	line-height: 1.5;
+	overflow-wrap: anywhere;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comments-toggle'] {
+	align-self: flex-start;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comments'] {
+	padding-left: 12px;
+	border-left: 2px solid var(--l2);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comment'] [data-role='linear.comment-head'] {
+	font-size: 12px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-event'] {
+	padding: 2px 12px;
+	font-size: 13px;
+	color: var(--t2);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-text'] {
+	overflow-wrap: anywhere;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-time'],
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-edited'] {
+	font-size: 12px;
+	white-space: nowrap;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-more'] {
+	align-self: flex-start;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-empty'] {
+	font-style: italic;
+}

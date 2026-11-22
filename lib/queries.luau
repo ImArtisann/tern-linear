@@ -192,4 +192,32 @@ queries.Project = [[query Project($id: String!) {
   }
 }]]
 
+-- The Activity tab: published project updates, newest first, each with its newest 10 comments (Linear's `first`
+-- returns the newest; the client sorts them ascending). `commentCount` counts all of them.
+queries.ProjectUpdates = [[query ProjectUpdates($id: String!, $first: Int = 20, $after: String) {
+  project(id: $id) {
+    id
+    projectUpdates(first: $first, after: $after) {
+      nodes {
+        id body health createdAt editedAt commentCount url
+        user { id name displayName avatarUrl }
+        comments(first: 10) { nodes { id body createdAt parentId user { id name displayName avatarUrl } } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}]]
+
+-- The Activity tab: project history records, most recently updated first, so no unloaded record holds an event
+-- newer than the oldest loaded record's `updatedAt`. `entries` is untyped JSON (model.historyEvent reads it).
+queries.ProjectHistory = [[query ProjectHistory($id: String!, $first: Int = 25, $after: String) {
+  project(id: $id) {
+    id
+    history(first: $first, after: $after, orderBy: updatedAt) {
+      nodes { id createdAt updatedAt entries }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}]]
+
 return queries
