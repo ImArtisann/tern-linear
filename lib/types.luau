@@ -120,6 +120,50 @@ export type Viewer = {
 	organization: { id: string, name: string, urlKey: string },
 }
 
+-- One of the organization's project statuses (Linear's `ProjectStatus`).
+export type ProjectStatus = {
+	id: string,
+	name: string,
+	-- ProjectStatusType: "backlog" | "planned" | "started" | "paused" | "completed" | "canceled"
+	type: string,
+	color: string,
+	position: number,
+}
+
+export type ProjectTeam = { id: string, key: string, name: string }
+
+export type Project = {
+	id: string,
+	name: string,
+	-- https://linear.app/<org>/project/<slug>
+	url: string,
+	slugId: string,
+	-- Linear icon name (e.g. "Rocket"); display-only, nil when unset.
+	icon: string?,
+	color: string,
+	-- Linear's short summary (`Project.description`), not the long document (`content`).
+	summary: string,
+	status: ProjectStatus,
+	-- "onTrack" | "atRisk" | "offTrack"; nil until the first project update.
+	health: string?,
+	-- 0..1
+	progress: number,
+	lead: User?,
+	-- "YYYY-MM-DD"
+	startDate: string?,
+	targetDate: string?,
+	-- 0 none, 1 urgent, 2 high, 3 medium, 4 low
+	priority: number,
+	sortOrder: number,
+	-- The first PROJECT_TEAMS (5) teams of `Project.teams`.
+	teams: { ProjectTeam },
+	createdAt: string,
+	updatedAt: string,
+	startedAt: string?,
+	completedAt: string?,
+	canceledAt: string?,
+}
+
 -- ─── Data layer ─────────────────────────────────────────────────────────────
 
 export type Config = {
@@ -142,6 +186,12 @@ export type Callback<T> = (result: T?, err: ApiError?) -> ()
 export type IssuePage = {
 	issues: { Issue },
 	-- True when MAX_ISSUES was reached and more matched on the server.
+	truncated: boolean,
+}
+
+export type ProjectPage = {
+	projects: { Project },
+	-- True when MAX_PROJECTS was reached and more matched on the server.
 	truncated: boolean,
 }
 
@@ -175,13 +225,18 @@ export type Field = {
 
 -- ─── Board preferences (persisted by `save`) ────────────────────────────────
 
+export type Mode = "projects" | "issues"
+
 export type Prefs = {
+	-- Which list the block shows. Saved prefs without a valid mode fall back to "projects".
+	mode: Mode,
 	-- "mine": issues assigned to the viewer across teams; "team": every issue of `teamId`.
 	scope: "mine" | "team",
 	teamId: string?,
 	-- "active": triage/unstarted/started; "backlog": backlog; "all": everything,
 	-- closed ones only when closed in the last 14 days.
 	view: "active" | "backlog" | "all",
+	-- Shared by both modes.
 	layout: "board" | "table",
 	-- Table sort column: "identifier" | "title" | "state" | "priority" | "assignee" | "updated"
 	sort: string,
@@ -191,6 +246,21 @@ export type Prefs = {
 	-- "me" | "none" | <user id>
 	assignee: string?,
 	labelId: string?,
+
+	-- Projects mode. "all": every project; "mine": the viewer leads or is a member;
+	-- "team": projects whose accessibleTeams include `projectTeamId`.
+	projectScope: "all" | "mine" | "team",
+	projectTeamId: string?,
+	-- By ProjectStatusType: "active": planned/started/paused; "backlog": backlog; "all": every type.
+	projectView: "active" | "backlog" | "all",
+	-- Table sort column: "name" | "status" | "health" | "lead" | "target" | "progress" | "updated"
+	projectSort: string,
+	projectSortAsc: boolean,
+	-- Client-side filters (not saved); nil means "any".
+	-- "me" | "none" | <user id>
+	projectLead: string?,
+	-- "onTrack" | "atRisk" | "offTrack" | "none"
+	projectHealth: string?,
 }
 
 -- ─── Forms ──────────────────────────────────────────────────────────────────
@@ -234,6 +304,22 @@ export type LinkDraft = {
 
 -- ─── Block state (lib/controller.luau owns all mutation) ────────────────────
 
+-- Projects mode: the project list, its search text and selection. The issue counterparts are
+-- top-level BlockState fields; a project page (opened from this list) keeps its own state beside it.
+export type ProjectsState = {
+	items: { Project },
+	-- The organization's statuses (board columns), sorted by type rank then position.
+	statuses: { ProjectStatus },
+	truncated: boolean,
+	-- Epoch seconds of the last successful project load; nil until projects were loaded once.
+	fetchedAt: number?,
+	-- Greatest updatedAt seen under the current project filter (ISO string, server clock).
+	maxUpdatedAt: string?,
+	-- Search text of projects mode (the search field shows the active mode's query).
+	query: Field,
+	selectedId: string?,
+}
+
 export type BlockState = {
 	cx: BlockCx,
 	-- "setup": no key yet; "loading": first load in flight; "ready": data shown.
@@ -250,6 +336,8 @@ export type BlockState = {
 	fetchedAt: number?,
 	-- Greatest updatedAt seen in the current scope (ISO string, server clock).
 	maxUpdatedAt: string?,
+	-- Projects mode data and selection (mode "projects").
+	projects: ProjectsState,
 
 	prefs: Prefs,
 	query: Field,

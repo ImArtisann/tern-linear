@@ -442,6 +442,259 @@ check(
 	diff.title == "New title" and diff.priority == "2" and diff.description == nil and diff.assignee == nil
 )
 
+-- ─── projects ───────────────────────────────────────────────────────────────
+
+local function pstatus(id: string, name: string, statusType: string, position: number): types.ProjectStatus
+	return { id = id, name = name, type = statusType, color = "#888888", position = position }
+end
+
+local P_BACKLOG = pstatus("ps-backlog", "Backlog", "backlog", 0)
+local P_PLANNED = pstatus("ps-planned", "Planned", "planned", 0)
+local P_DOING = pstatus("ps-doing", "In Progress", "started", 0)
+local P_QA = pstatus("ps-qa", "QA", "started", 1)
+local P_PAUSED = pstatus("ps-paused", "Paused", "paused", 0)
+local P_DONE = pstatus("ps-done", "Completed", "completed", 0)
+local P_CANCELED = pstatus("ps-canceled", "Canceled", "canceled", 0)
+-- Deliberately unsorted, as an organization might return them.
+local ORG_STATUSES = { P_DONE, P_QA, P_BACKLOG, P_CANCELED, P_PAUSED, P_DOING, P_PLANNED }
+
+type ProjectOverrides = {
+	name: string?,
+	status: types.ProjectStatus?,
+	health: string?,
+	progress: number?,
+	lead: types.User?,
+	targetDate: string?,
+	priority: number?,
+	sortOrder: number?,
+	teamKeys: { string }?,
+	updatedAt: string?,
+}
+
+local function project(id: string, overrides: ProjectOverrides?): types.Project
+	local o: ProjectOverrides = overrides or {}
+	local teams: { types.ProjectTeam } = {}
+	for _, key in o.teamKeys or { "ENG" } do
+		table.insert(teams, { id = "t-" .. string.lower(key), key = key, name = key })
+	end
+	return {
+		id = id,
+		name = o.name or id,
+		url = "https://linear.app/acme/project/" .. id,
+		slugId = id,
+		icon = nil,
+		color = "#888888",
+		summary = "",
+		status = o.status or P_DOING,
+		health = o.health,
+		progress = o.progress or 0,
+		lead = o.lead,
+		startDate = nil,
+		targetDate = o.targetDate,
+		priority = o.priority or 0,
+		sortOrder = o.sortOrder or 0,
+		teams = teams,
+		createdAt = "2025-01-01T00:00:00.000Z",
+		updatedAt = o.updatedAt or "2025-01-01T00:00:00.000Z",
+		startedAt = nil,
+		completedAt = nil,
+		canceledAt = nil,
+	}
+end
+
+local function names(projects: { types.Project }): string
+	local out: { string } = {}
+	for _, p in projects do
+		table.insert(out, p.name)
+	end
+	return table.concat(out, " ")
+end
+
+local function projectPrefs(overrides: { [string]: any }?): types.Prefs
+	return prefs(overrides or {})
+end
+
+-- server filter
+
+local activeAll: any = model.projectServerFilter(projectPrefs({ projectScope = "all", projectView = "active" }))
+check(
+	"project active view filters planned, started and paused statuses",
+	#activeAll["and"] == 1 and table.concat(activeAll["and"][1].status.type["in"], ",") == "planned,started,paused"
+)
+local everything: any = model.projectServerFilter(projectPrefs({ projectScope = "all", projectView = "all" }))
+check("all projects in the all view need no filter", next(everything) == nil)
+local mineProjects: any = model.projectServerFilter(projectPrefs({ projectScope = "mine", projectView = "backlog" }))
+local leadOrMember: any = mineProjects["and"][1]["or"]
+check(
+	"my projects are led by or have the viewer as a member",
+	leadOrMember[1].lead.isMe.eq == true and leadOrMember[2].members.some.isMe.eq == true
+)
+check(
+	"project backlog view filters the backlog status type",
+	table.concat(mineProjects["and"][2].status.type["in"], ",") == "backlog"
+)
+local teamProjects: any =
+	model.projectServerFilter(projectPrefs({ projectScope = "team", projectTeamId = "t-des", projectView = "all" }))
+check(
+	"team project scope filters on accessible teams",
+	#teamProjects["and"] == 1 and teamProjects["and"][1].accessibleTeams.some.id.eq == "t-des"
+)
+
+-- visible: search, filters and board order
+
+local apollo = project("p1", {
+	name = "Apollo",
+	status = P_DOING,
+	health = "onTrack",
+	lead = ME,
+	priority = 2,
+	progress = 0.5,
+	targetDate = "2025-07-01",
+	updatedAt = "2025-06-01T00:00:00Z",
+})
+local borealis = project("p2", {
+	name = "Borealis",
+	status = P_DOING,
+	health = "atRisk",
+	lead = ANA,
+	priority = 1,
+	progress = 0.25,
+	teamKeys = { "DES" },
+	targetDate = "2025-06-20",
+	updatedAt = "2025-06-10T00:00:00Z",
+})
+local cosmos = project("p3", {
+	name = "cosmos",
+	status = P_PLANNED,
+	priority = 0,
+	sortOrder = 2,
+	updatedAt = "2025-05-01T00:00:00Z",
+})
+local delta = project("p4", { name = "Delta", status = P_PAUSED, health = "offTrack", lead = ANA, progress = 0.75 })
+local eon = project("p5", { name = "Eon", status = P_QA, priority = 2, sortOrder = 1, lead = ME, progress = 1 })
+local ppool = { delta, apollo, eon, cosmos, borealis, apollo }
+
+check(
+	"visibleProjects orders by status rank, position, then priority, dropping duplicates",
+	names(model.visibleProjects(ppool, projectPrefs(), "", nil)) == "cosmos Borealis Apollo Eon Delta"
+)
+check("project search matches the name", names(model.visibleProjects(ppool, projectPrefs(), "COSM", nil)) == "cosmos")
+check(
+	"project search matches the lead",
+	names(model.visibleProjects(ppool, projectPrefs(), "ana", nil)) == "Borealis Delta"
+)
+check("project search matches team keys", names(model.visibleProjects(ppool, projectPrefs(), "des", nil)) == "Borealis")
+check(
+	"lead filter me",
+	names(model.visibleProjects(ppool, projectPrefs({ projectLead = "me" }), "", "u-me")) == "Apollo Eon"
+)
+check(
+	"lead filter none",
+	names(model.visibleProjects(ppool, projectPrefs({ projectLead = "none" }), "", nil)) == "cosmos"
+)
+check(
+	"lead filter by id",
+	names(model.visibleProjects(ppool, projectPrefs({ projectLead = "u-ana" }), "", nil)) == "Borealis Delta"
+)
+check(
+	"health filter",
+	names(model.visibleProjects(ppool, projectPrefs({ projectHealth = "atRisk" }), "", nil)) == "Borealis"
+)
+check(
+	"health filter none keeps projects without an update",
+	names(model.visibleProjects(ppool, projectPrefs({ projectHealth = "none" }), "", nil)) == "cosmos Eon"
+)
+
+-- columns
+
+local function columnSummary(columns: { model.ProjectColumn }): string
+	local out: { string } = {}
+	for _, column in columns do
+		table.insert(out, `{column.title}:{#column.projects}`)
+	end
+	return table.concat(out, ",")
+end
+
+local activeView = projectPrefs({ projectView = "active" })
+check(
+	"project columns: one per status of the view, type rank then position, empty ones included",
+	columnSummary(model.projectColumns(model.visibleProjects(ppool, activeView, "", nil), activeView, ORG_STATUSES))
+		== "Planned:1,In Progress:2,QA:1,Paused:1"
+)
+local allView = projectPrefs({ projectView = "all" })
+check(
+	"the all view shows every status type",
+	columnSummary(model.projectColumns({}, allView, ORG_STATUSES))
+		== "Backlog:0,Planned:0,In Progress:0,QA:0,Paused:0,Completed:0,Canceled:0"
+)
+local backlogView = projectPrefs({ projectView = "backlog" })
+check(
+	"the backlog view shows backlog statuses only",
+	columnSummary(model.projectColumns({}, backlogView, ORG_STATUSES)) == "Backlog:0"
+)
+local stray = project("p6", { name = "Stray", status = pstatus("ps-new", "Review", "started", 5) })
+local strayColumns = model.projectColumns({ apollo, stray }, activeView, ORG_STATUSES)
+check(
+	"a status missing from the organization list gets its own column",
+	columnSummary(strayColumns) == "Planned:0,In Progress:1,QA:0,Review:1,Paused:0"
+)
+check(
+	"project columns carry the status id and type",
+	strayColumns[2].statusId == "ps-doing" and strayColumns[2].statusType == "started"
+)
+local doingColumn = model.projectColumns({ apollo, borealis }, activeView, ORG_STATUSES)[2]
+check("cards in a column order by priority", names(doingColumn.projects) == "Borealis Apollo")
+
+-- table sorting
+
+local prows = { apollo, borealis, cosmos, delta, eon }
+check(
+	"sort projects by name ignores case",
+	names(model.sortProjects(prows, "name", true)) == "Apollo Borealis cosmos Delta Eon"
+)
+check(
+	"sort projects by status follows the status rank",
+	names(model.sortProjects(prows, "status", true)) == "cosmos Apollo Borealis Eon Delta"
+)
+check(
+	"sort by health puts off track first and no update last",
+	names(model.sortProjects(prows, "health", true)) == "Delta Borealis Apollo cosmos Eon"
+)
+check(
+	"sort by lead puts projects without a lead last",
+	names(model.sortProjects(prows, "lead", true)) == "Borealis Delta Apollo Eon cosmos"
+)
+check(
+	"sort by target date puts projects without one last",
+	names(model.sortProjects(prows, "target", true)) == "Borealis Apollo cosmos Delta Eon"
+)
+check(
+	"sort by progress descending",
+	names(model.sortProjects(prows, "progress", false)) == "Eon Delta Apollo Borealis cosmos"
+)
+check(
+	"sort by updated is newest first when descending",
+	names(model.sortProjects({ apollo, borealis, cosmos }, "updated", false)) == "Borealis Apollo cosmos"
+)
+check("sorting projects does not mutate its input", names(prows) == "Apollo Borealis cosmos Delta Eon")
+
+-- labels
+
+local june = model.epoch("2025-06-15T12:00:00Z") :: number
+check("shortDate in the current year", model.shortDate("2025-07-01", june) == "Jul 1")
+check("shortDate in another year", model.shortDate("2026-01-09", june) == "Jan 9, 2026")
+check("shortDate of garbage is empty", model.shortDate("soon", june) == "")
+check(
+	"progressLabel rounds down and clamps",
+	model.progressLabel(0.629) == "62%" and model.progressLabel(1) == "100%" and model.progressLabel(1.5) == "100%"
+)
+check("progressLabel of exact tenths", model.progressLabel(0.7) == "70%" and model.progressLabel(0.29) == "29%")
+check("healthLabel", model.healthLabel("atRisk") == "At risk" and model.healthLabel(nil) == "No update")
+check(
+	"projectStatusRank follows PROJECT_STATUS_TYPES",
+	model.projectStatusRank("backlog") == 1 and model.projectStatusRank("paused") == 4
+)
+
 if failures > 0 then
 	error(`{failures} model test(s) failed`)
 end

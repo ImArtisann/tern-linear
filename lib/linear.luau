@@ -15,6 +15,8 @@ local linear = {}
 
 local MAX_ISSUES = 250
 local ISSUES_PAGE_SIZE = 50
+local MAX_PROJECTS = 250
+local PROJECTS_PAGE_SIZE = 50
 -- Teams carry large nested connections: 5 per page keeps the query far below the 10000 complexity cap.
 local TEAMS_PAGE_SIZE = 5
 local COMMENTS_PAGE_SIZE = 50
@@ -34,6 +36,18 @@ local STATE_RANK: { [string]: number } = {
 	duplicate = 7,
 }
 local UNKNOWN_RANK = 99
+
+-- Mirrors model.PROJECT_STATUS_TYPES.
+local PROJECT_STATUS_RANK: { [string]: number } = {
+	backlog = 1,
+	planned = 2,
+	started = 3,
+	paused = 4,
+	completed = 5,
+	canceled = 6,
+}
+
+local HEALTHS: { [string]: boolean } = { onTrack = true, atRisk = true, offTrack = true }
 
 -- Variables that must encode as JSON arrays even when empty.
 local ARRAY_INPUT_KEYS: { [string]: boolean } = {
@@ -719,15 +733,164 @@ function linear.issues(cfg: types.Config, filter: any, cb: types.Callback<types.
 	end)
 end
 
-function linear.changedSince(cfg: types.Config, filter: any, sinceIso: string?, cb: types.Callback<string?>)
+-- `filter AND {updatedAt: {gt: sinceIso}}`; either side may be absent.
+local function newerThan(filter: Json, sinceIso: string?): Json
 	local scope = usableFilter(filter)
-	local combined: Json = scope
-	if sinceIso ~= nil then
-		local newer = { updatedAt = { gt = sinceIso } }
-		combined = if scope == nil then newer else { ["and"] = { scope, newer } }
+	if sinceIso == nil then
+		return scope
 	end
-	run(cfg, "IssuesChanged", queries.IssuesChanged, { filter = combined }, function(data: Json): string?
-		local newest: Json = nodes(data.issues)[1]
+	local newer = { updatedAt = { gt = sinceIso } }
+	return if scope == nil then newer else { ["and"] = { scope, newer } }
+end
+
+function linear.changedSince(cfg: types.Config, filter: any, sinceIso: string?, cb: types.Callback<string?>)
+	run(
+		cfg,
+		"IssuesChanged",
+		queries.IssuesChanged,
+		{ filter = newerThan(filter, sinceIso) },
+		function(data: Json): string?
+			local newest: Json = nodes(data.issues)[1]
+			return if type(newest) == "table" then text(newest.updatedAt) else nil
+		end,
+		cb
+	)
+end
+
+-- ─── Projects ───────────────────────────────────────────────────────────────
+
+local function normalizeProjectStatus(raw: Json): types.ProjectStatus?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local name = text(raw.name)
+	local statusType = text(raw.type)
+	if id == nil or name == nil or statusType == nil then
+		return nil
+	end
+	return {
+		id = id,
+		name = name,
+		type = statusType,
+		color = text(raw.color) or "",
+		position = number(raw.position) or 0,
+	}
+end
+
+local function projectStatusOrder(a: types.ProjectStatus, b: types.ProjectStatus): boolean
+	local rankA = PROJECT_STATUS_RANK[a.type] or UNKNOWN_RANK
+	local rankB = PROJECT_STATUS_RANK[b.type] or UNKNOWN_RANK
+	if rankA ~= rankB then
+		return rankA < rankB
+	end
+	if a.position ~= b.position then
+		return a.position < b.position
+	end
+	return a.id < b.id
+end
+
+local function normalizeProject(raw: Json): types.Project
+	local id = text(raw.id)
+	local name = text(raw.name)
+	local status = normalizeProjectStatus(raw.status)
+	if id == nil or name == nil or status == nil then
+		error("malformed project")
+	end
+	local teams: { types.ProjectTeam } = {}
+	for _, node in nodes(raw.teams) do
+		local teamId = text(node.id)
+		local key = text(node.key)
+		if teamId ~= nil and key ~= nil then
+			table.insert(teams, { id = teamId, key = key, name = text(node.name) or key })
+		end
+	end
+	local health = text(raw.health)
+	local progress = number(raw.progress) or 0
+	return {
+		id = id,
+		name = name,
+		url = text(raw.url) or "",
+		slugId = text(raw.slugId) or "",
+		icon = text(raw.icon),
+		color = text(raw.color) or "",
+		summary = text(raw.description) or "",
+		status = status,
+		health = if health ~= nil and HEALTHS[health] then health else nil,
+		progress = math.clamp(progress, 0, 1),
+		lead = normalizeUser(raw.lead),
+		startDate = text(raw.startDate),
+		targetDate = text(raw.targetDate),
+		priority = number(raw.priority) or 0,
+		sortOrder = number(raw.sortOrder) or 0,
+		teams = teams,
+		createdAt = text(raw.createdAt) or "",
+		updatedAt = text(raw.updatedAt) or "",
+		startedAt = text(raw.startedAt),
+		completedAt = text(raw.completedAt),
+		canceledAt = text(raw.canceledAt),
+	}
+end
+
+-- The organization's statuses minus archived ones, sorted by type rank then position.
+function linear.projectStatuses(cfg: types.Config, cb: types.Callback<{ types.ProjectStatus }>)
+	run(cfg, "ProjectStatuses", queries.ProjectStatuses, nil, function(data: Json): { types.ProjectStatus }
+		local org: Json = data.organization
+		if type(org) ~= "table" or type(org.projectStatuses) ~= "table" then
+			error("malformed organization")
+		end
+		local statuses: { types.ProjectStatus } = {}
+		for _, node in org.projectStatuses do
+			local status = normalizeProjectStatus(node)
+			if status ~= nil and text(node.archivedAt) == nil then
+				table.insert(statuses, status)
+			end
+		end
+		table.sort(statuses, projectStatusOrder)
+		return statuses
+	end, cb)
+end
+
+function linear.projects(cfg: types.Config, filter: any, cb: types.Callback<types.ProjectPage>)
+	local projects: { types.Project } = {}
+	local seen: { [string]: boolean } = {}
+	local truncated = false
+
+	eachPage(cfg, {
+		opName = "Projects",
+		query = queries.Projects,
+		variables = { filter = usableFilter(filter), first = PROJECTS_PAGE_SIZE },
+		afterKey = "after",
+	}, function(data)
+		local connection: Json = data.projects
+		for _, node in nodes(connection) do
+			local project = normalizeProject(node)
+			if not seen[project.id] then
+				seen[project.id] = true
+				table.insert(projects, project)
+			end
+		end
+		if #projects >= MAX_PROJECTS then
+			while #projects > MAX_PROJECTS do
+				table.remove(projects)
+			end
+			truncated = type(connection.pageInfo) == "table" and connection.pageInfo.hasNextPage == true
+			return nil
+		end
+		return connection.pageInfo
+	end, function(err)
+		if err ~= nil then
+			cb(nil, err)
+			return
+		end
+		cb({ projects = projects, truncated = truncated }, nil)
+	end)
+end
+
+function linear.projectsChanged(cfg: types.Config, filter: any, sinceIso: string?, cb: types.Callback<string?>)
+	local query = queries.ProjectsChanged
+	run(cfg, "ProjectsChanged", query, { filter = newerThan(filter, sinceIso) }, function(data: Json): string?
+		local newest: Json = nodes(data.projects)[1]
 		return if type(newest) == "table" then text(newest.updatedAt) else nil
 	end, cb)
 end

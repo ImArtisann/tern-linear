@@ -12,12 +12,14 @@ local view = require("./view")
 
 type BlockState = types.BlockState
 type Issue = types.Issue
+type Project = types.Project
 type Team = types.Team
 type ApiError = types.ApiError
 type Field = types.Field
 type Form = types.Form
 type FormField = types.FormField
 type FormOption = types.FormOption
+type Mode = types.Mode
 type Prefs = types.Prefs
 type Patch = { [string]: any }
 
@@ -35,6 +37,11 @@ local SORT_KEYS: { [string]: boolean } = {
 	assignee = true,
 	updated = true,
 }
+
+local PROJECT_SORT_KEYS: { [string]: boolean } = {}
+for _, key in model.PROJECT_SORT_KEYS do
+	PROJECT_SORT_KEYS[key] = true
+end
 
 -- ─── Run registry ───────────────────────────────────────────────────────────
 -- One Run per live block. Pane ids are reused after a restart, so every
@@ -131,6 +138,7 @@ end
 
 local VIEWS: { [string]: "active" | "backlog" | "all" } = { active = "active", backlog = "backlog", all = "all" }
 local LAYOUTS: { [string]: "board" | "table" } = { board = "board", table = "table" }
+local MODES: { [string]: Mode } = { projects = "projects", issues = "issues" }
 local LINK_MODES: { [string]: "blocked-by" | "blocks" | "related" } = {
 	["blocked-by"] = "blocked-by",
 	blocks = "blocks",
@@ -149,13 +157,29 @@ local function parseLinkMode(value: any): ("blocked-by" | "blocks" | "related")?
 	return if type(value) == "string" then LINK_MODES[value] else nil
 end
 
+local function parseMode(value: any): Mode?
+	return if type(value) == "string" then MODES[value] else nil
+end
+
 -- Every saved field is checked against its allowed values; anything else falls back.
 local function restorePrefs(saved: any): Prefs
-	local prefs: Prefs = { scope = "mine", view = "active", layout = "board", sort = "updated", sortAsc = false }
+	local prefs: Prefs = {
+		mode = "projects",
+		scope = "mine",
+		view = "active",
+		layout = "board",
+		sort = "updated",
+		sortAsc = false,
+		projectScope = "all",
+		projectView = "active",
+		projectSort = "updated",
+		projectSortAsc = false,
+	}
 	if type(saved) ~= "table" then
 		return prefs
 	end
 	local data = saved :: { [string]: any }
+	prefs.mode = parseMode(data.mode) or prefs.mode
 	if type(data.teamId) == "string" then
 		prefs.teamId = data.teamId
 		if data.scope == "team" then
@@ -170,7 +194,32 @@ local function restorePrefs(saved: any): Prefs
 	if type(data.sortAsc) == "boolean" then
 		prefs.sortAsc = data.sortAsc
 	end
+	if data.projectScope == "mine" then
+		prefs.projectScope = "mine"
+	elseif data.projectScope == "team" and type(data.projectTeamId) == "string" then
+		prefs.projectScope = "team"
+		prefs.projectTeamId = data.projectTeamId
+	end
+	prefs.projectView = parseView(data.projectView) or prefs.projectView
+	if type(data.projectSort) == "string" and PROJECT_SORT_KEYS[data.projectSort] then
+		prefs.projectSort = data.projectSort
+	end
+	if type(data.projectSortAsc) == "boolean" then
+		prefs.projectSortAsc = data.projectSortAsc
+	end
 	return prefs
+end
+
+local function emptyProjects(): types.ProjectsState
+	return {
+		items = {},
+		statuses = {},
+		truncated = false,
+		fetchedAt = nil,
+		maxUpdatedAt = nil,
+		query = text.new(""),
+		selectedId = nil,
+	}
 end
 
 local function newState(cx: BlockCx, prefs: Prefs): BlockState
@@ -186,6 +235,7 @@ local function newState(cx: BlockCx, prefs: Prefs): BlockState
 		truncated = false,
 		fetchedAt = nil,
 		maxUpdatedAt = nil,
+		projects = emptyProjects(),
 		prefs = prefs,
 		query = text.new(""),
 		focus = nil,
@@ -226,6 +276,32 @@ local function selectedIssue(state: BlockState): Issue?
 		return nil
 	end
 	return findIssue(state, id)
+end
+
+local function findProject(state: BlockState, id: string): Project?
+	for _, project in state.projects.items do
+		if project.id == id then
+			return project
+		end
+	end
+	return nil
+end
+
+local function selectedProject(state: BlockState): Project?
+	local id = state.projects.selectedId
+	if id == nil then
+		return nil
+	end
+	return findProject(state, id)
+end
+
+local function inProjects(state: BlockState): boolean
+	return state.prefs.mode == "projects"
+end
+
+-- The search text of the active mode.
+local function activeQuery(state: BlockState): Field
+	return if inProjects(state) then state.projects.query else state.query
 end
 
 local function teamById(state: BlockState, id: string?): Team?
@@ -378,6 +454,10 @@ local function clearSelection(state: BlockState, run: Run)
 	text.set(state.comment, "")
 end
 
+local function clearProjectSelection(state: BlockState)
+	state.projects.selectedId = nil
+end
+
 -- ─── Errors and setup ───────────────────────────────────────────────────────
 
 local function resetData(state: BlockState, run: Run)
@@ -395,6 +475,9 @@ local function resetData(state: BlockState, run: Run)
 	state.truncated = false
 	state.fetchedAt = nil
 	state.maxUpdatedAt = nil
+	local query = state.projects.query
+	state.projects = emptyProjects()
+	state.projects.query = query
 	state.selectedId = nil
 	state.detail = nil
 	state.drawerOpen = false
@@ -499,6 +582,33 @@ local function commitIssues(state: BlockState, run: Run, page: types.IssuePage)
 	end
 end
 
+local function newestUpdate(updatedAts: { string }): string?
+	local newest: string? = nil
+	for _, updatedAt in updatedAts do
+		if newest == nil or updatedAt > newest then
+			newest = updatedAt
+		end
+	end
+	return newest
+end
+
+local function commitProjects(state: BlockState, run: Run, page: types.ProjectPage)
+	local projects = state.projects
+	projects.items = page.projects
+	projects.truncated = page.truncated
+	projects.fetchedAt = os.time()
+	local updatedAts: { string } = {}
+	for _, project in page.projects do
+		table.insert(updatedAts, project.updatedAt)
+	end
+	projects.maxUpdatedAt = newestUpdate(updatedAts)
+	run.lastFullAt = tern.now()
+	local id = projects.selectedId
+	if id ~= nil and findProject(state, id) == nil then
+		clearProjectSelection(state)
+	end
+end
+
 -- ─── Detail loads ───────────────────────────────────────────────────────────
 -- Own flag and token; they never touch `busy`.
 
@@ -592,16 +702,22 @@ end
 
 -- ─── Background reads ───────────────────────────────────────────────────────
 
-local reloadIssues: (state: BlockState, run: Run) -> ()
+local reloadData: (state: BlockState, run: Run) -> ()
 
 local function runQueuedReload(state: BlockState, run: Run)
 	if run.reloadQueued then
 		run.reloadQueued = false
-		reloadIssues(state, run)
+		reloadData(state, run)
 	end
 end
 
-reloadIssues = function(state: BlockState, run: Run)
+-- One background read: `start` issues the request; `commit` applies a result unless the generation moved on.
+local function backgroundRead<T>(
+	state: BlockState,
+	run: Run,
+	start: (types.Config, types.Callback<T>) -> (),
+	commit: (T, Run) -> ()
+)
 	local cfg = run.cfg
 	if cfg == nil or state.phase ~= "ready" then
 		return
@@ -612,14 +728,15 @@ reloadIssues = function(state: BlockState, run: Run)
 	end
 	state.refreshing = true
 	local generation = state.generation
-	linear.issues(cfg, model.serverFilter(state.prefs), function(page, err)
+	start(cfg, function(result: T?, err: ApiError?)
 		local live = liveRun(state)
 		if live == nil then
 			return
 		end
+		state.refreshing = false
 		if state.generation == generation then
-			if page ~= nil then
-				commitIssues(state, live, page)
+			if result ~= nil then
+				commit(result, live)
 				state.error = nil
 			elseif err ~= nil then
 				fail(state, err, nil)
@@ -628,6 +745,31 @@ reloadIssues = function(state: BlockState, run: Run)
 		state.cx:render()
 		runQueuedReload(state, live)
 	end)
+end
+
+local function reloadIssues(state: BlockState, run: Run)
+	backgroundRead(state, run, function(cfg: types.Config, done: types.Callback<types.IssuePage>)
+		linear.issues(cfg, model.serverFilter(state.prefs), done)
+	end, function(page: types.IssuePage, live: Run)
+		commitIssues(state, live, page)
+	end)
+end
+
+local function reloadProjects(state: BlockState, run: Run)
+	backgroundRead(state, run, function(cfg: types.Config, done: types.Callback<types.ProjectPage>)
+		linear.projects(cfg, model.projectServerFilter(state.prefs), done)
+	end, function(page: types.ProjectPage, live: Run)
+		commitProjects(state, live, page)
+	end)
+end
+
+-- Background reload of the active mode's list.
+reloadData = function(state: BlockState, run: Run)
+	if inProjects(state) then
+		reloadProjects(state, run)
+	else
+		reloadIssues(state, run)
+	end
 end
 
 -- Authoritative reload after a mutation: the board, and the drawer if open.
@@ -678,8 +820,9 @@ local function formLocked(state: BlockState, run: Run): boolean
 	return state.busy and run.fgKind == "mutation"
 end
 
--- viewer (when unknown) → teams → issues; `issuesOnly` skips straight to the issues.
-local function loadAll(state: BlockState, issuesOnly: boolean)
+-- viewer (when unknown) → teams → the active mode's data; `dataOnly` skips straight to the data.
+-- Issues mode loads the issues; projects mode loads the organization's project statuses, then the projects.
+local function loadAll(state: BlockState, dataOnly: boolean)
 	local run = runOf(state)
 	if run == nil then
 		return
@@ -728,6 +871,42 @@ local function loadAll(state: BlockState, issuesOnly: boolean)
 		end)
 	end
 
+	local function loadProjects()
+		linear.projectStatuses(cfg, function(statuses, statusErr)
+			if current(state, generation) == nil then
+				return
+			end
+			if statuses == nil then
+				failed(statusErr)
+				return
+			end
+			linear.projects(cfg, model.projectServerFilter(state.prefs), function(page, err)
+				local live = current(state, generation)
+				if live == nil then
+					return
+				end
+				if page == nil then
+					failed(err)
+					return
+				end
+				settle(state, live)
+				state.projects.statuses = statuses
+				commitProjects(state, live, page)
+				state.phase = "ready"
+				state.error = nil
+				state.cx:render()
+			end)
+		end)
+	end
+
+	local function loadData()
+		if inProjects(state) then
+			loadProjects()
+		else
+			loadIssues()
+		end
+	end
+
 	local function loadTeams()
 		linear.teams(cfg, function(teams, err)
 			if current(state, generation) == nil then
@@ -739,16 +918,21 @@ local function loadAll(state: BlockState, issuesOnly: boolean)
 			end
 			state.teams = teams
 			run.metaReady = true
-			if state.prefs.scope == "team" and teamById(state, state.prefs.teamId) == nil then
-				state.prefs.scope = "mine"
-				state.prefs.teamId = nil
+			local prefs = state.prefs
+			if prefs.scope == "team" and teamById(state, prefs.teamId) == nil then
+				prefs.scope = "mine"
+				prefs.teamId = nil
 			end
-			loadIssues()
+			if prefs.projectScope == "team" and teamById(state, prefs.projectTeamId) == nil then
+				prefs.projectScope = "all"
+				prefs.projectTeamId = nil
+			end
+			loadData()
 		end)
 	end
 
-	if issuesOnly then
-		loadIssues()
+	if dataOnly then
+		loadData()
 	elseif state.viewer ~= nil then
 		loadTeams()
 	else
@@ -817,32 +1001,45 @@ local function pollAllowed(state: BlockState): boolean
 	return focus ~= "comment" and focus ~= "form" and focus ~= "link"
 end
 
+-- The change check of the active mode; a newer `updatedAt` than the list's newest reloads that list.
 local function checkForChanges(state: BlockState, run: Run)
 	local cfg = run.cfg
 	if cfg == nil then
 		return
 	end
-	state.refreshing = true
+	local projects = inProjects(state)
+	local since = if projects then state.projects.maxUpdatedAt else state.maxUpdatedAt
 	local generation = state.generation
-	linear.changedSince(cfg, model.serverFilter(state.prefs), state.maxUpdatedAt, function(newest, err)
+	local function onResult(newest: string?, err: ApiError?)
 		local live = liveRun(state)
 		if live == nil then
 			return
 		end
 		state.refreshing = false
 		if state.generation == generation then
+			local known = if projects then state.projects.maxUpdatedAt else state.maxUpdatedAt
 			if err ~= nil then
 				fail(state, err, nil)
 			else
 				state.error = nil
-				if newest ~= nil and (state.maxUpdatedAt == nil or newest > state.maxUpdatedAt) then
-					reloadIssues(state, live)
+				if newest ~= nil and (known == nil or newest > known) then
+					if projects then
+						reloadProjects(state, live)
+					else
+						reloadIssues(state, live)
+					end
 				end
 			end
 		end
 		state.cx:render()
 		runQueuedReload(state, live)
-	end)
+	end
+	state.refreshing = true
+	if projects then
+		linear.projectsChanged(cfg, model.projectServerFilter(state.prefs), since, onResult)
+	else
+		linear.changedSince(cfg, model.serverFilter(state.prefs), since, onResult)
+	end
 end
 
 local function tick(state: BlockState, run: Run)
@@ -868,13 +1065,13 @@ local function tick(state: BlockState, run: Run)
 	if not pollAllowed(state) then
 		return
 	end
-	if not run.metaReady then
-		loadAll(state, false)
+	if not run.metaReady or (inProjects(state) and #state.projects.statuses == 0) then
+		loadAll(state, run.metaReady)
 		state.cx:render()
 		return
 	end
 	if tern.now() - run.lastFullAt >= FULL_RELOAD_MS then
-		reloadIssues(state, run)
+		reloadData(state, run)
 	else
 		checkForChanges(state, run)
 	end
@@ -1593,22 +1790,47 @@ local function orderedIssues(state: BlockState): { Issue }
 	return ordered
 end
 
-local function moveSelection(state: BlockState, run: Run, delta: number): boolean
-	local ordered = orderedIssues(state)
-	if #ordered == 0 then
-		return false
+-- `id` stepped by `delta` through `ids` (clamped at the ends); the first id when `id` is not among them.
+local function steppedId(ids: { string }, id: string?, delta: number): string?
+	if #ids == 0 then
+		return nil
 	end
-	local index = 0
-	for position, issue in ordered do
-		if issue.id == state.selectedId then
-			index = position
-			break
+	local index = if id ~= nil then table.find(ids, id) else nil
+	return ids[if index == nil then 1 else math.clamp(index + delta, 1, #ids)]
+end
+
+-- The first id of the previous/next non-empty column from the one holding `id` (the first non-empty column
+-- when `id` is in none).
+local function adjacentColumnId(columns: { { string } }, id: string?, delta: number): string?
+	local currentColumn = 0
+	for position, ids in columns do
+		if id ~= nil and table.find(ids, id) ~= nil then
+			currentColumn = position
 		end
 	end
-	local target = if index == 0 then 1 else math.clamp(index + delta, 1, #ordered)
-	local issue = ordered[target]
-	if issue.id ~= state.selectedId then
-		selectIssue(state, run, issue.id, false, DETAIL_DEBOUNCE_MS)
+	local step = if currentColumn == 0 then 1 else delta
+	local position = if currentColumn == 0 then 1 else currentColumn + delta
+	while position >= 1 and position <= #columns do
+		local first = columns[position][1]
+		if first ~= nil then
+			return first
+		end
+		position += step
+	end
+	return nil
+end
+
+local function moveSelection(state: BlockState, run: Run, delta: number): boolean
+	local ids: { string } = {}
+	for _, issue in orderedIssues(state) do
+		table.insert(ids, issue.id)
+	end
+	local target = steppedId(ids, state.selectedId, delta)
+	if target == nil then
+		return false
+	end
+	if target ~= state.selectedId then
+		selectIssue(state, run, target, false, DETAIL_DEBOUNCE_MS)
 	end
 	return true
 end
@@ -1618,26 +1840,85 @@ local function moveColumn(state: BlockState, run: Run, delta: number): boolean
 	if state.prefs.layout ~= "board" then
 		return false
 	end
-	local columns = model.columns(visibleIssues(state), state.prefs, scopeTeam(state))
-	local currentColumn = 0
-	for position, column in columns do
+	local columns: { { string } } = {}
+	for _, column in model.columns(visibleIssues(state), state.prefs, scopeTeam(state)) do
+		local ids: { string } = {}
 		for _, issue in column.issues do
-			if issue.id == state.selectedId then
-				currentColumn = position
-			end
+			table.insert(ids, issue.id)
+		end
+		table.insert(columns, ids)
+	end
+	local target = adjacentColumnId(columns, state.selectedId, delta)
+	if target == nil then
+		return false
+	end
+	selectIssue(state, run, target, false, DETAIL_DEBOUNCE_MS)
+	return true
+end
+
+-- ─── Projects navigation ────────────────────────────────────────────────────
+
+local function visibleProjects(state: BlockState): { Project }
+	return model.visibleProjects(state.projects.items, state.prefs, state.projects.query.text, viewerId(state))
+end
+
+local function projectBoardColumns(state: BlockState): { model.ProjectColumn }
+	return model.projectColumns(visibleProjects(state), state.prefs, state.projects.statuses)
+end
+
+-- The order the active layout renders projects in.
+local function orderedProjects(state: BlockState): { Project }
+	local prefs = state.prefs
+	if prefs.layout == "table" then
+		return model.sortProjects(visibleProjects(state), prefs.projectSort, prefs.projectSortAsc)
+	end
+	local ordered: { Project } = {}
+	for _, column in projectBoardColumns(state) do
+		for _, project in column.projects do
+			table.insert(ordered, project)
 		end
 	end
-	local step = if currentColumn == 0 then 1 else delta
-	local position = if currentColumn == 0 then 1 else currentColumn + delta
-	while position >= 1 and position <= #columns do
-		local first = columns[position].issues[1]
-		if first ~= nil then
-			selectIssue(state, run, first.id, false, DETAIL_DEBOUNCE_MS)
-			return true
-		end
-		position += step
+	return ordered
+end
+
+-- Selecting a project opens nothing: opening a project page is a separate action.
+local function selectProject(state: BlockState, id: string)
+	if findProject(state, id) ~= nil then
+		state.projects.selectedId = id
 	end
-	return false
+end
+
+local function moveProjectSelection(state: BlockState, delta: number): boolean
+	local ids: { string } = {}
+	for _, project in orderedProjects(state) do
+		table.insert(ids, project.id)
+	end
+	local target = steppedId(ids, state.projects.selectedId, delta)
+	if target == nil then
+		return false
+	end
+	selectProject(state, target)
+	return true
+end
+
+local function moveProjectColumn(state: BlockState, delta: number): boolean
+	if state.prefs.layout ~= "board" then
+		return false
+	end
+	local columns: { { string } } = {}
+	for _, column in projectBoardColumns(state) do
+		local ids: { string } = {}
+		for _, project in column.projects do
+			table.insert(ids, project.id)
+		end
+		table.insert(columns, ids)
+	end
+	local target = adjacentColumnId(columns, state.projects.selectedId, delta)
+	if target == nil then
+		return false
+	end
+	selectProject(state, target)
+	return true
 end
 
 -- Client-side filters keyed to a team no longer apply after a scope change.
@@ -1656,24 +1937,37 @@ local function canReload(state: BlockState, run: Run): boolean
 	return not state.busy or run.fgKind == "load"
 end
 
--- Reloads the board in the foreground after the server filter changed.
+-- Reloads the active mode's list in the foreground after its server filter changed.
 local function reloadBoard(state: BlockState, run: Run, clearBoard: boolean)
 	if clearBoard then
-		clearSelection(state, run)
-		state.issues = {}
-		state.truncated = false
-		state.maxUpdatedAt = nil
-		resetScopedFilters(state.prefs)
+		if inProjects(state) then
+			clearProjectSelection(state)
+			state.projects.items = {}
+			state.projects.truncated = false
+			state.projects.maxUpdatedAt = nil
+		else
+			clearSelection(state, run)
+			state.issues = {}
+			state.truncated = false
+			state.maxUpdatedAt = nil
+			resetScopedFilters(state.prefs)
+		end
 	end
 	loadAll(state, true)
 end
 
 local function setView(state: BlockState, run: Run, value: any)
 	local parsed: ("active" | "backlog" | "all")? = parseView(value)
-	if parsed == nil or parsed == state.prefs.view or not canReload(state, run) then
+	local prefs = state.prefs
+	local currentView = if inProjects(state) then prefs.projectView else prefs.view
+	if parsed == nil or parsed == currentView or not canReload(state, run) then
 		return
 	end
-	state.prefs.view = parsed
+	if inProjects(state) then
+		prefs.projectView = parsed
+	else
+		prefs.view = parsed
+	end
 	reloadBoard(state, run, false)
 end
 
@@ -1720,11 +2014,57 @@ local function nextTeam(state: BlockState, run: Run): boolean
 	return true
 end
 
+-- Projects mode scope: "all", "mine", or "team" with `teamId`.
+local function setProjectScope(state: BlockState, run: Run, scope: "all" | "mine" | "team", teamId: string?)
+	local prefs = state.prefs
+	if scope == "team" and teamById(state, teamId) == nil then
+		return
+	end
+	local target = if scope == "team" then teamId else nil
+	if (prefs.projectScope == scope and prefs.projectTeamId == target) or not canReload(state, run) then
+		return
+	end
+	prefs.projectScope = scope
+	prefs.projectTeamId = target
+	reloadBoard(state, run, true)
+end
+
+local function nextProjectTeam(state: BlockState, run: Run): boolean
+	local teams = state.teams
+	if #teams == 0 then
+		return false
+	end
+	local index = 0
+	if state.prefs.projectScope == "team" then
+		for position, team in teams do
+			if team.id == state.prefs.projectTeamId then
+				index = position
+				break
+			end
+		end
+	end
+	setProjectScope(state, run, "team", teams[index % #teams + 1].id)
+	return true
+end
+
+-- Same key toggles direction; a new key starts ascending, except "updated" (newest first).
 local function setSort(state: BlockState, key: string)
+	local prefs = state.prefs
+	if inProjects(state) then
+		if not PROJECT_SORT_KEYS[key] then
+			return
+		end
+		if prefs.projectSort == key then
+			prefs.projectSortAsc = not prefs.projectSortAsc
+		else
+			prefs.projectSort = key
+			prefs.projectSortAsc = key ~= "updated"
+		end
+		return
+	end
 	if not SORT_KEYS[key] then
 		return
 	end
-	local prefs = state.prefs
 	if prefs.sort == key then
 		prefs.sortAsc = not prefs.sortAsc
 	else
@@ -1734,6 +2074,12 @@ local function setSort(state: BlockState, key: string)
 end
 
 local function clearFilters(state: BlockState)
+	if inProjects(state) then
+		state.prefs.projectLead = nil
+		state.prefs.projectHealth = nil
+		text.set(state.projects.query, "")
+		return
+	end
 	state.prefs.priority = nil
 	state.prefs.assignee = nil
 	state.prefs.labelId = nil
@@ -1745,13 +2091,50 @@ local function copyText(state: BlockState, run: Run, value: string, label: strin
 	setNotice(state, run, "Copied " .. label)
 end
 
--- Only Linear's own pages are opened from an issue's `url`.
-local function openIssueUrl(state: BlockState, run: Run, issue: Issue)
-	if string.match(issue.url, "^https://linear%.app/") ~= nil then
-		state.cx:open(issue.url)
+-- Only Linear's own pages are opened from an issue's or a project's `url`.
+local function openLinearUrl(state: BlockState, run: Run, url: string)
+	if string.match(url, "^https://linear%.app/") ~= nil then
+		state.cx:open(url)
 	else
 		setNotice(state, run, "Refusing to open a link outside linear.app.")
 		state.cx:render()
+	end
+end
+
+-- Copies the project's URL, or its name when Linear sent no URL.
+local function copyProject(state: BlockState, run: Run, project: Project)
+	if project.url ~= "" then
+		copyText(state, run, project.url, "link to " .. project.name)
+	else
+		copyText(state, run, project.name, project.name)
+	end
+end
+
+-- Switches between projects and issues. Entering a mode whose list never loaded (or while a foreground load
+-- runs) loads it in the foreground; otherwise the list shows at once and reloads in the background.
+local function setMode(state: BlockState, run: Run, value: any)
+	local mode: Mode? = parseMode(value)
+	if mode == nil or mode == state.prefs.mode or not canReload(state, run) then
+		return
+	end
+	if mode == "projects" then
+		-- The drawer, its inputs and the create dialog belong to issues mode.
+		closeDrawer(state, run)
+		if state.form ~= nil then
+			cancelForm(state, run)
+		end
+	end
+	if state.focus == "search" then
+		setFocus(state, nil)
+	end
+	state.prefs.mode = mode
+	local loaded = if mode == "projects"
+		then state.projects.fetchedAt ~= nil and #state.projects.statuses > 0
+		else state.fetchedAt ~= nil
+	if state.busy or not loaded or not run.metaReady then
+		loadAll(state, run.metaReady)
+	else
+		reloadData(state, run)
 	end
 end
 
@@ -1817,7 +2200,7 @@ local ACTIONS: { [string]: ActionHandler } = {
 	end,
 	["open-url"] = function(state, run, value)
 		withIssue(state, value, function(issue)
-			openIssueUrl(state, run, issue)
+			openLinearUrl(state, run, issue.url)
 		end)
 	end,
 	["copy-id"] = function(state, run, value)
@@ -1904,6 +2287,67 @@ local ACTIONS: { [string]: ActionHandler } = {
 	["sign-out"] = function(state, run, _value)
 		signOut(state, run)
 	end,
+	["mode"] = function(state, run, value)
+		setMode(state, run, value)
+	end,
+	["project-scope"] = function(state, run, value)
+		if value == "all" or value == "mine" then
+			setProjectScope(state, run, value, nil)
+		end
+	end,
+	["project-team"] = function(state, run, value)
+		if value ~= nil then
+			setProjectScope(state, run, "team", value)
+		end
+	end,
+	["select-project"] = function(state, _run, value)
+		if value ~= nil then
+			selectProject(state, value)
+		end
+	end,
+	["open-project-url"] = function(state, run, value)
+		local project = if value ~= nil then findProject(state, value) else nil
+		if project ~= nil then
+			openLinearUrl(state, run, project.url)
+		end
+	end,
+	["copy-project-url"] = function(state, run, value)
+		local project = if value ~= nil then findProject(state, value) else nil
+		if project ~= nil then
+			copyProject(state, run, project)
+		end
+	end,
+}
+
+-- Actions that only apply in one mode; a stale click from the other mode is ignored. Unlisted: both modes.
+local ACTION_MODES: { [string]: Mode } = {
+	["scope"] = "issues",
+	["team"] = "issues",
+	["focus-team"] = "issues",
+	["select"] = "issues",
+	["close-detail"] = "issues",
+	["open-url"] = "issues",
+	["copy-id"] = "issues",
+	["copy-branch"] = "issues",
+	["set-state"] = "issues",
+	["assign-me"] = "issues",
+	["unassign"] = "issues",
+	["close-issue"] = "issues",
+	["reopen"] = "issues",
+	["edit"] = "issues",
+	["create"] = "issues",
+	["submit-form"] = "issues",
+	["cancel-form"] = "issues",
+	["submit-comment"] = "issues",
+	["link"] = "issues",
+	["submit-link"] = "issues",
+	["cancel-link"] = "issues",
+	["unlink"] = "issues",
+	["project-scope"] = "projects",
+	["project-team"] = "projects",
+	["select-project"] = "projects",
+	["open-project-url"] = "projects",
+	["copy-project-url"] = "projects",
 }
 
 -- Actions that must not blur the field they were clicked from.
@@ -1966,6 +2410,19 @@ local SELECTS: { [string]: SelectHandler } = {
 				setPriority(state, issue, priority)
 			end
 		end)
+	end,
+	["project-scope-select"] = function(state, run, value)
+		if value == "all" or value == "mine" then
+			setProjectScope(state, run, value, nil)
+		else
+			setProjectScope(state, run, "team", value)
+		end
+	end,
+	["filter-lead"] = function(state, _run, value)
+		state.prefs.projectLead = if value == "" then nil else value
+	end,
+	["filter-health"] = function(state, _run, value)
+		state.prefs.projectHealth = if value == "" then nil else value
 	end,
 }
 
@@ -2041,7 +2498,7 @@ local function handleFieldKey(state: BlockState, run: Run, k: Key): boolean
 			setFocus(state, nil)
 			return true
 		end
-		return text.key(state.query, k, false)
+		return text.key(activeQuery(state), k, false)
 	elseif focus == "comment" then
 		if name == "escape" or name == "tab" then
 			setFocus(state, nil)
@@ -2174,7 +2631,7 @@ local KEYS: { [string]: KeyHandler } = {
 		moveAdjacent(state, run, issue, 1)
 	end),
 	["o"] = selectedAction(function(state, run, issue)
-		openIssueUrl(state, run, issue)
+		openLinearUrl(state, run, issue.url)
 	end),
 	["y"] = selectedAction(function(state, run, issue)
 		copyText(state, run, issue.identifier, issue.identifier)
@@ -2183,6 +2640,78 @@ local KEYS: { [string]: KeyHandler } = {
 		loadAll(state, false)
 		return true
 	end,
+	["p"] = function(state, run)
+		setMode(state, run, "projects")
+		return true
+	end,
+	["i"] = function(state, run)
+		setMode(state, run, "issues")
+		return true
+	end,
+}
+
+local function selectedProjectAction(use: (BlockState, Run, Project) -> ()): KeyHandler
+	return function(state, run)
+		local project = selectedProject(state)
+		if project == nil then
+			return false
+		end
+		use(state, run, project)
+		return true
+	end
+end
+
+local function projectMoveKey(delta: number): KeyHandler
+	return function(state, _run)
+		return moveProjectSelection(state, delta)
+	end
+end
+
+local function projectColumnKey(delta: number): KeyHandler
+	return function(state, _run)
+		return moveProjectColumn(state, delta)
+	end
+end
+
+-- Projects mode: the issue keys without an issue to act on (n e c a x [ ]) are absent; `enter` opens nothing.
+local PROJECT_KEYS: { [string]: KeyHandler } = {
+	["/"] = KEYS["/"],
+	["1"] = KEYS["1"],
+	["2"] = KEYS["2"],
+	["3"] = KEYS["3"],
+	["v"] = KEYS["v"],
+	["r"] = KEYS["r"],
+	["p"] = KEYS["p"],
+	["i"] = KEYS["i"],
+	-- My projects, or back to All projects when already there.
+	["m"] = function(state, run)
+		if state.prefs.projectScope == "mine" then
+			setProjectScope(state, run, "all", nil)
+		else
+			setProjectScope(state, run, "mine", nil)
+		end
+		return true
+	end,
+	["t"] = nextProjectTeam,
+	["j"] = projectMoveKey(1),
+	["down"] = projectMoveKey(1),
+	["k"] = projectMoveKey(-1),
+	["up"] = projectMoveKey(-1),
+	["h"] = projectColumnKey(-1),
+	["left"] = projectColumnKey(-1),
+	["l"] = projectColumnKey(1),
+	["right"] = projectColumnKey(1),
+	["escape"] = function(state, _run)
+		if state.projects.selectedId == nil then
+			return false
+		end
+		clearProjectSelection(state)
+		return true
+	end,
+	["o"] = selectedProjectAction(function(state, run, project)
+		openLinearUrl(state, run, project.url)
+	end),
+	["y"] = selectedProjectAction(copyProject),
 }
 
 local function handleKey(state: BlockState, k: Key, _cx: BlockCx): boolean?
@@ -2201,7 +2730,7 @@ local function handleKey(state: BlockState, k: Key, _cx: BlockCx): boolean?
 	if k.ctrl or k.alt or k.meta then
 		return false
 	end
-	local handler = KEYS[k.name]
+	local handler = (if inProjects(state) then PROJECT_KEYS else KEYS)[k.name]
 	if handler == nil then
 		return false
 	end
@@ -2213,7 +2742,7 @@ end
 -- Maps a view field name to its focus key, editable text and (form fields) index.
 local function resolveField(state: BlockState, name: string): (string?, Field?, number?)
 	if name == "search" then
-		return "search", state.query, nil
+		return "search", activeQuery(state), nil
 	elseif name == "setup" then
 		return "setup", state.setupKey, nil
 	elseif name == "comment" then
@@ -2286,6 +2815,7 @@ end
 -- Selects whose pick may go unapplied (refused, rejected or failed); they remount to the real value.
 local REMOUNTING_SELECTS: { [string]: boolean } = {
 	["team-select"] = true,
+	["project-scope-select"] = true,
 	["state-select"] = true,
 	["assignee-select"] = true,
 	["priority-select"] = true,
@@ -2310,6 +2840,10 @@ local function onAction(state: BlockState, run: Run, ev: UiEvent)
 			return
 		end
 	elseif state.phase ~= "ready" then
+		return
+	end
+	local only = ACTION_MODES[act]
+	if only ~= nil and only ~= state.prefs.mode then
 		return
 	end
 	if not KEEPS_FOCUS[act] then
@@ -2351,10 +2885,21 @@ local function onChange(state: BlockState, run: Run, ev: UiEvent)
 	end
 end
 
--- Table row events: `select` highlights (and follows an open drawer), `activate` opens.
+-- Table row events. Issues: `select` highlights (and follows an open drawer), `activate` opens the drawer.
+-- Projects: both select the project; nothing opens yet.
 local function onRow(state: BlockState, run: Run, ev: UiEvent, open: boolean)
 	local item = ev.item
-	if type(item) ~= "string" or state.phase ~= "ready" or findIssue(state, item) == nil then
+	if type(item) ~= "string" or state.phase ~= "ready" then
+		return
+	end
+	if inProjects(state) then
+		if findProject(state, item) ~= nil then
+			blurTextFocus(state)
+			selectProject(state, item)
+		end
+		return
+	end
+	if findIssue(state, item) == nil then
 		return
 	end
 	blurTextFocus(state)
@@ -2424,6 +2969,17 @@ local function blockTitle(state: BlockState): string
 	if state.phase ~= "ready" then
 		return "Linear"
 	end
+	local prefs = state.prefs
+	if prefs.mode == "projects" then
+		if prefs.projectScope == "mine" then
+			return "Linear · My projects"
+		end
+		local team = if prefs.projectScope == "team" then teamById(state, prefs.projectTeamId) else nil
+		if team ~= nil then
+			return `Linear · Projects · {team.key}`
+		end
+		return "Linear · Projects"
+	end
 	local team = scopeTeam(state)
 	if team ~= nil then
 		return "Linear · " .. team.key
@@ -2450,12 +3006,18 @@ local def: BlockDef<BlockState> = {
 	save = function(state)
 		local prefs = state.prefs
 		return {
+			mode = prefs.mode,
 			sort = prefs.sort,
 			sortAsc = prefs.sortAsc,
 			scope = prefs.scope,
 			teamId = prefs.teamId,
 			view = prefs.view,
 			layout = prefs.layout,
+			projectScope = prefs.projectScope,
+			projectTeamId = prefs.projectTeamId,
+			projectView = prefs.projectView,
+			projectSort = prefs.projectSort,
+			projectSortAsc = prefs.projectSortAsc,
 		}
 	end,
 }

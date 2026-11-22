@@ -7,6 +7,8 @@ local types = require("./types")
 type Issue = types.Issue
 type IssueRef = types.IssueRef
 type Prefs = types.Prefs
+type Project = types.Project
+type ProjectStatus = types.ProjectStatus
 type Team = types.Team
 type WorkflowState = types.WorkflowState
 type Form = types.Form
@@ -18,6 +20,16 @@ export type Column = {
 	stateId: string?,
 	color: string?,
 	issues: { Issue },
+}
+
+-- One board column of projects mode: an organization project status.
+export type ProjectColumn = {
+	id: string,
+	title: string,
+	statusType: string,
+	statusId: string,
+	color: string,
+	projects: { Project },
 }
 
 local model = {}
@@ -578,6 +590,286 @@ function model.formDiff(form: Form): { [string]: string }
 		end
 	end
 	return changed
+end
+
+-- ─── Projects ───────────────────────────────────────────────────────────────
+
+local PROJECT_STATUS_TYPES: { string } =
+	table.freeze({ "backlog", "planned", "started", "paused", "completed", "canceled" })
+model.PROJECT_STATUS_TYPES = PROJECT_STATUS_TYPES
+
+local PROJECT_VIEW_TYPES: { [string]: { string } } = {
+	active = table.freeze({ "planned", "started", "paused" }),
+	backlog = table.freeze({ "backlog" }),
+	all = PROJECT_STATUS_TYPES,
+}
+
+local HEALTHS: { { value: string, label: string } } = {
+	{ value = "onTrack", label = "On track" },
+	{ value = "atRisk", label = "At risk" },
+	{ value = "offTrack", label = "Off track" },
+}
+model.HEALTHS = HEALTHS
+
+-- Worst first, so an ascending health sort leads with the projects that need attention.
+local HEALTH_RANK: { [string]: number } = { offTrack = 1, atRisk = 2, onTrack = 3 }
+local NO_HEALTH_RANK = 4
+
+function model.projectStatusRank(t: string): number
+	return table.find(PROJECT_STATUS_TYPES, t) or #PROJECT_STATUS_TYPES + 1
+end
+
+function model.projectViewTypes(view: string): { string }
+	return PROJECT_VIEW_TYPES[view] or PROJECT_VIEW_TYPES.active
+end
+
+function model.healthLabel(health: string?): string
+	for _, entry in HEALTHS do
+		if entry.value == health then
+			return entry.label
+		end
+	end
+	return "No update"
+end
+
+-- 0..1 → "0%"…"100%", rounded down so a project shows 100% only when it is complete.
+function model.progressLabel(progress: number): string
+	return `{math.floor(math.clamp(progress, 0, 1) * 100 + 1e-9)}%`
+end
+
+-- "YYYY-MM-DD" (or an ISO timestamp) → "Mar 4", with the year when it is not the year of `now`.
+function model.shortDate(date: string, now: number): string
+	local at = model.epoch(string.sub(date, 1, 10))
+	if at == nil then
+		return ""
+	end
+	local year, month, day = civilFromDays(at // SECONDS_PER_DAY)
+	local currentYear = civilFromDays(now // SECONDS_PER_DAY)
+	local label = `{MONTH_NAMES[month]} {day}`
+	return if year == currentYear then label else `{label}, {year}`
+end
+
+-- Linear ProjectFilter as plain tables; `{}` (no condition) when every project of the organization is wanted.
+-- Archived projects are excluded by the query itself (includeArchived defaults to false).
+function model.projectServerFilter(prefs: Prefs): any
+	local parts: { any } = {}
+	if prefs.projectScope == "mine" then
+		local leadOrMember: { any } = {
+			{ lead = { isMe = { eq = true } } },
+			{ members = { some = { isMe = { eq = true } } } },
+		}
+		table.insert(parts, { ["or"] = leadOrMember })
+	elseif prefs.projectScope == "team" and prefs.projectTeamId ~= nil then
+		table.insert(parts, { accessibleTeams = { some = { id = { eq = prefs.projectTeamId } } } })
+	end
+	if prefs.projectView ~= "all" then
+		table.insert(parts, { status = { type = { ["in"] = model.projectViewTypes(prefs.projectView) } } })
+	end
+	if #parts == 0 then
+		return {}
+	end
+	return { ["and"] = parts }
+end
+
+local function compareProjectStatus(a: Project, b: Project): number
+	local byType = compare(model.projectStatusRank(a.status.type), model.projectStatusRank(b.status.type))
+	if byType ~= 0 then
+		return byType
+	end
+	local byPosition = compare(a.status.position, b.status.position)
+	return if byPosition ~= 0 then byPosition else compareText(a.status.name, b.status.name)
+end
+
+local function compareProjectName(a: Project, b: Project): number
+	return compareText(a.name, b.name)
+end
+
+-- Inside a column: priority (1..4, then none), then Linear's manual order, then name.
+local function compareProjectCard(a: Project, b: Project): number
+	local byPriority = compare(priorityRank(a.priority), priorityRank(b.priority))
+	if byPriority ~= 0 then
+		return byPriority
+	end
+	local bySortOrder = compare(a.sortOrder, b.sortOrder)
+	return if bySortOrder ~= 0 then bySortOrder else compareProjectName(a, b)
+end
+
+local function lessProjects(compareWith: (Project, Project) -> number): (Project, Project) -> boolean
+	return function(a: Project, b: Project): boolean
+		local c = compareWith(a, b)
+		if c ~= 0 then
+			return c < 0
+		end
+		return a.id < b.id
+	end
+end
+
+local function projectHaystack(project: Project): string
+	local parts: { string } = { project.name }
+	local lead = project.lead
+	if lead ~= nil then
+		table.insert(parts, lead.name)
+		table.insert(parts, lead.displayName)
+	end
+	for _, team in project.teams do
+		table.insert(parts, team.key)
+	end
+	return string.lower(table.concat(parts, "\n"))
+end
+
+local function matchesLead(project: Project, wanted: string, viewerId: string?): boolean
+	local lead = project.lead
+	if wanted == "none" then
+		return lead == nil
+	end
+	local id = if wanted == "me" then viewerId else wanted
+	return lead ~= nil and id ~= nil and lead.id == id
+end
+
+local function matchesHealth(project: Project, wanted: string): boolean
+	if wanted == "none" then
+		return project.health == nil
+	end
+	return project.health == wanted
+end
+
+-- Client filters (query over name, lead and team keys; lead; health), deduped by id, in board order:
+-- status (type rank, position), then priority, sortOrder and name.
+function model.visibleProjects(projects: { Project }, prefs: Prefs, query: string, viewerId: string?): { Project }
+	local needle = string.lower(string.match(query, "^%s*(.-)%s*$") :: string)
+	local seen: { [string]: boolean } = {}
+	local out: { Project } = {}
+	for _, project in projects do
+		local keep = not seen[project.id]
+			and (needle == "" or string.find(projectHaystack(project), needle, 1, true) ~= nil)
+			and (prefs.projectLead == nil or matchesLead(project, prefs.projectLead, viewerId))
+			and (prefs.projectHealth == nil or matchesHealth(project, prefs.projectHealth))
+		if keep then
+			table.insert(out, project)
+		end
+		seen[project.id] = true
+	end
+	table.sort(
+		out,
+		lessProjects(function(a: Project, b: Project): number
+			local byStatus = compareProjectStatus(a, b)
+			return if byStatus ~= 0 then byStatus else compareProjectCard(a, b)
+		end)
+	)
+	return out
+end
+
+local function statusOrder(a: ProjectStatus, b: ProjectStatus): boolean
+	local rankA, rankB = model.projectStatusRank(a.type), model.projectStatusRank(b.type)
+	if rankA ~= rankB then
+		return rankA < rankB
+	end
+	if a.position ~= b.position then
+		return a.position < b.position
+	end
+	return a.id < b.id
+end
+
+-- One column per organization status whose type is in the view (empty ones included), ordered by type rank
+-- then position. A project whose status is missing from `statuses` (stale list) gets a column of its own.
+function model.projectColumns(visible: { Project }, prefs: Prefs, statuses: { ProjectStatus }): { ProjectColumn }
+	local viewTypes = model.projectViewTypes(prefs.projectView)
+	local wanted: { ProjectStatus } = {}
+	local known: { [string]: boolean } = {}
+	local function want(status: ProjectStatus)
+		if not known[status.id] and inList(viewTypes, status.type) then
+			known[status.id] = true
+			table.insert(wanted, status)
+		end
+	end
+	for _, status in statuses do
+		want(status)
+	end
+	for _, project in visible do
+		want(project.status)
+	end
+	table.sort(wanted, statusOrder)
+
+	local columns: { ProjectColumn } = {}
+	local byStatus: { [string]: ProjectColumn } = {}
+	for _, status in wanted do
+		local column: ProjectColumn = {
+			id = status.id,
+			title = status.name,
+			statusType = status.type,
+			statusId = status.id,
+			color = status.color,
+			projects = {},
+		}
+		table.insert(columns, column)
+		byStatus[status.id] = column
+	end
+	for _, project in visible do
+		local column = byStatus[project.status.id]
+		if column ~= nil then
+			table.insert(column.projects, project)
+		end
+	end
+	for _, column in columns do
+		table.sort(column.projects, lessProjects(compareProjectCard))
+	end
+	return columns
+end
+
+local function healthRank(health: string?): number
+	return if health ~= nil then HEALTH_RANK[health] or NO_HEALTH_RANK else NO_HEALTH_RANK
+end
+
+-- 1 when only `a` is missing, -1 when only `b` is: missing values (no lead, no target date) sort last.
+local function missingOrder(aMissing: boolean, bMissing: boolean): number
+	return compare(if aMissing then 1 else 0, if bMissing then 1 else 0)
+end
+
+local PROJECT_COMPARATORS: { [string]: (Project, Project) -> number } = {
+	name = compareProjectName,
+	status = compareProjectStatus,
+	health = function(a: Project, b: Project): number
+		return compare(healthRank(a.health), healthRank(b.health))
+	end,
+	lead = function(a: Project, b: Project): number
+		local left, right = a.lead, b.lead
+		if left == nil or right == nil then
+			return missingOrder(left == nil, right == nil)
+		end
+		return compareText(left.name, right.name)
+	end,
+	target = function(a: Project, b: Project): number
+		local left, right = a.targetDate, b.targetDate
+		if left == nil or right == nil then
+			return missingOrder(left == nil, right == nil)
+		end
+		return compare(model.epoch(left) or 0, model.epoch(right) or 0)
+	end,
+	progress = function(a: Project, b: Project): number
+		return compare(a.progress, b.progress)
+	end,
+	updated = function(a: Project, b: Project): number
+		return compare(model.epoch(a.updatedAt) or 0, model.epoch(b.updatedAt) or 0)
+	end,
+}
+
+model.PROJECT_SORT_KEYS = table.freeze({ "name", "status", "health", "lead", "target", "progress", "updated" })
+
+-- Table order for projects mode; ties fall back to the name. Unknown keys sort by name.
+function model.sortProjects(visible: { Project }, key: string, asc: boolean): { Project }
+	local base = PROJECT_COMPARATORS[key] or compareProjectName
+	local out = table.clone(visible)
+	table.sort(
+		out,
+		lessProjects(function(a: Project, b: Project): number
+			local c = base(a, b)
+			if c == 0 then
+				return compareProjectName(a, b)
+			end
+			return if asc then c else -c
+		end)
+	)
+	return out
 end
 
 return model

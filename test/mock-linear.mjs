@@ -1,4 +1,4 @@
-// A stateful fake of the Linear GraphQL API for the twelve operations in lib/queries.luau.
+// A stateful fake of the Linear GraphQL API for the fifteen operations in lib/queries.luau.
 //
 // Requests are executed by graphql-js against Linear's real SDL (.cache/linear-schema.graphql), so variable coercion,
 // validation errors and the shape of every response follow the documents the plugin sends. Resolvers read and mutate an
@@ -246,6 +246,67 @@ class IssueMatcher {
 	}
 }
 
+/** Evaluates the `ProjectFilter` subset the plugin sends (plus a few neighbours) against one project record. */
+class ProjectMatcher extends IssueMatcher {
+	matchKey(project, key, condition) {
+		const db = this.db;
+		const date = (value) => resolveDate(value, this.now);
+		switch (key) {
+			case "and":
+				return condition.every((sub) => this.match(project, sub));
+			case "or":
+				return condition.length === 0 || condition.some((sub) => this.match(project, sub));
+			case "id":
+				return compare(project.id, condition);
+			case "name":
+				return compare(project.name, condition);
+			case "health":
+				return compare(project.health, condition);
+			case "priority":
+				return compare(project.priority, condition);
+			case "startDate":
+			case "targetDate":
+				return compare(project[key], condition);
+			case "createdAt":
+			case "updatedAt":
+			case "completedAt":
+			case "canceledAt":
+				return compare(project[key], condition, date);
+			case "lead":
+				return this.matchRelated(db.user(project.leadId), condition, (user, sub) => this.matchUser(user, sub));
+			case "members":
+				return this.matchCollection(
+					project.memberIds.map((id) => db.user(id)),
+					condition,
+					(user, sub) => this.matchUser(user, sub),
+				);
+			case "accessibleTeams":
+				return this.matchCollection(
+					project.teamIds.map((id) => db.team(id)),
+					condition,
+					(team, sub) => this.matchTeam(team, sub),
+				);
+			case "status": {
+				const { id, name, type, position } = db.projectStatus(project.statusId);
+				return this.matchEntries(condition, { id, name, type, position });
+			}
+			default:
+				throw invalidInput(`The mock does not support ProjectFilter.${key}`);
+		}
+	}
+
+	/** `{some, every, length}` over a list of related entities. */
+	matchCollection(entities, condition, matchEntity) {
+		for (const [op, sub] of Object.entries(condition)) {
+			if (op === "some" && !entities.some((entity) => matchEntity(entity, sub))) return false;
+			if (op === "every" && !entities.every((entity) => matchEntity(entity, sub))) return false;
+			if (op === "length" && !compare(entities.length, sub)) return false;
+			if (!["some", "every", "length"].includes(op)) throw invalidInput(`The mock does not support ${op} on collections`);
+		}
+		return true;
+	}
+}
+
 // ─── data access and views ──────────────────────────────────────────────────
 
 const IDENTIFIER = /^([A-Za-z][A-Za-z0-9]*)-(\d+)$/;
@@ -312,6 +373,9 @@ class Database {
 	project(id) {
 		return this.state_.projects.find((p) => p.id === id) ?? null;
 	}
+	projectStatus(id) {
+		return this.state_.projectStatuses.find((s) => s.id === id) ?? null;
+	}
 	issue(id) {
 		return id ? (this.state_.issues.find((i) => i.id === id) ?? null) : null;
 	}
@@ -344,6 +408,28 @@ class Database {
 
 	stateView(state) {
 		return state && { ...state };
+	}
+
+	projectStatusView(status) {
+		return { ...status, createdAt: iso(status.createdAt), updatedAt: iso(status.updatedAt), archivedAt: iso(status.archivedAt) };
+	}
+
+	projectView(project) {
+		const slug = slugify(project.name);
+		return {
+			...project,
+			url: project.url ?? `https://linear.app/${this.state_.organization.urlKey}/project/${slug}-${project.slugId}`,
+			createdAt: iso(project.createdAt),
+			updatedAt: iso(project.updatedAt),
+			startedAt: iso(project.startedAt),
+			completedAt: iso(project.completedAt),
+			canceledAt: iso(project.canceledAt),
+			archivedAt: iso(project.archivedAt),
+			status: this.projectStatusView(this.projectStatus(project.statusId)),
+			lead: this.userView(this.user(project.leadId)),
+			members: (args) => connection(project.memberIds.map((id) => this.userView(this.user(id))), args),
+			teams: (args) => connection(project.teamIds.map((id) => this.teamView(this.team(id))), args),
+		};
 	}
 
 	cycleView(id) {
@@ -403,7 +489,7 @@ class Database {
 			creator: this.userView(creator),
 			assignee: this.userView(this.user(issue.assigneeId)),
 			labels: (args) => connection(issue.labelIds.map((id) => ({ ...this.label(id) })), args),
-			project: this.project(issue.projectId),
+			project: issue.projectId ? this.projectView(this.project(issue.projectId)) : null,
 			cycle: this.cycleView(issue.cycleId),
 			parent: issue.parentId ? this.issueView(this.issue(issue.parentId)) : null,
 			subscribers: (args) => connection([this.userView(viewer)], args),
@@ -431,6 +517,7 @@ class Database {
 
 function buildRoot(db, now) {
 	const matcher = new IssueMatcher(db, now());
+	const projectMatcher = new ProjectMatcher(db, now());
 
 	const settle = (issue) => {
 		const state = db.state(issue.stateId);
@@ -456,6 +543,24 @@ function buildRoot(db, now) {
 			...db.userView(db.user(db.state_.viewerId)),
 			organization: { ...db.state_.organization },
 		}),
+
+		organization: () => ({
+			...db.state_.organization,
+			projectStatuses: db.state_.projectStatuses.map((s) => db.projectStatusView(s)),
+		}),
+
+		projects: ({ filter, first, after, orderBy, includeArchived }) => {
+			projectMatcher.now = now();
+			const key = orderBy === "createdAt" ? "createdAt" : "updatedAt";
+			const matching = db.state_.projects
+				.filter((project) => includeArchived || project.archivedAt === null)
+				.filter((project) => projectMatcher.match(project, filter))
+				.sort((a, b) => b[key] - a[key] || a.name.localeCompare(b.name));
+			return connection(
+				matching.map((project) => db.projectView(project)),
+				{ first, after },
+			);
+		},
 
 		teams: (args) => connection(db.state_.teams.map((t) => db.teamView(t)), args),
 
@@ -609,6 +714,17 @@ function snapshot(db) {
 			id: t.id,
 			key: t.key,
 			states: t.states.map(({ id, name, type }) => ({ id, name, type })),
+		})),
+		projects: s.projects.map((p) => ({
+			id: p.id,
+			name: p.name,
+			status: db.projectStatus(p.statusId).name,
+			statusType: db.projectStatus(p.statusId).type,
+			health: p.health,
+			leadId: p.leadId,
+			url: db.projectView(p).url,
+			updatedAt: iso(p.updatedAt),
+			archivedAt: iso(p.archivedAt),
 		})),
 		issues: s.issues.map((i) => ({
 			id: i.id,

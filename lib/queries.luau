@@ -148,4 +148,32 @@ queries.IssuesChanged = [[query IssuesChanged($filter: IssueFilter, $includeArch
   }
 }]]
 
+-- The organization's project statuses: a plain list (no connection), a few per workspace.
+queries.ProjectStatuses = [[query ProjectStatuses {
+  organization { projectStatuses { id name type color position archivedAt } }
+}]]
+
+-- Archived projects are excluded (`includeArchived` defaults to false). `teams` is capped at 5 per project:
+-- the board shows team keys only, and every nested connection multiplies the cost by the page size.
+queries.Projects =
+	[[query Projects($filter: ProjectFilter, $first: Int = 50, $after: String, $orderBy: PaginationOrderBy = updatedAt) {
+  projects(filter: $filter, first: $first, after: $after, orderBy: $orderBy) {
+    nodes {
+      id name url slugId icon color description priority sortOrder progress health
+      startDate targetDate createdAt updatedAt startedAt completedAt canceledAt
+      status { id name type color position }
+      lead { id name displayName avatarUrl }
+      teams(first: 5) { nodes { id key name } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}]]
+
+-- Cheap change detection for projects mode: the most recently updated project under the list's filter.
+queries.ProjectsChanged = [[query ProjectsChanged($filter: ProjectFilter) {
+  projects(filter: $filter, first: 1, orderBy: updatedAt) {
+    nodes { id updatedAt }
+  }
+}]]
+
 return queries

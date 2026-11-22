@@ -1,6 +1,9 @@
 // Smoke test against the real Linear API (no mock).
-//   bun test/live-smoke.mjs            read-only: board, table, detail drawer
+//   bun test/live-smoke.mjs            read-only: projects board and table, then the issue board, table, detail drawer
 //   bun test/live-smoke.mjs --write    also creates, comments on and completes one issue
+//
+// It also sends the read-only project queries once directly and prints Linear's `x-complexity` for each
+// (Linear rejects a query above 10000).
 //
 // The key comes from LINEAR_API_KEY, else ~/.config/tern-linear-dev/api-key. It is never printed or written to the report.
 // Screenshots and the report go to e2e-artifacts/live/.
@@ -8,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createRunner, repoRoot, startTern, waitFor } from "./harness.mjs";
+import { extractQueries } from "./validate-queries.mjs";
 
 const write = process.argv.includes("--write");
 const artifacts = join(repoRoot, "e2e-artifacts/live");
@@ -23,11 +27,47 @@ function readKey() {
 	process.exit(2);
 }
 
+const LINEAR_ENDPOINT = "https://api.linear.app/graphql";
+const MAX_COMPLEXITY = 10_000;
+
+/**
+ * Sends each read-only project operation of lib/queries.luau once, with the variables the plugin uses, and returns
+ * `{ operation, request, complexity, nodes }` per request. Throws on a GraphQL error or a cost above the cap.
+ */
+async function measureComplexity(key) {
+	const docs = Object.fromEntries(
+		extractQueries(readFileSync(join(repoRoot, "lib/queries.luau"), "utf8")).map((q) => [q.key, q.text]),
+	);
+	const active = { and: [{ status: { type: { in: ["planned", "started", "paused"] } } }] };
+	const requests = [
+		["ProjectStatuses", {}, "organization statuses"],
+		["Projects", { first: 50, filter: active }, "first 50, Active view"],
+		["Projects", { first: 50 }, "first 50, All projects / All view (no filter)"],
+		["ProjectsChanged", { filter: active }, "change check, Active view"],
+	];
+	const results = [];
+	for (const [operation, variables, request] of requests) {
+		const response = await fetch(LINEAR_ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: key.startsWith("lin_oauth_") ? `Bearer ${key}` : key },
+			body: JSON.stringify({ query: docs[operation], operationName: operation, variables }),
+		});
+		const body = await response.json();
+		if (body.errors?.length) throw new Error(`${operation}: ${body.errors[0].message}`);
+		const complexity = Number(response.headers.get("x-complexity"));
+		if (!(complexity <= MAX_COMPLEXITY)) throw new Error(`${operation}: complexity ${complexity} over ${MAX_COMPLEXITY}`);
+		const nodes = body.data.projects?.nodes?.length ?? body.data.organization?.projectStatuses?.length;
+		results.push({ operation, request, complexity, nodes });
+	}
+	return results;
+}
+
 rmSync(artifacts, { recursive: true, force: true });
 mkdirSync(artifacts, { recursive: true });
 
+const apiKey = readKey();
 // Never point the plugin at the mock: LINEAR_API_URL is stripped from the child environment by the harness.
-const t = await startTern({ env: { LINEAR_API_KEY: readKey() }, out: ternOut, size: "1440 900" });
+const t = await startTern({ env: { LINEAR_API_KEY: apiKey }, out: ternOut, size: "1440 900" });
 const runner = createRunner(t, { dir: artifacts, title: write ? "tern-linear live smoke (write)" : "tern-linear live smoke" });
 
 const role = (name) => `[data-role='linear.${name}']`;
@@ -81,7 +121,7 @@ let hasIssues = false;
 const report = runner.report;
 
 async function scenario() {
-	await runner.step("board-loads", async (label) => {
+	await runner.step("projects-load", async (label) => {
 		await t.openBlock();
 		// Loaded = the loading screen is gone and something else (board, empty state, setup or error) shows.
 		await waitFor(
@@ -94,6 +134,49 @@ async function scenario() {
 		);
 		if (await exists(role("setup"))) throw new Error("the plugin shows the setup screen; the API key was not picked up");
 		if (await exists(role("error"))) throw new Error(`error banner: ${(await t.text(role("error"))).slice(0, 300)}`);
+		if (!(await exists(`${role("mode-projects")}`))) throw new Error("no mode switch in the top bar");
+		const count = (await t.tree(role("project-card"))).nodes?.length ?? 0;
+		const columns = ((await t.tree(role("column-head"))).nodes ?? []).map((node) => (node.text ?? "").replace(/\d+$/, ""));
+		console.log(`note: projects board (All projects, Active): ${count} cards in ${columns.length} columns: ${columns.join(", ")}`);
+		report.projects = { cards: count, columns };
+		await runner.shot(label);
+	});
+
+	await runner.step("projects-table", async (label) => {
+		await t.key("3");
+		await waitFor(async () => (await t.wait(150), !(await exists(role("reloading")))), { what: "the All view", timeout: 45_000, interval: 0 });
+		if (!(await exists(role("project-card")))) {
+			console.log("note: the workspace has no projects; the projects table is skipped");
+			await t.key("1");
+			return;
+		}
+		await t.key("v");
+		await present(role("table"));
+		await runner.shot(label);
+		await t.key("v");
+		await present(role("board"));
+		await t.key("1");
+	});
+
+	await runner.step("project-query-complexity", async () => {
+		report.complexity = await measureComplexity(apiKey);
+		for (const { operation, request, complexity, nodes } of report.complexity) {
+			console.log(`complexity: ${operation} (${request}): ${complexity} of ${MAX_COMPLEXITY}, ${nodes} nodes`);
+		}
+	});
+
+	await runner.step("issues-mode", async (label) => {
+		await t.key("i");
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("reloading"))) return false;
+				return (await exists(role("board"))) || (await exists(role("empty"))) || (await exists(role("error")));
+			},
+			{ what: "the issue board to load", timeout: 45_000, interval: 0 },
+		);
+		if (await exists(role("error"))) throw new Error(`error banner: ${(await t.text(role("error"))).slice(0, 300)}`);
+		await t.waitFor(role("search"), "Search issues");
 		await runner.shot(label);
 	});
 
