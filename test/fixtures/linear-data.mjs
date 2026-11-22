@@ -231,6 +231,8 @@ const SYNC_HISTORY = [
 // Dates: `target`/`start` in days from now (negative: past), the rest in ms ago.
 // "Desktop app" stays first: the issue seed refers to projects by index. Its issues span ENG and DES (the Issues tab):
 // Todo and In Progress in both teams, In Review in ENG, ENG-146 blocked by ENG-140, ENG-150 in Backlog, ENG-137 done.
+// Milestones (`milestone` on an issue, by name within its project): Beta holds ENG-142, ENG-138, DES-15 and ENG-150
+// (Backlog), Alpha ENG-140 and ENG-137 (Done), Accessibility audit DES-12; ENG-131, ENG-139 and ENG-146 have none.
 const PROJECTS = [
 	{
 		name: "Desktop app",
@@ -432,6 +434,7 @@ const ISSUES = [
 		labels: ["Bug"],
 		estimate: 5,
 		project: 0,
+		milestone: "Beta",
 		cycle: true,
 		created: 3 * DAY,
 		updated: 20 * MINUTE,
@@ -473,6 +476,7 @@ const ISSUES = [
 		estimate: 3,
 		parent: 131,
 		project: 0,
+		milestone: "Beta",
 		cycle: true,
 		created: 9 * DAY,
 		updated: 45 * MINUTE,
@@ -535,6 +539,7 @@ const ISSUES = [
 		labels: ["Improvement"],
 		estimate: 13,
 		project: 0,
+		milestone: "Alpha",
 		cycle: true,
 		created: 14 * DAY,
 		updated: 70 * MINUTE,
@@ -578,6 +583,7 @@ const ISSUES = [
 		labels: ["Improvement"],
 		estimate: 2,
 		project: 0,
+		milestone: "Alpha",
 		created: 11 * DAY,
 		updated: 5 * DAY,
 		completed: 5 * DAY,
@@ -619,6 +625,7 @@ const ISSUES = [
 		creator: "linus",
 		labels: ["Improvement"],
 		project: 0,
+		milestone: "Beta",
 		created: 2 * DAY,
 		updated: 4 * 24 * 60 * MINUTE,
 	},
@@ -633,6 +640,7 @@ const ISSUES = [
 		creator: "dieter",
 		labels: ["UI"],
 		project: 0,
+		milestone: "Accessibility audit",
 		created: 8 * DAY,
 		updated: 90 * MINUTE,
 	},
@@ -647,6 +655,7 @@ const ISSUES = [
 		creator: "dieter",
 		labels: ["UI", "Research"],
 		project: 0,
+		milestone: "Beta",
 		created: 3 * DAY,
 		updated: 400 * MINUTE,
 	},
@@ -906,6 +915,10 @@ function build(now) {
 			labelIds: (spec.labels ?? []).map((name) => team.labels.find((l) => l.name === name).id),
 			parentNumber: spec.parent ?? null,
 			projectId: spec.project === undefined ? null : projects[spec.project].id,
+			projectMilestoneId:
+				spec.milestone === undefined
+					? null
+					: projectMilestones.find((m) => m.projectId === projects[spec.project].id && m.name === spec.milestone).id,
 			cycleId: spec.cycle ? team.activeCycle.id : null,
 			dueDate: null,
 			sortOrder: -spec.number * 100,

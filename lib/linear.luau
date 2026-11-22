@@ -449,6 +449,11 @@ local function normalizeIssue(raw: Json, detailed: boolean): types.Issue
 	if type(raw.project) == "table" and text(raw.project.id) ~= nil and text(raw.project.name) ~= nil then
 		project = { id = raw.project.id, name = raw.project.name }
 	end
+	local milestone: { id: string, name: string }? = nil
+	local rawMilestone: Json = raw.projectMilestone
+	if type(rawMilestone) == "table" and text(rawMilestone.id) ~= nil and text(rawMilestone.name) ~= nil then
+		milestone = { id = rawMilestone.id, name = rawMilestone.name }
+	end
 	local cycle: { id: string, number: number, name: string? }? = nil
 	if type(raw.cycle) == "table" and text(raw.cycle.id) ~= nil and number(raw.cycle.number) ~= nil then
 		cycle = { id = raw.cycle.id, number = raw.cycle.number, name = text(raw.cycle.name) }
@@ -479,6 +484,7 @@ local function normalizeIssue(raw: Json, detailed: boolean): types.Issue
 		creator = normalizeUser(raw.creator),
 		labels = labels,
 		project = project,
+		projectMilestone = milestone,
 		cycle = cycle,
 		parent = normalizeRef(raw.parent),
 		children = children,

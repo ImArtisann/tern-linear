@@ -84,9 +84,16 @@
 	padding-top: 10px;
 }
 
+/* A milestone row is clickable: it shows the Issues tab filtered to the milestone. */
 .sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone'] {
-	padding: 4px 0 6px;
+	padding: 4px 4px 6px;
 	border-bottom: 1px solid var(--l1);
+	cursor: pointer;
+	transition: background 0.12s var(--ease);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone']:hover {
+	background: var(--raise);
 }
 
 .sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-icon'] {
@@ -179,4 +186,11 @@
 .sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-issues-bar'] {
 	align-items: center;
 	row-gap: 8px;
+}
+
+/* A set milestone filter stands out from the quiet selects around it. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-filter'][data-mark='active'] {
+	border-radius: var(--r-ctl);
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
 }

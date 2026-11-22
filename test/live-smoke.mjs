@@ -34,8 +34,8 @@ const MAX_COMPLEXITY = 10_000;
 /**
  * Sends each read-only project operation of lib/queries.luau once, with the variables the plugin uses, and returns
  * `{ operation, request, complexity, nodes }` per request. `Project` (the project page) asks for the first project of
- * the unfiltered list; so do the Issues tab's `Issues` and `IssuesChanged`. Throws on a GraphQL error or a cost above
- * the cap.
+ * the unfiltered list; so do the Issues tab's `Issues` and `IssuesChanged`, unfiltered and filtered to that project's
+ * first milestone (when it has one). Throws on a GraphQL error or a cost above the cap.
  */
 async function measureComplexity(key) {
 	const docs = Object.fromEntries(
@@ -75,7 +75,7 @@ async function measureComplexity(key) {
 		if (operation === "Projects" && !variables.filter) firstProject = data.projects.nodes[0]?.id;
 	}
 	if (firstProject) {
-		await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
+		const detail = await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
 		// The Issues tab: model.projectIssueFilter (the project AND the Active view), first page of 50 as linear.issues
 		// sends it, and the poll's change check.
 		const tabFilter = {
@@ -84,6 +84,19 @@ async function measureComplexity(key) {
 		await send("Issues", { filter: tabFilter, first: 50 }, "Issues tab, first 50, Active view");
 		const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 		await send("IssuesChanged", { filter: { and: [tabFilter, { updatedAt: { gt: since } }] } }, "Issues tab change check");
+		// The milestone filter (model.projectIssueFilter with a milestone): the project, the milestone, then the view.
+		const milestone = detail.project?.projectMilestones?.nodes?.[0]?.id;
+		if (milestone) {
+			const milestoneFilter = { and: [tabFilter.and[0], { projectMilestone: { id: { eq: milestone } } }, tabFilter.and[1]] };
+			await send("Issues", { filter: milestoneFilter, first: 50 }, "Issues tab filtered to a milestone, first 50, Active view");
+			await send(
+				"IssuesChanged",
+				{ filter: { and: [milestoneFilter, { updatedAt: { gt: since } }] } },
+				"Issues tab change check, milestone filter",
+			);
+		} else {
+			results.noMilestone = true;
+		}
 		// The Activity tab's first pages, with the plugin's page sizes (the documents' defaults).
 		await send("ProjectUpdates", { id: firstProject }, "Activity tab, first 20 updates with 10 comments each");
 		const history = await send("ProjectHistory", { id: firstProject }, "Activity tab, first 25 history records");
@@ -271,6 +284,28 @@ async function scenario() {
 			// The next Escape clears the selection; the one after that goes back.
 			await t.key("Escape");
 			await present(role("project-issues"));
+		}
+		// Read-only: a milestone row of the Overview shows the Issues tab filtered to it.
+		if (milestones > 0) {
+			await t.click(role("project-tab-overview"));
+			await present(role("milestone"));
+			await t.click(role("milestone"));
+			await present(`${role("milestone-filter")}[data-mark='active']`, 45_000);
+			await waitFor(
+				async () => {
+					await t.wait(150);
+					if (await exists(role("project-issues-error"))) {
+						throw new Error(`filtered issues tab error: ${(await t.text(role("project-issues-error"))).slice(0, 300)}`);
+					}
+					if (await exists(role("reloading"))) return false;
+					return (await exists(`${role("project-issues")} ${role("board")}`)) || (await exists(`${role("project-issues")} ${role("empty")}`));
+				},
+				{ what: "the milestone's issues", timeout: 45_000, interval: 0 },
+			);
+			const milestoneCards = ((await t.tree(role("card"))).nodes ?? []).length;
+			console.log(`note: issues tab filtered to the first milestone: ${milestoneCards} cards`);
+			report.projectIssues.milestoneCards = milestoneCards;
+			await runner.shot("project-issues-milestone");
 		}
 		await t.key("Escape");
 		await absent(role("project-header"));

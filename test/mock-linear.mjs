@@ -194,6 +194,10 @@ class IssueMatcher {
 				return this.matchRelated(db.project(issue.projectId), condition, (project, sub) =>
 					this.matchEntries(sub, { id: project.id, name: project.name }),
 				);
+			case "projectMilestone":
+				return this.matchRelated(db.projectMilestone(issue.projectMilestoneId), condition, (milestone, sub) =>
+					this.matchEntries(sub, { id: milestone.id, name: milestone.name }),
+				);
 			case "labels":
 				return this.matchLabels(issue, condition);
 			case "hasBlockedByRelations":
@@ -373,6 +377,9 @@ class Database {
 	project(id) {
 		return this.state_.projects.find((p) => p.id === id) ?? null;
 	}
+	projectMilestone(id) {
+		return id ? (this.state_.projectMilestones.find((m) => m.id === id) ?? null) : null;
+	}
 	projectLabel(id) {
 		return this.state_.projectLabels.find((l) => l.id === id) ?? null;
 	}
@@ -417,6 +424,10 @@ class Database {
 		return { ...status, createdAt: iso(status.createdAt), updatedAt: iso(status.updatedAt), archivedAt: iso(status.archivedAt) };
 	}
 
+	milestoneView(milestone) {
+		return milestone && { ...milestone, createdAt: iso(milestone.createdAt), updatedAt: iso(milestone.updatedAt), archivedAt: null };
+	}
+
 	projectView(project) {
 		const slug = slugify(project.name);
 		return {
@@ -440,7 +451,7 @@ class Database {
 					this.state_.projectMilestones
 						.filter((m) => m.projectId === project.id && m.archivedAt === null)
 						.sort((a, b) => b.sortOrder - a.sortOrder)
-						.map((m) => ({ ...m, createdAt: iso(m.createdAt), updatedAt: iso(m.updatedAt), archivedAt: null })),
+						.map((m) => this.milestoneView(m)),
 					args,
 				),
 			// Newest first, like Linear's `first` pages.
@@ -545,6 +556,7 @@ class Database {
 			assignee: this.userView(this.user(issue.assigneeId)),
 			labels: (args) => connection(issue.labelIds.map((id) => ({ ...this.label(id) })), args),
 			project: issue.projectId ? this.projectView(this.project(issue.projectId)) : null,
+			projectMilestone: issue.projectMilestoneId ? this.milestoneView(this.projectMilestone(issue.projectMilestoneId)) : null,
 			cycle: this.cycleView(issue.cycleId),
 			parent: issue.parentId ? this.issueView(this.issue(issue.parentId)) : null,
 			subscribers: (args) => connection([this.userView(viewer)], args),
@@ -664,6 +676,7 @@ function buildRoot(db, now) {
 				labelIds: input.labelIds ?? [],
 				parentId: resolveRef(input.parentId, "Issue"),
 				projectId: input.projectId ?? null,
+				projectMilestoneId: input.projectMilestoneId ?? null,
 				cycleId: input.cycleId ?? null,
 				dueDate: input.dueDate ?? null,
 				sortOrder: -now_,
@@ -697,7 +710,7 @@ function buildRoot(db, now) {
 				if (input.assigneeId !== null && !db.user(input.assigneeId)) throw notFound("User");
 				issue.assigneeId = input.assigneeId;
 			}
-			for (const key of ["title", "description", "priority", "estimate", "dueDate", "projectId", "cycleId"]) {
+			for (const key of ["title", "description", "priority", "estimate", "dueDate", "projectId", "projectMilestoneId", "cycleId"]) {
 				if (has(key)) issue[key] = input[key];
 			}
 			if (has("parentId")) issue.parentId = resolveRef(input.parentId, "Issue");
@@ -788,6 +801,12 @@ function snapshot(db) {
 			targetDate: p.targetDate,
 			archivedAt: iso(p.archivedAt),
 		})),
+		projectMilestones: s.projectMilestones.map(({ id, projectId, name, archivedAt }) => ({
+			id,
+			projectId,
+			name,
+			archived: archivedAt !== null,
+		})),
 		issues: s.issues.map((i) => ({
 			id: i.id,
 			identifier: db.identifier(i),
@@ -798,6 +817,7 @@ function snapshot(db) {
 			stateId: i.stateId,
 			stateType: db.state(i.stateId).type,
 			assigneeId: i.assigneeId,
+			projectMilestoneId: i.projectMilestoneId,
 			updatedAt: iso(i.updatedAt),
 			completedAt: iso(i.completedAt),
 			canceledAt: iso(i.canceledAt),
@@ -918,6 +938,11 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		/** The next request of `operationName` answers RATELIMITED with `retry-after: seconds`. */
 		rateLimitNext: (operationName, seconds = 1) => {
 			rateLimitedOps.set(operationName, seconds);
+		},
+		/** Deletes a milestone: its project no longer lists it and its issues belong to no milestone. */
+		deleteMilestone: (id) => {
+			db.projectMilestone(id).archivedAt = db.tick();
+			for (const issue of db.state_.issues) if (issue.projectMilestoneId === id) issue.projectMilestoneId = null;
 		},
 		stop: () => server.stop(true),
 	};

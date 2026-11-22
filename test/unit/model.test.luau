@@ -736,6 +736,15 @@ check(
 	milestoneNames(model.sortMilestones(unsortedMilestones)) == "Alpha Beta Undated Launch echo zulu"
 )
 check("sorting milestones does not mutate its input", unsortedMilestones[1].name == "Launch")
+local foundBeta = model.milestoneById(unsortedMilestones, "m-beta")
+check(
+	"milestoneById finds a milestone of the list; nil for an unknown or nil id",
+	foundBeta ~= nil
+		and foundBeta.name == "Beta"
+		and model.milestoneById(unsortedMilestones, "m-gone") == nil
+		and model.milestoneById(unsortedMilestones, nil) == nil
+		and model.milestoneById({}, "m-beta") == nil
+)
 check(
 	"milestone status labels",
 	model.milestoneStatusLabel("done") == "Done"

@@ -158,7 +158,7 @@ function model.serverFilter(prefs: Prefs): any
 	return { ["and"] = parts }
 end
 
--- The project page's Issues tab: the project's issues in a view, AND (layer 5) one of its milestones.
+-- The project page's Issues tab: the project's issues in a view, AND (when set) one of its milestones.
 function model.projectIssueFilter(projectId: string, view: string, milestoneId: string?): any
 	local parts: { any } = { { project = { id = { eq = projectId } } } }
 	if milestoneId ~= nil then
@@ -1117,6 +1117,20 @@ function model.sortMilestones(milestones: { ProjectMilestone }): { ProjectMilest
 		return a.id < b.id
 	end)
 	return out
+end
+
+-- The milestone with that id, nil when the list has none (the Issues tab's milestone filter checks a click, a select
+-- pick and a restored or polled filter against the page's milestones).
+function model.milestoneById(milestones: { ProjectMilestone }, id: string?): ProjectMilestone?
+	if id == nil then
+		return nil
+	end
+	for _, milestone in milestones do
+		if milestone.id == id then
+			return milestone
+		end
+	end
+	return nil
 end
 
 -- "ada, grace, linus" with at most `max` names, then "+N" for the rest; "" for none.

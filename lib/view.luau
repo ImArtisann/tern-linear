@@ -422,6 +422,7 @@ local function issuesModeList(state: BlockState, cx: BlockCx, team: Team?): issu
 		labels = availableLabels(state, team),
 		reloading = state.reloading,
 		emptyHelp = if prefs.scope == "mine" then "mine" else "none",
+		milestones = false,
 		chromeRows = chromeRows(state, cx),
 	}
 end

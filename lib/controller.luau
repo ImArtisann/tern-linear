@@ -240,7 +240,7 @@ end
 -- close to Luau's 200-local limit). The requests are defined with the project page below.
 local projectIssues = {}
 
--- The Issues tab before its first show: nothing loaded, the Active view, no filters, newest first.
+-- The Issues tab before its first show: nothing loaded, the Active view, no milestone, no filters, newest first.
 function projectIssues.new(): types.ProjectIssuesState
 	return {
 		items = {},
@@ -251,6 +251,7 @@ function projectIssues.new(): types.ProjectIssuesState
 		error = nil,
 		stale = false,
 		view = "active",
+		milestoneId = nil,
 		priority = nil,
 		assignee = nil,
 		labelId = nil,
@@ -281,7 +282,8 @@ local function newPage(id: string, tab: types.ProjectTab): types.ProjectPageStat
 	}
 end
 
--- A saved project page (`save().projectPage`): the project id and a known tab, else nil.
+-- A saved project page (`save().projectPage`): the project id, a known tab and the Issues tab's milestone filter
+-- (checked against the project's milestones once its detail loads), else nil.
 local function restorePage(saved: any): types.ProjectPageState?
 	if type(saved) ~= "table" then
 		return nil
@@ -290,7 +292,11 @@ local function restorePage(saved: any): types.ProjectPageState?
 	if type(page) ~= "table" or type(page.id) ~= "string" or page.id == "" then
 		return nil
 	end
-	return newPage(page.id, model.projectTab(page.tab) or "overview")
+	local restored = newPage(page.id, model.projectTab(page.tab) or "overview")
+	if type(page.milestoneId) == "string" and page.milestoneId ~= "" then
+		restored.issues.milestoneId = page.milestoneId
+	end
+	return restored
 end
 
 local function newState(cx: BlockCx, prefs: Prefs): BlockState
@@ -1291,6 +1297,7 @@ local function fetchProjectPage(state: BlockState, run: Run, shown: boolean)
 			page.detail = detail
 			page.error = nil
 			page.fetchedAt = os.time()
+			projectIssues.dropMissingMilestone(state, live, page)
 		else
 			local failure = err or unknownError()
 			if failure.kind == "notfound" then
@@ -1441,7 +1448,8 @@ function projectIssues.fetch(state: BlockState, run: Run, shown: boolean)
 	if shown then
 		tab.loading = true
 	end
-	linear.issues(cfg, model.projectIssueFilter(page.projectId, tab.view), function(result, err)
+	local filter = model.projectIssueFilter(page.projectId, tab.view, tab.milestoneId)
+	linear.issues(cfg, filter, function(result, err)
 		local live = liveRun(state)
 		if live == nil or live.issuesToken ~= token or state.projectPage ~= page then
 			return
@@ -1474,7 +1482,7 @@ function projectIssues.check(state: BlockState, run: Run)
 	run.issuesToken += 1
 	local token = run.issuesToken
 	run.issuesInFlight = true
-	local filter = model.projectIssueFilter(page.projectId, tab.view)
+	local filter = model.projectIssueFilter(page.projectId, tab.view, tab.milestoneId)
 	linear.changedSince(cfg, filter, tab.maxUpdatedAt, function(newest, err)
 		local live = liveRun(state)
 		if live == nil or live.issuesToken ~= token or state.projectPage ~= page then
@@ -1515,6 +1523,48 @@ local function selectProjectTab(state: BlockState, run: Run, tab: types.ProjectT
 		fetchActivity(state, run, "shown")
 	elseif tab == "issues" and (page.issues.stale or (page.issues.fetchedAt == nil and not page.issues.loading)) then
 		projectIssues.fetch(state, run, page.issues.fetchedAt == nil)
+	end
+end
+
+-- The milestone filter of the Issues tab (a milestone row of the Overview, the tab's milestone select): one of the
+-- page's milestones, or nil for all. Shows the Issues tab; a changed filter reloads it as a shown load.
+function projectIssues.showMilestone(state: BlockState, run: Run, id: string?)
+	local page = state.projectPage
+	if page == nil then
+		return
+	end
+	local detail = page.detail
+	if id ~= nil and (detail == nil or model.milestoneById(detail.milestones, id) == nil) then
+		return
+	end
+	local tab = page.issues
+	local changed = tab.milestoneId ~= id
+	tab.milestoneId = id
+	-- Showing a tab that never loaded loads it, already with the new filter.
+	local firstShow = tab.fetchedAt == nil and not tab.loading
+	selectProjectTab(state, run, "issues")
+	if changed and not firstShow then
+		projectIssues.fetch(state, run, true)
+	end
+end
+
+-- After a detail load: a milestone filter whose milestone the project no longer has (deleted since it was saved or
+-- picked) is dropped with a notice; the tab reloads unfiltered on screen, or on its next show.
+function projectIssues.dropMissingMilestone(state: BlockState, run: Run, page: types.ProjectPageState)
+	local tab = page.issues
+	local detail = page.detail
+	if tab.milestoneId == nil or detail == nil or model.milestoneById(detail.milestones, tab.milestoneId) ~= nil then
+		return
+	end
+	tab.milestoneId = nil
+	setNotice(state, run, "Milestone not found; showing all issues")
+	if page.tab == "issues" then
+		projectIssues.fetch(state, run, true)
+	else
+		run.issuesToken += 1
+		run.issuesInFlight = false
+		tab.loading = false
+		tab.fetchedAt = nil
 	end
 end
 
@@ -2841,6 +2891,11 @@ local ACTIONS: { [string]: ActionHandler } = {
 	["project-tab"] = function(state, run, value)
 		selectProjectTab(state, run, model.projectTab(value))
 	end,
+	["milestone"] = function(state, run, value)
+		if value ~= nil then
+			projectIssues.showMilestone(state, run, value)
+		end
+	end,
 	["refresh-project"] = function(state, run, _value)
 		refreshProjectTab(state, run)
 	end,
@@ -2918,6 +2973,7 @@ local ACTION_MODES: { [string]: Gate } = {
 	["project-back"] = "projects",
 	["project-tab"] = "projects",
 	["refresh-project"] = "projects",
+	["milestone"] = "projects",
 	["activity-more"] = "projects",
 	["activity-comments"] = "projects",
 	["open-project-url"] = "projects",
@@ -3016,6 +3072,11 @@ local SELECTS: { [string]: SelectHandler } = {
 	["filter-health"] = function(state, _run, value)
 		state.prefs.projectHealth = if value == "" then nil else value
 	end,
+	["milestone-select"] = function(state, run, value)
+		if model.issuesTab(state) ~= nil then
+			projectIssues.showMilestone(state, run, if value == "" then nil else value)
+		end
+	end,
 }
 
 -- Where each select applies (see Gate): the filter row's and the drawer's issue selects follow the issue list on
@@ -3031,6 +3092,7 @@ local SELECT_MODES: { [string]: Gate } = {
 	["project-scope-select"] = "projects",
 	["filter-lead"] = "projects",
 	["filter-health"] = "projects",
+	["milestone-select"] = "projects",
 }
 
 -- ─── Keys ───────────────────────────────────────────────────────────────────
@@ -3733,9 +3795,9 @@ local def: BlockDef<BlockState> = {
 			projectView = prefs.projectView,
 			projectSort = prefs.projectSort,
 			projectSortAsc = prefs.projectSortAsc,
-			-- The open project page, reopened on restore (projects mode only).
+			-- The open project page, reopened on restore (projects mode only), with the Issues tab's milestone filter.
 			projectPage = if prefs.mode == "projects" and page ~= nil
-				then { id = page.projectId, tab = page.tab }
+				then { id = page.projectId, tab = page.tab, milestoneId = page.issues.milestoneId }
 				else nil,
 		}
 	end,

@@ -44,6 +44,8 @@ export type IssueList = {
 	-- The empty, unfiltered list: "mine" (My issues) adds the hint with All and Choose team on the Active view;
 	-- "all" offers All outside the All view; "none" adds nothing.
 	emptyHelp: "mine" | "all" | "none",
+	-- Cards and the table show each issue's project milestone (the Issues tab while no milestone filter is set).
+	milestones: boolean,
 	-- Pane rows taken above the cards (bars, banners, column heads).
 	chromeRows: number,
 }
@@ -177,14 +179,27 @@ local function cardHead(issue: Issue): Node
 	return ui.node("row", { key = "head", gap = "xs" }, children)
 end
 
-local function cardFoot(issue: Issue): Node?
+local function cardFoot(issue: Issue, milestones: boolean): Node?
 	local chips = labelChips(issue)
 	local assignee = issue.assignee
-	if #chips == 0 and assignee == nil then
+	local milestone = if milestones then issue.projectMilestone else nil
+	if #chips == 0 and assignee == nil and milestone == nil then
 		return nil
 	end
 	local children: { Node } = {}
-	children[1] = ui.node("row", { key = "labels", gap = "xs", wrap = true, grow = 1 }, chips)
+	if milestone ~= nil then
+		table.insert(
+			children,
+			ui.node("text", {
+				key = "milestone",
+				role = "linear.card-milestone",
+				title = `Milestone: {milestone.name}`,
+				spans = { ui.span(`◆ {milestone.name}`, "muted") },
+				max = { w = "18ch" },
+			})
+		)
+	end
+	table.insert(children, ui.node("row", { key = "labels", gap = "xs", wrap = true, grow = 1 }, chips))
 	if assignee ~= nil then
 		table.insert(
 			children,
@@ -200,11 +215,11 @@ local function cardFoot(issue: Issue): Node?
 	return ui.node("row", { key = "foot", gap = "sm", align = "start" }, children)
 end
 
-local function issueCard(issue: Issue, selectedId: string?): Node
+local function issueCard(issue: Issue, selectedId: string?, milestones: boolean): Node
 	local children = compact({
 		cardHead(issue),
 		ui.node("text", { key = "title", role = "linear.card-title", max = { h = "2lines" }, spans = { issue.title } }),
-		cardFoot(issue),
+		cardFoot(issue, milestones),
 	}, 3)
 	return ui.node("col", {
 		key = issue.id,
@@ -215,10 +230,10 @@ local function issueCard(issue: Issue, selectedId: string?): Node
 	}, children)
 end
 
-local function boardColumn(column: Column, selectedId: string?, lines: number): Node
+local function boardColumn(column: Column, list: IssueList, lines: number): Node
 	local cards: { Node } = {}
 	for _, issue in column.issues do
-		table.insert(cards, issueCard(issue, selectedId))
+		table.insert(cards, issueCard(issue, list.selectedId, list.milestones))
 	end
 	return parts.columnNode({
 		id = column.id,
@@ -243,7 +258,7 @@ local function board(cx: BlockCx, list: IssueList, visible: { Issue }): Node
 	local lines = parts.columnLines(cx, list.chromeRows)
 	local children: { Node } = {}
 	for _, column in issueList.columns(list, visible) do
-		table.insert(children, boardColumn(column, list.selectedId, lines))
+		table.insert(children, boardColumn(column, list, lines))
 	end
 	return parts.boardRow(children)
 end
@@ -259,6 +274,10 @@ local TABLE_COLUMNS: { Col } = {
 	{ id = "updated", head = "Updated", align = "end", priority = 2 },
 }
 
+-- The same columns with the project milestone before the last one (Updated); it is the first to go on a narrow pane.
+local MILESTONE_TABLE_COLUMNS: { Col } = table.clone(TABLE_COLUMNS)
+table.insert(MILESTONE_TABLE_COLUMNS, #TABLE_COLUMNS, { id = "milestone", head = "Milestone", priority = 1 })
+
 local function priorityCell(issue: Issue): Cell
 	local tone = PRIORITY_TONES[issue.priority]
 	if tone == nil then
@@ -267,27 +286,30 @@ local function priorityCell(issue: Issue): Cell
 	return { badge = { text = model.priorityLabel(issue.priority), tone = tone } }
 end
 
-local function tableRow(issue: Issue, now: number): TableRow
+local function tableRow(issue: Issue, now: number, milestones: boolean): TableRow
 	local assignee = issue.assignee
-	return {
-		id = issue.id,
-		cells = {
-			issue.identifier,
-			issue.title,
-			{ text = issue.state.name, dot = STATE_TONES[issue.state.type] or "muted" },
-			priorityCell(issue),
-			if assignee ~= nil then assignee.displayName else "",
-			model.relativeTime(issue.updatedAt, now),
-		},
+	local cells: { Cell } = {
+		issue.identifier,
+		issue.title,
+		{ text = issue.state.name, dot = STATE_TONES[issue.state.type] or "muted" },
+		priorityCell(issue),
+		if assignee ~= nil then assignee.displayName else "",
 	}
+	if milestones then
+		local milestone = issue.projectMilestone
+		table.insert(cells, if milestone ~= nil then milestone.name else "")
+	end
+	table.insert(cells, model.relativeTime(issue.updatedAt, now))
+	return { id = issue.id, cells = cells }
 end
 
 local function issueTable(list: IssueList, visible: { Issue }, now: number): Node
 	local rows: { TableRow } = {}
 	for _, issue in model.sortTable(visible, list.sort, list.sortAsc) do
-		table.insert(rows, tableRow(issue, now))
+		table.insert(rows, tableRow(issue, now, list.milestones))
 	end
-	local node = ui.table(TABLE_COLUMNS, rows, { selectable = true, selected = list.selectedId })
+	local columns = if list.milestones then MILESTONE_TABLE_COLUMNS else TABLE_COLUMNS
+	local node = ui.table(columns, rows, { selectable = true, selected = list.selectedId })
 	return with(node, { key = "table", role = "linear.table" })
 end
 

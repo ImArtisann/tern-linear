@@ -307,8 +307,8 @@ local function description(page: ProjectPageState): Node?
 	return with(ui.md(text.safeMarkdown(detail.content)), { key = "description", role = "linear.project-description" })
 end
 
--- One milestone, keyed by its id (a later layer attaches its click action here): the name over its status and
--- target date, the progress at the end.
+-- One milestone, keyed by its id: the name over its status and target date, the progress at the end. A click shows
+-- the Issues tab filtered to it (`milestone=<id>`).
 local function milestoneRow(milestone: ProjectMilestone, now: number): Node
 	local token = MILESTONE_TOKENS[milestone.status] or MILESTONE_TOKENS.unstarted
 	local target = milestone.targetDate
@@ -331,6 +331,8 @@ local function milestoneRow(milestone: ProjectMilestone, now: number): Node
 		mark = milestone.status,
 		gap = "sm",
 		align = "start",
+		title = `Show the issues of {milestone.name}`,
+		actions = { click = `milestone={milestone.id}` },
 	}, {
 		ui.node("text", { key = "icon", role = "linear.milestone-icon", spans = { ui.span("◆", token) } }),
 		ui.node("col", { key = "text", gap = "xs", grow = 1, basis = 0 }, {
@@ -673,11 +675,39 @@ local function issueOptions(state: BlockState, issues: { types.Issue }): ({ type
 	return members, labels
 end
 
--- View switch, search and layout toggle of the tab (the top bar's controls for its own list).
-local function issuesToolbar(state: BlockState, tab: types.ProjectIssuesState): Node
-	local query = tab.query
-	return ui.node("row", { key = "bar", role = "linear.project-issues-bar", gap = "sm", wrap = true }, {
-		parts.viewSwitcher(tab.view),
+-- The milestone filter: "All milestones" and the page's milestones (none: no select). A restored filter whose
+-- milestone is not known until the detail loads reads "Loading…".
+local function milestoneSelect(page: ProjectPageState): Node?
+	local detail = page.detail
+	local milestones: { ProjectMilestone } = if detail ~= nil then detail.milestones else {}
+	local active = page.issues.milestoneId
+	if #milestones == 0 and active == nil then
+		return nil
+	end
+	local options: { { value: string, label: string } } = { { value = "", label = "All milestones" } }
+	for _, milestone in milestones do
+		table.insert(options, { value = milestone.id, label = milestone.name })
+	end
+	if active ~= nil and model.milestoneById(milestones, active) == nil then
+		table.insert(options, { value = active, label = "Loading…" })
+	end
+	return ui.node("select", {
+		key = "milestone-select",
+		role = "linear.milestone-filter",
+		mark = if active ~= nil then "active" else nil,
+		value = active or "",
+		options = options,
+		variant = "quiet",
+		aria = "Milestone filter",
+	})
+end
+
+-- View switch, milestone filter, search and layout toggle of the tab (the top bar's controls for its own list).
+local function issuesToolbar(state: BlockState, page: ProjectPageState): Node
+	local query = page.issues.query
+	local children = compact({
+		parts.viewSwitcher(page.issues.view),
+		milestoneSelect(page),
 		ui.node("input", {
 			key = "search",
 			role = "linear.search",
@@ -693,7 +723,8 @@ local function issuesToolbar(state: BlockState, tab: types.ProjectIssuesState): 
 			max = { w = "40ch" },
 		}),
 		parts.layoutSwitcher(state.prefs.layout),
-	})
+	}, 4)
+	return ui.node("row", { key = "bar", role = "linear.project-issues-bar", gap = "sm", wrap = true }, children)
 end
 
 -- The Issues tab: the toolbar, then issues mode's filter row and board or table over the project's issues.
@@ -723,10 +754,12 @@ local function issuesTab(state: BlockState, page: ProjectPageState, _project: Pr
 		labels = labels,
 		reloading = tab.loading,
 		emptyHelp = "all",
+		-- Every card of a filtered list belongs to the filter's milestone.
+		milestones = tab.milestoneId == nil,
 		chromeRows = ISSUES_CHROME_ROWS + banners * BANNER_ROWS,
 	}
 	local visible = issueList.visible(state, list)
-	local children: { Node } = { issuesToolbar(state, tab), issueList.filterRow(state, list, #visible) }
+	local children: { Node } = { issuesToolbar(state, page), issueList.filterRow(state, list, #visible) }
 	local failure = tab.error
 	if failure ~= nil then
 		table.insert(

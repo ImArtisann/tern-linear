@@ -106,6 +106,8 @@ export type Issue = {
 	creator: User?,
 	labels: { Label },
 	project: { id: string, name: string }?,
+	-- The project milestone the issue belongs to (`Issue.projectMilestone`); nil when it has none.
+	projectMilestone: { id: string, name: string }?,
 	cycle: { id: string, number: number, name: string? }?,
 	parent: IssueRef?,
 	children: { IssueRef },
@@ -438,6 +440,9 @@ export type ProjectIssuesState = {
 	stale: boolean,
 	-- The server filter's view (model.projectIssueFilter), like Prefs.view.
 	view: "active" | "backlog" | "all",
+	-- The server filter's milestone (model.projectIssueFilter): an id of the page's `ProjectDetail.milestones`;
+	-- nil shows the issues of every milestone and of none. Saved with the page (`save().projectPage.milestoneId`).
+	milestoneId: string?,
 	-- Client-side filters (IssueFilters); nil means "any".
 	priority: number?,
 	assignee: string?,

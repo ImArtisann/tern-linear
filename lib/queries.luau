@@ -46,6 +46,7 @@ queries.Issues =
       assignee { id name displayName avatarUrl }
       labels(first: 10) { nodes { id name color } }
       project { id name }
+      projectMilestone { id name }
       cycle { id number name }
       parent { id identifier title state { name type } }
       children(first: 10) { nodes { id identifier title state { name type } } }
@@ -66,6 +67,7 @@ queries.Issue = [[query Issue($id: String!, $commentsFirst: Int = 50, $commentsA
     assignee { id name displayName avatarUrl }
     labels(first: 25) { nodes { id name color } }
     project { id name }
+    projectMilestone { id name }
     cycle { id number name }
     parent { id identifier title state { name type } }
     children(first: 50) { nodes { id identifier title state { name type } } }
@@ -89,6 +91,7 @@ queries.IssueCreate = [[mutation IssueCreate($input: IssueCreateInput!) {
       assignee { id name displayName avatarUrl }
       labels(first: 10) { nodes { id name color } }
       project { id name }
+      projectMilestone { id name }
       cycle { id number name }
       parent { id identifier title state { name type } }
       children(first: 10) { nodes { id identifier title state { name type } } }
@@ -109,6 +112,7 @@ queries.IssueUpdate = [[mutation IssueUpdate($id: String!, $input: IssueUpdateIn
       assignee { id name displayName avatarUrl }
       labels(first: 10) { nodes { id name color } }
       project { id name }
+      projectMilestone { id name }
       cycle { id number name }
       parent { id identifier title state { name type } }
       children(first: 10) { nodes { id identifier title state { name type } } }

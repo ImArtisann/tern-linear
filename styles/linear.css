@@ -171,6 +171,7 @@
 }
 
 [data-role='linear.card-assignee'],
+[data-role='linear.card-milestone'],
 [data-role='linear.project-lead'] {
 	flex: none;
 	overflow: hidden;

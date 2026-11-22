@@ -129,6 +129,17 @@ const DESKTOP_ACTIVE = "ENG-139,ENG-146,DES-15,ENG-142,ENG-140,ENG-138,ENG-131,D
 // Its table by priority: ties by identifier (team key, number) in both directions.
 const PRIORITY_ASC = "ENG-142,ENG-138,ENG-139,ENG-140,DES-12,ENG-131,ENG-146,DES-15";
 const PRIORITY_DESC = "DES-15,DES-12,ENG-131,ENG-146,ENG-138,ENG-139,ENG-140,ENG-142";
+// Its milestone filter (model.projectIssueFilter with a milestone): the project, the milestone, then the view.
+const milestoneIssueFilter = (projectId, milestoneId, stateTypes) => ({
+	and: [{ project: { id: { eq: projectId } } }, { projectMilestone: { id: { eq: milestoneId } } }, { state: { type: { in: stateTypes } } }],
+});
+const milestoneNamed = (projectName, name) =>
+	mock.state().projectMilestones.find((m) => m.projectId === projectNamed(projectName).id && m.name === name);
+// Desktop app's Beta issues in board order: Active (Todo, In Progress), Backlog, and All (Backlog first).
+const BETA_ACTIVE = "DES-15,ENG-142,ENG-138";
+const BETA_ALL = "ENG-150,DES-15,ENG-142,ENG-138";
+/** The filter of the newest `Issues` request since `before`, as JSON (for exact comparisons). */
+const lastIssuesFilter = (before) => JSON.stringify(opsSince(before, "Issues").at(-1)?.variables.filter);
 // Card and row texts run the identifier into the next word ("ENG-139High…"), so no trailing word boundary.
 const ISSUE_ID = /\b[A-Z]+-\d+/;
 
@@ -796,6 +807,148 @@ async function scenario() {
 		await t.waitFor(role("card"), "Drag cards between board columns");
 		await runner.shot(label);
 		await runner.shot("project-issues-restore");
+		await t.click(role("project-tab-overview"));
+		await present(role("project-overview"));
+	});
+
+	// A milestone row of the Overview shows the Issues tab filtered to that milestone (layer 5).
+	await runner.step("project-milestone-click", async (label) => {
+		const desktop = projectNamed("Desktop app").id;
+		const beta = milestoneNamed("Desktop app", "Beta").id;
+		// Unfiltered, the cards and the table name each issue's milestone; the select offers All milestones.
+		await t.click(role("project-tab-issues"));
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the unfiltered tab", interval: 0 });
+		await t.waitFor(role("milestone-filter"), "All milestones");
+		const cards = await nodesOf(role("card"));
+		const card = (id) => cards.find((node) => (node.text ?? "").includes(id))?.text ?? "";
+		if (!card("DES-12").includes("◆ Accessibility audit")) throw new Error(`DES-12 shows no milestone: ${card("DES-12")}`);
+		if (!card("ENG-142").includes("◆ Beta")) throw new Error(`ENG-142 shows no milestone: ${card("ENG-142")}`);
+		if (card("ENG-131").includes("◆")) throw new Error(`ENG-131 has no milestone but shows one: ${card("ENG-131")}`);
+		await t.key("v");
+		await present(`${role("project-issues")} ${role("table")}`);
+		await t.waitFor(`${role("table")} .sf-tbl-row.head`, "Milestone");
+		await t.waitFor(role("table"), "Accessibility audit");
+		await t.key("v");
+		await present(`${role("project-issues")} ${role("board")}`);
+
+		await t.click(role("project-tab-overview"));
+		await present(role("project-overview"));
+		await settle();
+		const before = mark();
+		await t.click(`${role("milestone")}[data-mark='next']`);
+		await present(role("project-issues"));
+		await waitFor(() => opsSince(before, "Issues").length > 0, { what: "an Issues request after the milestone click" });
+		assertEqual(lastIssuesFilter(before), JSON.stringify(milestoneIssueFilter(desktop, beta, ACTIVE_TYPES)), "milestone filter");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), {
+			what: `Beta's Active issues (${BETA_ACTIVE})`,
+			interval: 0,
+		});
+		await t.waitFor(`${role("project-issues")} ${role("count")}`, "3 issues");
+		await t.waitFor(role("milestone-filter"), "Beta");
+		await present(`${role("milestone-filter")}[data-mark='active']`);
+		// Every card is Beta's: the cards leave the milestone out.
+		if ((await t.text(role("board"))).includes("◆")) throw new Error("filtered cards repeat the milestone");
+		await runner.shot(label);
+		await runner.shot("project-issues-milestone");
+	});
+
+	// The view switch and the search keep the milestone; Clear filters clears the client filters only.
+	await runner.step("project-milestone-views", async () => {
+		const desktop = projectNamed("Desktop app").id;
+		const beta = milestoneNamed("Desktop app", "Beta").id;
+		let before = mark();
+		await t.key("2");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === "ENG-150"), { what: "Beta's Backlog issue", interval: 0 });
+		assertEqual(lastIssuesFilter(before), JSON.stringify(milestoneIssueFilter(desktop, beta, ["backlog"])), "Backlog view filter");
+		before = mark();
+		await t.key("3");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ALL), { what: `Beta's issues (${BETA_ALL})`, interval: 0 });
+		const all = opsSince(before, "Issues").at(-1).variables.filter;
+		if (all.and[1].projectMilestone?.id?.eq !== beta || !all.and[2].or) throw new Error(`All view filter: ${JSON.stringify(all)}`);
+		await t.key("1");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "Beta's Active issues", interval: 0 });
+		await search("icon");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === "DES-15"), { what: "only DES-15 to match", interval: 0 });
+		await t.click(role("clear-filters"));
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "the search cleared", interval: 0 });
+		await t.waitFor(role("milestone-filter"), "Beta");
+	});
+
+	// The poll's change check carries the milestone too.
+	await runner.step("project-milestone-poll", async () => {
+		const beta = milestoneNamed("Desktop app", "Beta").id;
+		await settle();
+		const before = mark();
+		await t.wait(31_000);
+		const check = await waitFor(() => opsSince(before, "IssuesChanged")[0], { what: "an IssuesChanged poll on the filtered tab" });
+		const filter = JSON.stringify(check.variables.filter);
+		if (!filter.includes(`"projectMilestone":{"id":{"eq":"${beta}"}}`) || !filter.includes("updatedAt")) {
+			throw new Error(`the filtered tab's change check: ${filter}`);
+		}
+		for (const op of opsSince(before, "Issues")) {
+			if (!JSON.stringify(op.variables.filter).includes(beta)) throw new Error(`a poll reload dropped the milestone: ${JSON.stringify(op.variables.filter)}`);
+		}
+		await t.waitFor(role("milestone-filter"), "Beta");
+	});
+
+	// The filter is saved with the page: a restored block reopens the tab filtered; a milestone deleted meanwhile is
+	// dropped with a notice and the tab reloads unfiltered.
+	await runner.step("project-milestone-restore", async (label) => {
+		const beta = milestoneNamed("Desktop app", "Beta").id;
+		await settle();
+		let before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Viewer").length > 0, { what: "the block to restart" });
+		await present(role("project-issues"));
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "the restored filtered tab", interval: 0 });
+		const [load] = opsSince(before, "Issues");
+		if (!load || load.variables.filter.and[1].projectMilestone?.id?.eq !== beta) {
+			throw new Error(`the restored tab's first load is not filtered: ${JSON.stringify(load?.variables)}`);
+		}
+		await t.waitFor(role("milestone-filter"), "Beta");
+
+		// Public launch holds no issue: the select picks it, the empty state shows; then Linear deletes it.
+		const launch = milestoneNamed("Desktop app", "Public launch").id;
+		before = mark();
+		await pick("milestone-filter", "Public launch");
+		await present(`${role("project-issues")} ${role("empty")}`);
+		if (!lastIssuesFilter(before).includes(launch)) throw new Error(`the select sent no milestone filter: ${lastIssuesFilter(before)}`);
+		await settle();
+		mock.deleteMilestone(launch);
+		before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Viewer").length > 0, { what: "the block to restart" });
+		await t.waitFor(role("notice"), "Milestone not found");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the unfiltered tab", interval: 0 });
+		if (lastIssuesFilter(before).includes("projectMilestone")) throw new Error(`still filtered: ${lastIssuesFilter(before)}`);
+		await t.waitFor(role("milestone-filter"), "All milestones");
+		await runner.shot(label);
+	});
+
+	// "All milestones" clears the filter; Back clears it too, so the page reopens unfiltered.
+	await runner.step("project-milestone-clear-back", async () => {
+		const desktop = projectNamed("Desktop app").id;
+		await pick("milestone-filter", "Beta");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "Beta picked", interval: 0 });
+		let before = mark();
+		await pick("milestone-filter", "All milestones");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the filter cleared", interval: 0 });
+		assertEqual(lastIssuesFilter(before), JSON.stringify(projectIssueFilter(desktop, ACTIVE_TYPES)), "filter after All milestones");
+		if (await exists(`${role("milestone-filter")}[data-mark='active']`)) throw new Error("the cleared select still shows as active");
+
+		await t.click(role("project-tab-overview"));
+		await present(`${role("milestone")}[data-mark='next']`);
+		await t.click(`${role("milestone")}[data-mark='next']`);
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === BETA_ACTIVE), { what: "Beta from the Overview", interval: 0 });
+		await backToList("Desktop app");
+		await t.key("Enter");
+		await pageOpen("Desktop app");
+		await settle();
+		before = mark();
+		await t.click(role("project-tab-issues"));
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the reopened tab unfiltered", interval: 0 });
+		assertEqual(lastIssuesFilter(before), JSON.stringify(projectIssueFilter(desktop, ACTIVE_TYPES)), "filter after Back");
+		await t.waitFor(role("milestone-filter"), "All milestones");
 		await t.click(role("project-tab-overview"));
 		await present(role("project-overview"));
 	});
