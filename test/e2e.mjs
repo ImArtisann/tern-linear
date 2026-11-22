@@ -58,6 +58,19 @@ async function settle(quietMs = 800) {
 	);
 }
 
+/**
+ * Advances app time until the poll tick reloads the open project page's detail, then lets the network settle. The
+ * next tick is then about 30 s of app time away, so the checks that follow can count requests without seeing one.
+ */
+async function afterPageTick() {
+	const before = mark();
+	for (let advanced = 0; opsSince(before, "Project").length === 0; advanced += 1000) {
+		if (advanced > 31_000) throw new Error("no poll tick reloaded the project page");
+		await t.wait(1000);
+	}
+	await settle();
+}
+
 const backspaces = async (count) => {
 	for (let i = 0; i < count; i += 1) await t.key("Backspace");
 };
@@ -423,8 +436,9 @@ async function scenario() {
 		await t.click(role("activity-comments-toggle"));
 		await absent(role("activity-comment"));
 
-		// `tab` / `shift+tab` cycle the tabs; a loaded Activity tab does not reload when shown again.
-		await settle();
+		// `tab` / `shift+tab` cycle the tabs; a loaded Activity tab does not reload when shown again. Right after a
+		// poll tick, so the next one stays out of this check and the `r` one below.
+		await afterPageTick();
 		before = mark();
 		await t.key("Tab");
 		await present(role("project-overview"));
