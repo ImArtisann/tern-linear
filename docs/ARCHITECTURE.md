@@ -101,9 +101,10 @@ linear.project(cfg, id: string, cb: Callback<ProjectDetail>)
     -- Project; archived projects too; milestones in the server's order (the controller sorts them);
     -- a missing project is `notfound`
 linear.projectActivity(cfg, id: string, after: ActivityCursors?, cb: Callback<ProjectActivity>)
-    -- ProjectUpdates (first 20) and ProjectHistory (first 25, orderBy updatedAt) side by side, one callback;
-    -- after = nil: the first page of both; else only the sources whose cursor is set (the others come back
-    -- empty, without more); the first failure wins; a missing project is `notfound`
+    -- ProjectUpdates (first 20) and ProjectHistory (first 25, orderBy updatedAt) side by side, one callback once
+    -- both responded; after = nil: the first page of both; else only the sources whose cursor is set (the others
+    -- come back empty, without more); of two failures `auth` wins, then `rate`, else the first; a missing
+    -- project is `notfound`
 linear.changedSince(cfg, filter: any, sinceIso: string?, cb: Callback<string?>)
     -- IssuesChanged with filter AND {updatedAt: {gt: sinceIso}}; result = newest updatedAt or nil
 linear.issue(cfg, id: string, cb: Callback<Issue>)          -- detail; all comment pages, ascending
@@ -207,12 +208,14 @@ model.activityNames(users: {User}, teams: {{id, name}}, milestones: {ProjectMile
 model.historyEvent(entry: any, names: ActivityNames, now: number): HistoryEvent?
     -- one raw `entries` element as a line; nil for unknown kinds and for shapes not seen live (below)
 model.activityTimeline(activity: ProjectActivity, names: ActivityNames, now: number): ActivityTimeline
-    -- updates (by createdAt) and described history events (by `at`) newest first, ties by item id; items older
-    -- than the floor of a source with more pages are held back; `more` = a source has another page
+    -- updates (by createdAt) and described history events (by `at`) newest first; equal times list events
+    -- before updates, each in load order; items older than the floor of a source with more pages are held
+    -- back, and updates at the history's floor while it has more; `more` = a source has another page
 model.activityCursors(activity): ActivityCursors?    -- the cursors Load more sends; nil when nothing has more
 model.activityReloaded(old: ProjectActivity?, fresh: ProjectActivity): ProjectActivity
-    -- a reloaded first page over what was loaded: fresh wins; older items `Load more` added stay (minus the
-    -- fresh page's ids) with their cursor; when none stay, the fresh cursor
+    -- a reloaded first page over what was loaded: fresh wins; the items `Load more` added after the last fresh
+    -- item loaded at the same time stay (minus the fresh page's ids) with their cursor; when the fresh page
+    -- shares no such item with them (a gap) or none stay, the fresh page and its cursor
 model.activityAppended(old, page, cursors: ActivityCursors): ProjectActivity
     -- Load more: each source with a cursor gets the page's new items (by id) and the page's cursor
 model.relativeSince(at: number, now: number): string -- model.relativeTime of epoch seconds
@@ -223,7 +226,7 @@ model.absoluteTime(at: number): string        -- "Nov 22, 2026, 19:47" in the ho
 
 #### Project history entries
 
-`ProjectHistory.entries` is typed `JSONObject` but is a list of events. Linear groups the events of a time window (minutes to days) into one record; each event has `type` and `at` (epoch **milliseconds**), events are in `at` order, and a record's `updatedAt` is its last event. The kinds below are the ones observed read-only in a live workspace (32 projects, 38 records, 225 events) and are the only ones described; any other `type`, a non-numeric `at`, a missing `type` or a known kind without the fields listed is skipped silently (never raw JSON). Actor ids resolve through `ActivityNames`; an id nobody resolves reads `Someone` (or the integration's `source.displayName` when Linear gives one). `source` (`{type: "apiKey"}` or `{type: "oauthClient", id, displayName, oauthTokenUserId}`) is otherwise ignored.
+`ProjectHistory.entries` is typed `JSONObject` but is a list of events. Linear groups the events of a time window (minutes to days) into one record; each event has `type` and `at` (epoch **milliseconds**), events are in `at` order, and a record's `updatedAt` is its last event. The kinds below are the ones observed read-only in a live workspace (32 projects, 38 records, 225 events) and are the only ones described; any other `type`, a non-numeric `at` (or one outside the dates the host can show), a missing `type` or a known kind without the fields listed is skipped silently (never raw JSON). Actor ids resolve through `ActivityNames`; an id nobody resolves reads `Someone` (or the integration's `source.displayName` when Linear gives one). `source` (`{type: "apiKey"}` or `{type: "oauthClient", id, displayName, oauthTokenUserId}`) is otherwise ignored.
 
 | `type` | Fields used | Line |
 | --- | --- | --- |
@@ -233,7 +236,7 @@ model.absoluteTime(at: number): string        -- "Nov 22, 2026, 19:47" in the ho
 | `icon` | `actorId` (`to` is an icon name) | `ada changed the icon` |
 | `content` | `actorIds` (a list) | `ada and grace updated the description` (the project document) |
 | `description` | `actorId` | `ada updated the summary` (the short summary) |
-| `leadTeamId` | `actorId`, `from` / `to` team ids | `ada changed the lead team from Engineering to Design` (`… changed the lead team` when unresolved) |
+| `leadTeamId` | `actorId`, `from` / `to` team ids (either may be absent, not both) | `ada changed the lead team from Engineering to Design` (`… changed the lead team` when unresolved) |
 | `teams` | `actorId`, `added` / `removed` team-id lists | `ada added team Design`, `… removed teams Engineering and 1 other`, `… added a team` |
 | `milestones` | `actorId`, `added` / `removed` lists of `{id, name}` | `grace added milestones Alpha and Beta` |
 | `milestone_completion` | `milestone {id, name}`, no actor | `Milestone Alpha completed` (`A milestone was completed` when unresolved) |
@@ -283,9 +286,9 @@ State: projects mode keeps its list in `BlockState.projects: ProjectsState` (`it
 
 Project page lifecycle: opening (`open-project`, `Enter`, table `activate`) needs the project in `ProjectsState.items`, and `Enter` needs it among the visible projects too (search and the lead/health filters keep a selection they hide); it selects it, clears search focus, sets `projectPage` with the Overview tab and loads the detail. Until the detail arrives the header and properties show the list item. The detail has its own token (`Run.pageToken`, bumped on open, close and every reload) and never touches `busy`. A successful detail clears the page's `error` only; `state.error` stays with the request that set it (a failed list load stays visible behind Back). `notfound` removes the project from `ProjectsState.items` and the selection, records it in `Run.goneProjects` so a list result from a request that started before then leaves it out (a later request's result is authoritative), closes the page and shows `Project not found`; other failures go through the usual routing with the page's `error` as the inline target. Back (`project-back`, `Escape`, `Backspace`, `p`) clears `projectPage` and re-selects the project when the list holds it; scope, view, layout, sort, filters and search are untouched. Switching to issues mode closes the page. `resetData` (sign out, auth failure) clears it.
 
-Activity lifecycle: the Activity tab loads the first time it is shown (`project-tab=activity`, `tab` / `shift+tab`, a restored page saved on it), never with the Overview; while `activity` is nil a failed first load is retried by showing the tab again or by the poll tick. Its requests (`linear.projectActivity`) have their own token (`Run.activityToken`, bumped on every request, on close and in `resetData`), never touch `busy`, and drop a result for a superseded token or a closed page. A shown load sets `activityLoading`; `r` and Refresh reload the tab on screen (the activity on Activity, the detail on Overview); the header's Refresh label and spinner follow the tab on screen. A first-page result goes through `model.activityReloaded`, so older items loaded with `Load more` stay. `activity-more` (refused while a shown load or another page is in flight) sends `model.activityCursors` and appends through `model.activityAppended`. `notfound` closes the page like the detail; other failures set `activityError` through the usual routing. The view builds `model.activityNames` from the viewer, the project lead, the detail's members and milestones, every team's members and name, the project's teams and the loaded updates' authors and commenters, then renders `model.activityTimeline`.
+Activity lifecycle: the Activity tab loads the first time it is shown (`project-tab=activity`, `tab` / `shift+tab`, a restored page saved on it), never with the Overview; while `activity` is nil a failed first load is retried by showing the tab again or by the poll tick. Its requests (`linear.projectActivity`) have their own token (`Run.activityToken`, bumped on every request, on close and in `resetData`), never touch `busy`, and drop a result for a superseded token or a closed page. A shown load sets `activityLoading`; `r` and Refresh reload the tab on screen (the activity on Activity, the detail on Overview); the header's Refresh label and spinner follow the tab on screen. A first-page result goes through `model.activityReloaded`, so older items loaded with `Load more` stay while the fresh page reaches them. `activity-more` (refused while a shown load or another page is in flight) sends `model.activityCursors` and appends through `model.activityAppended`. `notfound` closes the page like the detail; other failures set `activityError` through the usual routing. The view builds `model.activityNames` from the viewer, the project lead, the detail's members and milestones, every team's members and name, the project's teams and the loaded updates' authors and commenters, then renders `model.activityTimeline`.
 
-Paging order: updates come newest `createdAt` first; history records newest `updatedAt` first, so no unloaded record holds an event newer than the oldest loaded record's `updatedAt`. While a source has more pages, the timeline hides items older than that source's floor (oldest `createdAt` / `updatedAt` loaded); `Load more` reveals them, never inserting above an item already shown.
+Paging order: updates come newest `createdAt` first; history records newest `updatedAt` first, so no unloaded record holds an event newer than the oldest loaded record's `updatedAt`. While a source has more pages, the timeline hides items older than that source's floor (oldest `createdAt` / `updatedAt` loaded), and, at the history's floor, the updates of that time (an unloaded event of that time lists above them: equal times list events before updates, each in load order, which the next pages continue); `Load more` reveals them, never inserting above an item already shown. A reload keeps the pages `Load more` added only where its first page provably reaches them (`model.activityReloaded`); after a gap the source restarts from the fresh page.
 
 Modes: `mode=` / `p` / `i` switch modes. Entering a mode whose list was never loaded (or while a foreground load runs) loads it in the foreground (`reloading`, `Loading projects…` / `Loading issues…`); otherwise the cached list shows at once and reloads in the background. Switching to projects closes the drawer, the link input and any form; switching to issues closes the project page. Every load, poll and reload works on the active mode only; `refresh` reloads the statuses too.
 

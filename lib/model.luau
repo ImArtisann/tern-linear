@@ -1196,8 +1196,15 @@ local HISTORY_KINDS: { [string]: (entry: any, names: ActivityNames, now: number)
 		return "updated the summary"
 	end,
 	leadTeamId = function(entry, names)
-		local from = if type(entry.from) == "string" then names.teams[entry.from] else nil
-		local to = if type(entry.to) == "string" then names.teams[entry.to] else nil
+		local fromId, toId = entry.from, entry.to
+		-- Each side is a team id or absent (no lead team); anything else is not the shape seen live.
+		if (fromId ~= nil and type(fromId) ~= "string") or (toId ~= nil and type(toId) ~= "string") then
+			return nil
+		elseif fromId == nil and toId == nil then
+			return nil
+		end
+		local from = if fromId ~= nil then names.teams[fromId] else nil
+		local to = if toId ~= nil then names.teams[toId] else nil
 		if from ~= nil and to ~= nil then
 			return `changed the lead team from {from} to {to}`
 		elseif to ~= nil then
@@ -1234,9 +1241,14 @@ local HISTORY_KINDS: { [string]: (entry: any, names: ActivityNames, now: number)
 local ACTORLESS: { [string]: boolean } = { milestone_completion = true }
 
 -- One raw `ProjectHistory.entries` element as a line, or nil when its kind is unknown or its shape is not the one
--- observed (no `type`, no numeric `at`, missing fields). Ids resolve through `names`; `now` dates short dates.
+-- observed (no `type`, no numeric `at` or one outside the dates the host can show, missing fields). Ids resolve
+-- through `names`; `now` dates short dates.
 function model.historyEvent(entry: any, names: ActivityNames, now: number): HistoryEvent?
 	if type(entry) ~= "table" or type(entry.type) ~= "string" or type(entry.at) ~= "number" then
+		return nil
+	end
+	local time = entry.at / 1000
+	if os.date("*t", math.floor(time)) == nil then
 		return nil
 	end
 	local describe = HISTORY_KINDS[entry.type]
@@ -1251,7 +1263,7 @@ function model.historyEvent(entry: any, names: ActivityNames, now: number): Hist
 	if not ACTORLESS[entry.type] then
 		actor = entryActor(entry, names) or UNKNOWN_ACTOR
 	end
-	return { kind = entry.type, time = entry.at / 1000, actor = actor, text = line }
+	return { kind = entry.type, time = time, actor = actor, text = line }
 end
 
 -- The oldest time of a source with more pages: anything older may still be preceded by an unloaded item.
@@ -1277,17 +1289,13 @@ local function recordTime(record: types.ProjectHistoryRecord): number?
 	return model.epoch(record.updatedAt)
 end
 
--- The Activity tab's timeline: updates and the history events `historyEvent` describes, newest first (ties by
--- id). Items older than a source's oldest loaded item while that source has more pages are held back, so loading
--- the next page never inserts anything above an item already shown.
+-- The Activity tab's timeline: updates and the history events `historyEvent` describes, newest first. Equal times
+-- list history events before updates, each in the order they were loaded (records, then entries; updates), the
+-- order the next pages continue. Items an unloaded page could list above are held back: items older than the
+-- oldest loaded item of a source with more pages and, when that source is the history, updates at that very time
+-- (an unloaded event of that time lists above them). So loading the next page never inserts above a shown item.
 function model.activityTimeline(activity: types.ProjectActivity, names: ActivityNames, now: number): ActivityTimeline
 	local items: { ActivityItem } = {}
-	for _, update in activity.updates.items do
-		local time = updateTime(update)
-		if time ~= nil then
-			table.insert(items, { id = update.id, time = time, update = update, event = nil })
-		end
-	end
 	for _, record in activity.history.items do
 		for index, entry in record.entries do
 			local event = model.historyEvent(entry, names, now)
@@ -1296,14 +1304,27 @@ function model.activityTimeline(activity: types.ProjectActivity, names: Activity
 			end
 		end
 	end
+	for _, update in activity.updates.items do
+		local time = updateTime(update)
+		if time ~= nil then
+			table.insert(items, { id = update.id, time = time, update = update, event = nil })
+		end
+	end
 	local cutoff = sourceFloor(activity.updates, updateTime)
 	local historyFloor = sourceFloor(activity.history, recordTime)
 	if historyFloor ~= nil and (cutoff == nil or historyFloor > cutoff) then
 		cutoff = historyFloor
 	end
+	local holdUpdates = historyFloor ~= nil and historyFloor == cutoff
+	local order: { [ActivityItem]: number } = {}
 	local shown: { ActivityItem } = {}
-	for _, item in items do
-		if cutoff == nil or item.time >= cutoff then
+	for index, item in items do
+		order[item] = index
+		if
+			cutoff == nil
+			or item.time > cutoff
+			or (item.time == cutoff and not (holdUpdates and item.update ~= nil))
+		then
 			table.insert(shown, item)
 		end
 	end
@@ -1311,7 +1332,7 @@ function model.activityTimeline(activity: types.ProjectActivity, names: Activity
 		if a.time ~= b.time then
 			return a.time > b.time
 		end
-		return a.id < b.id
+		return order[a] < order[b]
 	end)
 	return { items = shown, more = activity.updates.hasMore or activity.history.hasMore }
 end
@@ -1326,36 +1347,45 @@ function model.activityCursors(activity: types.ProjectActivity): types.ActivityC
 	return { updates = updates, history = history }
 end
 
--- A reloaded first page merged over what was loaded: the fresh page wins, the older pages loaded with `Load more`
--- stay (items older than the fresh page's oldest, minus the ones the fresh page carries), with their cursor.
+-- A reloaded first page merged over what was loaded. The older pages `Load more` added stay, with their cursor, only
+-- where the fresh page provably reaches them: the last fresh item that `old` holds at the same time (so at the same
+-- place in the order) anchors the merge, and the old items after it continue the fresh page. Without such an
+-- item a gap may lie between them, so the fresh page replaces the source and `Load more` pages from its cursor.
 local function reloadSource<T>(
 	old: types.ActivitySource<T>,
 	fresh: types.ActivitySource<T>,
 	idOf: (T) -> string,
 	timeOf: (T) -> number?
 ): types.ActivitySource<T>
+	if not fresh.hasMore then
+		return fresh
+	end
+	local oldIndex: { [string]: number } = {}
+	for index, item in old.items do
+		oldIndex[idOf(item)] = index
+	end
 	local freshIds: { [string]: boolean } = {}
-	local oldest: number? = nil
+	local anchor: number? = nil
 	for _, item in fresh.items do
-		freshIds[idOf(item)] = true
+		local id = idOf(item)
+		freshIds[id] = true
+		local index = oldIndex[id]
 		local time = timeOf(item)
-		if time ~= nil and (oldest == nil or time < oldest) then
-			oldest = time
+		if index ~= nil and time ~= nil and timeOf(old.items[index]) == time and (anchor == nil or index > anchor) then
+			anchor = index
 		end
 	end
-	if not fresh.hasMore or oldest == nil then
+	if anchor == nil then
 		return fresh
 	end
 	local items = table.clone(fresh.items)
-	local kept = 0
-	for _, item in old.items do
-		local time = timeOf(item)
-		if not freshIds[idOf(item)] and time ~= nil and time < oldest then
+	for index = anchor + 1, #old.items do
+		local item = old.items[index]
+		if not freshIds[idOf(item)] then
 			table.insert(items, item)
-			kept += 1
 		end
 	end
-	if kept == 0 then
+	if #items == #fresh.items then
 		return fresh
 	end
 	return { items = items, cursor = old.cursor, hasMore = old.hasMore }

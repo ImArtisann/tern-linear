@@ -896,6 +896,14 @@ check(
 		and line({ type = "milestones", at = AT, actorId = "u-ada", added = { "m1" } }) == nil
 		and line({ type = "milestones", at = AT, actorId = "u-ada", added = {}, removed = {} }) == nil
 		and line({ type = "milestone_completion", at = AT }) == nil
+		and line({ type = "leadTeamId", at = AT, actorId = "u-ada", from = {} }) == nil
+		and line({ type = "leadTeamId", at = AT, actorId = "u-ada", from = "t-eng", to = 42 }) == nil
+		and line({ type = "leadTeamId", at = AT, actorId = "u-ada" }) == nil
+)
+check(
+	"entries with an at outside the host's dates are skipped",
+	line({ type = "icon", at = 1e30, actorId = "u-ada" }) == nil
+		and line({ type = "icon", at = 0 / 0, actorId = "u-ada" }) == nil
 )
 
 local function iso(secondsAgo: number): string
@@ -948,10 +956,15 @@ check("timeline merges updates and events newest first", itemIds(whole) == "u2 h
 check("timeline without more pages", not whole.more and model.activityCursors(complete) == nil)
 
 local tie = model.activityTimeline({
-	updates = source({ update("b", 100) }, nil),
-	history = source({ record("a", 100, { icon(100) }) }, nil),
+	updates = source({ update("a", 100) }, nil),
+	history = source({ record("z", 100, { icon(100) }) }, nil),
 }, NAMES, NOW)
-check("equal times order by id", itemIds(tie) == "a:1 b")
+check("equal times list events before updates", itemIds(tie) == "z:1 a")
+local badTime = model.activityTimeline({
+	updates = source({}, nil),
+	history = source({ record("h9", 100, { { type = "icon", at = 1e30, actorId = "u-ada" }, icon(100) }) }, nil),
+}, NAMES, NOW)
+check("an entry with an unusable time leaves its neighbours", itemIds(badTime) == "h9:2")
 
 -- Updates have another page below u1 (500 s ago): older history events wait for it.
 local partial: types.ProjectActivity = {
@@ -972,6 +985,34 @@ local historyPaged = model.activityTimeline({
 	history = source({ record("h1", 300, { icon(900), icon(300) }) }, "c-h"),
 }, NAMES, NOW)
 check("a paged history holds back events older than its oldest record", itemIds(historyPaged) == "h1:2")
+
+-- Equal times at a page boundary: the next page lists below everything shown, in its source and across sources.
+local updatesBoundary: types.ProjectActivity = {
+	updates = source({ update("z", 100) }, "c-u"),
+	history = source({ record("y", 100, { icon(100) }) }, nil),
+}
+local updatesBoundaryMore = model.activityAppended(updatesBoundary, {
+	updates = source({ update("a", 100) }, nil),
+	history = source({}, nil),
+}, { updates = "c-u", history = nil })
+check(
+	"Load more lists updates of the boundary time below the shown items",
+	itemIds(model.activityTimeline(updatesBoundary, NAMES, NOW)) == "y:1 z"
+		and itemIds(model.activityTimeline(updatesBoundaryMore, NAMES, NOW)) == "y:1 z a"
+)
+local historyBoundary: types.ProjectActivity = {
+	updates = source({ update("a", 100) }, nil),
+	history = source({ record("h2", 100, { icon(100) }) }, "c-h"),
+}
+local historyBoundaryMore = model.activityAppended(historyBoundary, {
+	updates = source({}, nil),
+	history = source({ record("h1", 100, { icon(100) }) }, nil),
+}, { updates = nil, history = "c-h" })
+check(
+	"updates at a paged history's oldest time wait for its next page",
+	itemIds(model.activityTimeline(historyBoundary, NAMES, NOW)) == "h2:1"
+		and itemIds(model.activityTimeline(historyBoundaryMore, NAMES, NOW)) == "h2:1 h1:1 a"
+)
 
 local appended = model.activityAppended(partial, {
 	updates = source({ update("u1", 500), update("u0", 900) }, nil),
@@ -1005,13 +1046,67 @@ check(
 check("a reload replaces a source that fits one page", #reloaded.history.items[1].entries == 1)
 local first = model.activityReloaded(nil, complete)
 check("the first load is the fresh data", first == complete)
-local grown = model.activityReloaded(complete, {
-	updates = source({ update("u9", 5) }, "c-new"),
+local function sourceIds<T>(items: { T }, idOf: (T) -> string): string
+	local out: { string } = {}
+	for _, item in items do
+		table.insert(out, idOf(item))
+	end
+	return table.concat(out, " ")
+end
+local function updateIds(activity: types.ProjectActivity): string
+	return sourceIds(activity.updates.items, function(item: types.ProjectUpdate): string
+		return item.id
+	end)
+end
+-- A fresh page that shares no item with the loaded ones may leave a gap below it: it restarts the source.
+local gapped = model.activityReloaded(complete, {
+	updates = source({ update("u9", 5), update("u8", 10) }, "c-new"),
 	history = complete.history,
 })
 check(
-	"a reload over a complete list stays complete",
-	#grown.updates.items == 3 and grown.updates.items[2].id == "u2" and not grown.updates.hasMore
+	"a reload with a gap below its page restarts from the fresh page",
+	updateIds(gapped) == "u9 u8" and gapped.updates.cursor == "c-new" and gapped.updates.hasMore
+)
+local grown = model.activityReloaded(complete, {
+	updates = source({ update("u9", 5), update("u2", 100) }, "c-new"),
+	history = complete.history,
+})
+check("a reload reaching a complete list stays complete", updateIds(grown) == "u9 u2 u1" and not grown.updates.hasMore)
+local tied = model.activityReloaded({
+	updates = source({ update("b", 100), update("z", 100), update("a", 200) }, nil),
+	history = complete.history,
+}, {
+	updates = source({ update("new", 50), update("b", 100) }, "c-new"),
+	history = complete.history,
+})
+check("a reload keeps loaded items tied with its oldest", updateIds(tied) == "new b z a" and not tied.updates.hasMore)
+-- A history record updated since moved up: its old place proves nothing; an unchanged one anchors the merge.
+local function historyIds(activity: types.ProjectActivity): string
+	return sourceIds(activity.history.items, function(item: types.ProjectHistoryRecord): string
+		return item.id
+	end)
+end
+local fourRecords: types.ProjectActivity = {
+	updates = complete.updates,
+	history = source(
+		{ record("h4", 300, {}), record("h3", 400, {}), record("h2", 500, {}), record("h1", 600, {}) },
+		nil
+	),
+}
+local movedOnly = model.activityReloaded(fourRecords, {
+	updates = complete.updates,
+	history = source({ record("h1", 10, {}), record("h3", 20, {}) }, "c-h"),
+})
+local anchored = model.activityReloaded(fourRecords, {
+	updates = complete.updates,
+	history = source({ record("h1", 10, {}), record("h4", 300, {}) }, "c-h"),
+})
+check(
+	"a reload anchors on an unchanged record only",
+	historyIds(movedOnly) == "h1 h3"
+		and movedOnly.history.cursor == "c-h"
+		and historyIds(anchored) == "h1 h4 h3 h2"
+		and not anchored.history.hasMore
 )
 local caughtUp = model.activityReloaded({
 	updates = source({ update("u2", 100) }, "c-old"),

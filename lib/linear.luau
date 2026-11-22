@@ -1086,8 +1086,20 @@ local function noPage<T>(): types.ActivitySource<T>
 	return { items = {}, cursor = nil, hasMore = false }
 end
 
--- The Activity tab's data: ProjectUpdates and ProjectHistory, sent side by side. `after` nil asks for the first page
--- of both; otherwise only the sources with a cursor are fetched (the others come back empty, without more).
+-- Which failure of several side-by-side requests a callback reports: `auth` (back to setup), then `rate` (backoff),
+-- whatever order they arrived in; otherwise the first.
+local FAILURE_RANK: { [string]: number } = { auth = 1, rate = 2 }
+
+local function worseFailure(current: ApiError?, err: ApiError): ApiError
+	if current == nil or (FAILURE_RANK[err.kind] or 3) < (FAILURE_RANK[current.kind] or 3) then
+		return err
+	end
+	return current
+end
+
+-- The Activity tab's data: ProjectUpdates and ProjectHistory, sent side by side; `cb` runs once both responded.
+-- `after` nil asks for the first page of both; otherwise only the sources with a cursor are fetched (the others
+-- come back empty, without more).
 function linear.projectActivity(
 	cfg: types.Config,
 	id: string,
@@ -1098,22 +1110,21 @@ function linear.projectActivity(
 	local wantHistory = after == nil or after.history ~= nil
 	local result: types.ProjectActivity = { updates = noPage(), history = noPage() }
 	local pending = (if wantUpdates then 1 else 0) + (if wantHistory then 1 else 0)
-	local finished = false
+	local failed: ApiError? = nil
 	local function settle(err: ApiError?)
-		if finished then
-			return
-		end
 		pending -= 1
 		if err ~= nil then
-			finished = true
-			cb(nil, err)
-		elseif pending <= 0 then
-			finished = true
-			cb(result, nil)
+			failed = worseFailure(failed, err)
+		end
+		if pending == 0 then
+			if failed ~= nil then
+				cb(nil, failed)
+			else
+				cb(result, nil)
+			end
 		end
 	end
 	if pending == 0 then
-		finished = true
 		cb(result, nil)
 		return
 	end
