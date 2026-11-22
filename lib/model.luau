@@ -220,6 +220,18 @@ local function lessWith(compareIssues: (Issue, Issue) -> number): (Issue, Issue)
 	end
 end
 
+-- ─── Rate limits ────────────────────────────────────────────────────────────
+
+-- The banner while Linear's rate limit backs off; `isRateMessage` recognizes it (its countdown is refreshed and
+-- cleared, other errors are left alone).
+function model.rateMessage(waitMs: number): string
+	return string.format("Rate limited by Linear; retrying in %ds", math.ceil(waitMs / 1000))
+end
+
+function model.isRateMessage(message: string?): boolean
+	return message ~= nil and string.find(message, "^Rate limited") ~= nil
+end
+
 -- ─── Dates ──────────────────────────────────────────────────────────────────
 
 local SECONDS_PER_DAY = 86400
@@ -514,6 +526,38 @@ function model.sortTable(visible: { Issue }, key: string, asc: boolean): { Issue
 		end)
 	)
 	return out
+end
+
+-- ─── Keyboard navigation ────────────────────────────────────────────────────
+
+-- `id` stepped by `delta` through `ids` (clamped at the ends); the first id when `id` is not among them.
+function model.steppedId(ids: { string }, id: string?, delta: number): string?
+	if #ids == 0 then
+		return nil
+	end
+	local index = if id ~= nil then table.find(ids, id) else nil
+	return ids[if index == nil then 1 else math.clamp(index + delta, 1, #ids)]
+end
+
+-- The first id of the previous/next non-empty column (lists of ids) from the one holding `id` (the first non-empty
+-- column when `id` is in none).
+function model.adjacentColumnId(columns: { { string } }, id: string?, delta: number): string?
+	local currentColumn = 0
+	for position, ids in columns do
+		if id ~= nil and table.find(ids, id) ~= nil then
+			currentColumn = position
+		end
+	end
+	local step = if currentColumn == 0 then 1 else delta
+	local position = if currentColumn == 0 then 1 else currentColumn + delta
+	while position >= 1 and position <= #columns do
+		local first = columns[position][1]
+		if first ~= nil then
+			return first
+		end
+		position += step
+	end
+	return nil
 end
 
 -- ─── Workflow states ────────────────────────────────────────────────────────

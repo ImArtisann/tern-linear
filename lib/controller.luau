@@ -135,41 +135,38 @@ local function nowMs(): number
 	return os.time() * 1000
 end
 
-local function rateMessage(waitMs: number): string
-	return string.format("Rate limited by Linear; retrying in %ds", math.ceil(waitMs / 1000))
-end
-
-local function isRateMessage(message: string?): boolean
-	return message ~= nil and string.find(message, "^Rate limited") ~= nil
-end
-
 local function unknownError(): ApiError
 	return { kind = "server", message = "Linear returned no data." }
 end
 
-local VIEWS: { [string]: "active" | "backlog" | "all" } = { active = "active", backlog = "backlog", all = "all" }
-local LAYOUTS: { [string]: "board" | "table" } = { board = "board", table = "table" }
-local MODES: { [string]: Mode } = { projects = "projects", issues = "issues" }
-local LINK_MODES: { [string]: "blocked-by" | "blocks" | "related" } = {
-	["blocked-by"] = "blocked-by",
-	blocks = "blocks",
-	related = "related",
-}
+-- Event values and saved prefs: the value when it is one of the allowed strings, else nil. The allowed sets are
+-- scoped to the block below (the controller's top level is close to Luau's 200-local limit).
+local parse = {}
+do
+	local VIEWS: { [string]: "active" | "backlog" | "all" } = { active = "active", backlog = "backlog", all = "all" }
+	local LAYOUTS: { [string]: "board" | "table" } = { board = "board", table = "table" }
+	local MODES: { [string]: Mode } = { projects = "projects", issues = "issues" }
+	local LINK_MODES: { [string]: "blocked-by" | "blocks" | "related" } = {
+		["blocked-by"] = "blocked-by",
+		blocks = "blocks",
+		related = "related",
+	}
 
-local function parseView(value: any): ("active" | "backlog" | "all")?
-	return if type(value) == "string" then VIEWS[value] else nil
-end
+	function parse.view(value: any): ("active" | "backlog" | "all")?
+		return if type(value) == "string" then VIEWS[value] else nil
+	end
 
-local function parseLayout(value: any): ("board" | "table")?
-	return if type(value) == "string" then LAYOUTS[value] else nil
-end
+	function parse.layout(value: any): ("board" | "table")?
+		return if type(value) == "string" then LAYOUTS[value] else nil
+	end
 
-local function parseLinkMode(value: any): ("blocked-by" | "blocks" | "related")?
-	return if type(value) == "string" then LINK_MODES[value] else nil
-end
+	function parse.linkMode(value: any): ("blocked-by" | "blocks" | "related")?
+		return if type(value) == "string" then LINK_MODES[value] else nil
+	end
 
-local function parseMode(value: any): Mode?
-	return if type(value) == "string" then MODES[value] else nil
+	function parse.mode(value: any): Mode?
+		return if type(value) == "string" then MODES[value] else nil
+	end
 end
 
 -- Every saved field is checked against its allowed values; anything else falls back.
@@ -190,15 +187,15 @@ local function restorePrefs(saved: any): Prefs
 		return prefs
 	end
 	local data = saved :: { [string]: any }
-	prefs.mode = parseMode(data.mode) or prefs.mode
+	prefs.mode = parse.mode(data.mode) or prefs.mode
 	if type(data.teamId) == "string" then
 		prefs.teamId = data.teamId
 		if data.scope == "team" then
 			prefs.scope = "team"
 		end
 	end
-	prefs.view = parseView(data.view) or prefs.view
-	prefs.layout = parseLayout(data.layout) or prefs.layout
+	prefs.view = parse.view(data.view) or prefs.view
+	prefs.layout = parse.layout(data.layout) or prefs.layout
 	if type(data.sort) == "string" and SORT_KEYS[data.sort] then
 		prefs.sort = data.sort
 	end
@@ -211,7 +208,7 @@ local function restorePrefs(saved: any): Prefs
 		prefs.projectScope = "team"
 		prefs.projectTeamId = data.projectTeamId
 	end
-	prefs.projectView = parseView(data.projectView) or prefs.projectView
+	prefs.projectView = parse.view(data.projectView) or prefs.projectView
 	if type(data.projectSort) == "string" and PROJECT_SORT_KEYS[data.projectSort] then
 		prefs.projectSort = data.projectSort
 	end
@@ -585,7 +582,7 @@ local function fail(state: BlockState, err: ApiError, inline: ((string) -> ())?)
 	if err.kind == "rate" then
 		local waitMs = err.retryAfterMs or DEFAULT_BACKOFF_MS
 		state.backoffUntil = nowMs() + waitMs
-		state.error = rateMessage(waitMs)
+		state.error = model.rateMessage(waitMs)
 		return
 	end
 	if inline ~= nil then
@@ -1221,7 +1218,7 @@ end
 -- The Activity tab's requests, on their own token like the detail and never `busy`:
 -- "shown" (first show, `r`, Refresh on the tab) marks the tab loading, "poll" reloads silently; both reload the first
 -- pages and keep the older pages `Load more` added. "more" fetches the next pages and appends them.
--- `notfound` closes the page like the detail; other failures show in the tab and keep what it had.
+-- `notfound` drops the project like the detail (projectGone); other failures show in the tab and keep what it had.
 local function fetchActivity(state: BlockState, run: Run, mode: "shown" | "poll" | "more")
 	local page = state.projectPage
 	local cfg = run.cfg
@@ -1263,8 +1260,7 @@ local function fetchActivity(state: BlockState, run: Run, mode: "shown" | "poll"
 		else
 			local failure = err or unknownError()
 			if failure.kind == "notfound" then
-				closeProjectPage(state, live)
-				setNotice(state, live, "Project not found")
+				projectGone(state, live, page.projectId)
 			else
 				fail(state, failure, function(message: string)
 					page.activityError = message
@@ -1308,14 +1304,14 @@ local function tick(state: BlockState, run: Run)
 	if backoff ~= nil then
 		local remaining = backoff - nowMs()
 		if remaining > 0 then
-			if isRateMessage(state.error) then
-				state.error = rateMessage(remaining)
+			if model.isRateMessage(state.error) then
+				state.error = model.rateMessage(remaining)
 				state.cx:render()
 			end
 			return
 		end
 		state.backoffUntil = nil
-		if isRateMessage(state.error) then
+		if model.isRateMessage(state.error) then
 			state.error = nil
 			state.cx:render()
 		end
@@ -2060,42 +2056,12 @@ local function orderedIssues(state: BlockState): { Issue }
 	return ordered
 end
 
--- `id` stepped by `delta` through `ids` (clamped at the ends); the first id when `id` is not among them.
-local function steppedId(ids: { string }, id: string?, delta: number): string?
-	if #ids == 0 then
-		return nil
-	end
-	local index = if id ~= nil then table.find(ids, id) else nil
-	return ids[if index == nil then 1 else math.clamp(index + delta, 1, #ids)]
-end
-
--- The first id of the previous/next non-empty column from the one holding `id` (the first non-empty column
--- when `id` is in none).
-local function adjacentColumnId(columns: { { string } }, id: string?, delta: number): string?
-	local currentColumn = 0
-	for position, ids in columns do
-		if id ~= nil and table.find(ids, id) ~= nil then
-			currentColumn = position
-		end
-	end
-	local step = if currentColumn == 0 then 1 else delta
-	local position = if currentColumn == 0 then 1 else currentColumn + delta
-	while position >= 1 and position <= #columns do
-		local first = columns[position][1]
-		if first ~= nil then
-			return first
-		end
-		position += step
-	end
-	return nil
-end
-
 local function moveSelection(state: BlockState, run: Run, delta: number): boolean
 	local ids: { string } = {}
 	for _, issue in orderedIssues(state) do
 		table.insert(ids, issue.id)
 	end
-	local target = steppedId(ids, state.selectedId, delta)
+	local target = model.steppedId(ids, state.selectedId, delta)
 	if target == nil then
 		return false
 	end
@@ -2118,7 +2084,7 @@ local function moveColumn(state: BlockState, run: Run, delta: number): boolean
 		end
 		table.insert(columns, ids)
 	end
-	local target = adjacentColumnId(columns, state.selectedId, delta)
+	local target = model.adjacentColumnId(columns, state.selectedId, delta)
 	if target == nil then
 		return false
 	end
@@ -2163,7 +2129,7 @@ local function moveProjectSelection(state: BlockState, delta: number): boolean
 	for _, project in orderedProjects(state) do
 		table.insert(ids, project.id)
 	end
-	local target = steppedId(ids, state.projects.selectedId, delta)
+	local target = model.steppedId(ids, state.projects.selectedId, delta)
 	if target == nil then
 		return false
 	end
@@ -2183,7 +2149,7 @@ local function moveProjectColumn(state: BlockState, delta: number): boolean
 		end
 		table.insert(columns, ids)
 	end
-	local target = adjacentColumnId(columns, state.projects.selectedId, delta)
+	local target = model.adjacentColumnId(columns, state.projects.selectedId, delta)
 	if target == nil then
 		return false
 	end
@@ -2227,7 +2193,7 @@ local function reloadBoard(state: BlockState, run: Run, clearBoard: boolean)
 end
 
 local function setView(state: BlockState, run: Run, value: any)
-	local parsed: ("active" | "backlog" | "all")? = parseView(value)
+	local parsed: ("active" | "backlog" | "all")? = parse.view(value)
 	local prefs = state.prefs
 	local currentView = if inProjects(state) then prefs.projectView else prefs.view
 	if parsed == nil or parsed == currentView or not canReload(state, run) then
@@ -2242,7 +2208,7 @@ local function setView(state: BlockState, run: Run, value: any)
 end
 
 local function setLayout(state: BlockState, value: any)
-	local parsed: ("board" | "table")? = parseLayout(value)
+	local parsed: ("board" | "table")? = parse.layout(value)
 	if parsed ~= nil then
 		state.prefs.layout = parsed
 	end
@@ -2383,7 +2349,7 @@ end
 -- Switches between projects and issues. Entering a mode whose list never loaded (or while a foreground load
 -- runs) loads it in the foreground; otherwise the list shows at once and reloads in the background.
 local function setMode(state: BlockState, run: Run, value: any)
-	local mode: Mode? = parseMode(value)
+	local mode: Mode? = parse.mode(value)
 	if mode == nil or mode == state.prefs.mode or not canReload(state, run) then
 		return
 	end
@@ -2538,7 +2504,7 @@ local ACTIONS: { [string]: ActionHandler } = {
 		submitComment(state)
 	end,
 	["link"] = function(state, _run, value)
-		local mode: ("blocked-by" | "blocks" | "related")? = parseLinkMode(value)
+		local mode: ("blocked-by" | "blocks" | "related")? = parse.linkMode(value)
 		if mode ~= nil then
 			openLink(state, mode)
 		end

@@ -644,6 +644,68 @@ async function scenario() {
 		await clearSearch("public".length);
 	});
 
+	// A rate-limited first Activity load only sets the banner: once no request is pending the tab shows no loading
+	// line, and showing the tab again retries.
+	await runner.step("project-activity-rate", async (label) => {
+		await search("sync");
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Sync engine v2");
+		await t.key("Enter");
+		await pageOpen("Sync engine v2");
+		await settle();
+		// The backoff runs on the wall clock (`os.time`) while `t.wait` advances app time: 3 s keep the poll tick from
+		// retrying during the checks below.
+		mock.rateLimitNext("ProjectUpdates", 3);
+		await t.click(role("project-tab-activity"));
+		await t.waitFor(role("error"), "Rate limited by Linear");
+		// No request is pending and nothing loaded: no loading line, no inline error, no rows (the empty tab draws nothing).
+		await t.wait(500);
+		if (await exists(role("activity-loading"))) throw new Error("the rate-limited Activity tab shows a loading line");
+		if (await exists(role("activity-error"))) throw new Error("the rate limit shows in the Activity tab, not only the banner");
+		if (await exists(ACTIVITY_ITEMS)) throw new Error("activity rows after a failed first load");
+		await runner.shot(label);
+		await t.click(role("project-tab-overview"));
+		await present(role("project-overview"));
+		await openActivity();
+		await waitFor(async () => (await t.wait(150), (await nodesOf(role("activity-update"))).length === 20), {
+			what: "the first 20 updates after the retry",
+			interval: 0,
+		});
+		// The first poll tick past the backoff clears the banner.
+		const failedAt = Date.now();
+		while (await exists(role("error"))) {
+			if (Date.now() - failedAt > 20_000) throw new Error("the rate limit banner stayed after the backoff");
+			await t.wait(1000);
+		}
+		await backToList("Sync engine v2");
+		await clearSearch("sync".length);
+	});
+
+	// A project deleted while its Activity tab is open leaves the list like one deleted under the Overview.
+	await runner.step("project-activity-notfound", async (label) => {
+		await t.key("3");
+		await see("Mobile companion");
+		await search("mobile");
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Mobile companion");
+		await t.key("Enter");
+		await pageOpen("Mobile companion");
+		await openActivity();
+		await settle();
+		mock.deleteProject(projectNamed("Mobile companion").id);
+		const before = mark();
+		await t.key("r");
+		await absent(role("project-header"));
+		await t.waitFor(role("notice"), "Project not found");
+		assertEqual(opsSince(before, "Project").length, 0, "detail reloads from r on the Activity tab");
+		await present(role("empty"));
+		if (await exists(role("project-card"))) throw new Error("the deleted project is still on the board");
+		await runner.shot(label);
+		await clearSearch("mobile".length);
+		await t.key("1");
+		await see("Desktop app");
+	});
+
 	await runner.step("project-page-restore-missing", async (label) => {
 		await t.key("3");
 		await see("Billing migration");

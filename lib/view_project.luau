@@ -575,7 +575,10 @@ local function activityTab(
 	end
 	local activity = page.activity
 	if activity == nil then
-		if failure == nil then
+		-- Nothing loaded: the loading line only while a shown load is pending (a retry after an error keeps the error).
+		-- A failed first load shows the tab's error, or nothing beyond the banner when the failure went to
+		-- `state.error` (rate, auth with an env key).
+		if page.activityLoading and failure == nil then
 			table.insert(children, loadingLine("loading", "linear.activity-loading"))
 		end
 		return ui.node("col", { key = "tab", role = "linear.activity", gap = "sm" }, children)

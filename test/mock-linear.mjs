@@ -823,7 +823,8 @@ const json = (body, init = {}) =>
 
 /**
  * Starts the mock on 127.0.0.1. `port: 0` picks a free port.
- * Returns `{ url, port, log, state(), reset(), stop() }`; `url` is the GraphQL endpoint.
+ * Returns `{ url, port, log, state(), reset(), stop(), deleteProject(id), rateLimitNext(operationName, seconds) }`;
+ * `url` is the GraphQL endpoint.
  */
 export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 	const schema = loadSchema();
@@ -831,12 +832,15 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 	let root_ = buildRoot(db, Date.now);
 	let log = [];
 	let requestsRemaining = 2500;
+	// operationName → retry-after seconds: the next request of that operation answers RATELIMITED.
+	const rateLimitedOps = new Map();
 
 	const reset = () => {
 		db = new Database(Date.now());
 		root_ = buildRoot(db, Date.now);
 		log = [];
 		requestsRemaining = 2500;
+		rateLimitedOps.clear();
 	};
 
 	const rateHeaders = () => ({
@@ -860,6 +864,15 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 			return json({ errors: [{ message: "Body must be JSON" }] }, { status: 400 });
 		}
 		const { query, variables, operationName } = body ?? {};
+		const retryAfter = rateLimitedOps.get(operationName);
+		if (retryAfter !== undefined) {
+			rateLimitedOps.delete(operationName);
+			log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 400 });
+			return json(
+				{ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED", type: "ratelimited" } }] },
+				{ status: 400, headers: { ...rateHeaders(), "retry-after": String(retryAfter) } },
+			);
+		}
 		log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 200 });
 		requestsRemaining = Math.max(0, requestsRemaining - 1);
 		const result = await graphql({
@@ -901,6 +914,10 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		/** Deletes a project: the list no longer returns it and `project(id)` answers "Entity not found". */
 		deleteProject: (id) => {
 			db.project(id).deleted = true;
+		},
+		/** The next request of `operationName` answers RATELIMITED with `retry-after: seconds`. */
+		rateLimitNext: (operationName, seconds = 1) => {
+			rateLimitedOps.set(operationName, seconds);
 		},
 		stop: () => server.stop(true),
 	};
