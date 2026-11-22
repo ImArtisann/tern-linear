@@ -164,6 +164,35 @@ export type Project = {
 	canceledAt: string?,
 }
 
+-- One of a project's milestones (Linear's `ProjectMilestone`).
+export type ProjectMilestone = {
+	id: string,
+	name: string,
+	-- ProjectMilestoneStatus: "unstarted" | "next" | "overdue" | "done" (computed by Linear)
+	status: string,
+	-- 0..1
+	progress: number,
+	-- "YYYY-MM-DD"
+	targetDate: string?,
+	-- Linear's manual order; model.sortMilestones orders by it.
+	sortOrder: number,
+}
+
+-- A project as the project page shows it: the list fields plus the overview's own.
+export type ProjectDetail = {
+	-- The list fields, from the same normalizer as `Project` (teams: the first 10 instead of 5).
+	project: Project,
+	-- The long project document (`Project.content`), Markdown; "" when there is none.
+	content: string,
+	-- When the health was last set by a project update.
+	healthUpdatedAt: string?,
+	members: { User },
+	-- Project labels (no group labels).
+	labels: { Label },
+	-- Linear's order (model.sortMilestones): sortOrder, then target date, then name.
+	milestones: { ProjectMilestone },
+}
+
 -- ─── Data layer ─────────────────────────────────────────────────────────────
 
 export type Config = {
@@ -305,7 +334,7 @@ export type LinkDraft = {
 -- ─── Block state (lib/controller.luau owns all mutation) ────────────────────
 
 -- Projects mode: the project list, its search text and selection. The issue counterparts are
--- top-level BlockState fields; a project page (opened from this list) keeps its own state beside it.
+-- top-level BlockState fields; the project page (opened from this list) keeps its own state beside it.
 export type ProjectsState = {
 	items: { Project },
 	-- The organization's statuses (board columns), sorted by type rank then position.
@@ -318,6 +347,25 @@ export type ProjectsState = {
 	-- Search text of projects mode (the search field shows the active mode's query).
 	query: Field,
 	selectedId: string?,
+}
+
+-- A tab of the project page. Each tab is one entry of model.PROJECT_TABS (the tab bar's order); a layer that
+-- adds a tab extends this union and that list, and keeps its own data in ProjectPageState.
+export type ProjectTab = "overview"
+
+-- The project page: full-screen over projects mode's list, which stays loaded (scope, view, layout and
+-- selection untouched) for Back.
+export type ProjectPageState = {
+	projectId: string,
+	tab: ProjectTab,
+	-- The overview's data; nil until the first detail load. The header falls back to the list item.
+	detail: ProjectDetail?,
+	-- A shown detail request is in flight (open, `r`, Refresh); poll reloads keep it false.
+	loading: boolean,
+	-- The last detail load failed (shown in the page; the known fields stay).
+	error: string?,
+	-- Epoch seconds of the last successful detail load.
+	fetchedAt: number?,
 }
 
 export type BlockState = {
@@ -338,6 +386,8 @@ export type BlockState = {
 	maxUpdatedAt: string?,
 	-- Projects mode data and selection (mode "projects").
 	projects: ProjectsState,
+	-- The open project page (projects mode only); nil shows the list.
+	projectPage: ProjectPageState?,
 
 	prefs: Prefs,
 	query: Field,

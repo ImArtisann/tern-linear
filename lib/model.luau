@@ -9,6 +9,8 @@ type IssueRef = types.IssueRef
 type Prefs = types.Prefs
 type Project = types.Project
 type ProjectStatus = types.ProjectStatus
+type ProjectMilestone = types.ProjectMilestone
+type ProjectTab = types.ProjectTab
 type Team = types.Team
 type WorkflowState = types.WorkflowState
 type Form = types.Form
@@ -870,6 +872,82 @@ function model.sortProjects(visible: { Project }, key: string, asc: boolean): { 
 		end)
 	)
 	return out
+end
+
+-- ─── Project page ───────────────────────────────────────────────────────────
+
+-- The project page's tabs in tab-bar order. A layer that adds a tab appends it here (and to types.ProjectTab).
+local PROJECT_TABS: { { id: ProjectTab, label: string } } = table.freeze({
+	table.freeze({ id = "overview" :: ProjectTab, label = "Overview" }),
+})
+model.PROJECT_TABS = PROJECT_TABS
+
+-- The tab named `id`, or nil when no tab has that id (a saved tab a later version dropped).
+function model.projectTab(id: any): ProjectTab?
+	for _, tab in PROJECT_TABS do
+		if tab.id == id then
+			return tab.id
+		end
+	end
+	return nil
+end
+
+-- The tab `delta` steps from `current`, wrapping around; the first tab when `current` is unknown.
+function model.stepProjectTab(current: ProjectTab, delta: number): ProjectTab
+	local index = 0
+	for position, tab in PROJECT_TABS do
+		if tab.id == current then
+			index = position
+		end
+	end
+	if index == 0 then
+		return PROJECT_TABS[1].id
+	end
+	return PROJECT_TABS[(index - 1 + delta) % #PROJECT_TABS + 1].id
+end
+
+local MILESTONE_STATUS_LABELS: { [string]: string } = {
+	unstarted = "Not started",
+	next = "Next",
+	overdue = "Overdue",
+	done = "Done",
+}
+
+-- ProjectMilestoneStatus → label; unknown statuses read as not started.
+function model.milestoneStatusLabel(status: string): string
+	return MILESTONE_STATUS_LABELS[status] or MILESTONE_STATUS_LABELS.unstarted
+end
+
+-- Linear's milestone order: sortOrder, then target date (none last), then name, then id. Returns a new list.
+function model.sortMilestones(milestones: { ProjectMilestone }): { ProjectMilestone }
+	local out = table.clone(milestones)
+	table.sort(out, function(a: ProjectMilestone, b: ProjectMilestone): boolean
+		if a.sortOrder ~= b.sortOrder then
+			return a.sortOrder < b.sortOrder
+		end
+		local left, right = a.targetDate, b.targetDate
+		if left ~= right then
+			if left == nil or right == nil then
+				return right == nil
+			end
+			return left < right
+		end
+		local byName = compareText(a.name, b.name)
+		if byName ~= 0 then
+			return byName < 0
+		end
+		return a.id < b.id
+	end)
+	return out
+end
+
+-- "ada, grace, linus" with at most `max` names, then "+N" for the rest; "" for none.
+function model.namesLabel(names: { string }, max: number): string
+	if #names <= max then
+		return table.concat(names, ", ")
+	end
+	local shown = table.move(names, 1, max, 1, {})
+	return `{table.concat(shown, ", ")} +{#names - max}`
 end
 
 return model

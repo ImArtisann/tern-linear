@@ -176,4 +176,20 @@ queries.ProjectsChanged = [[query ProjectsChanged($filter: ProjectFilter) {
   }
 }]]
 
+-- The project page: the list fields (teams up to 10) plus the overview's document, members, labels and milestones.
+-- `Query.project` also returns archived projects. IssueConnection has no count, so milestones carry no issue
+-- count: counting would need a nested `issues` page per milestone, multiplying the cost.
+queries.Project = [[query Project($id: String!) {
+  project(id: $id) {
+    id name url slugId icon color description content priority sortOrder progress health healthUpdatedAt
+    startDate targetDate createdAt updatedAt startedAt completedAt canceledAt
+    status { id name type color position }
+    lead { id name displayName avatarUrl }
+    teams(first: 10) { nodes { id key name } }
+    members(first: 50) { nodes { id name displayName avatarUrl } }
+    labels(first: 25) { nodes { id name color isGroup } }
+    projectMilestones(first: 50) { nodes { id name status progress targetDate sortOrder } }
+  }
+}]]
+
 return queries

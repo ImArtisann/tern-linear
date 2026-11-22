@@ -55,6 +55,8 @@ type Run = {
 	detailTimer: TimerHandle?,
 	-- Bumped whenever the drawer's detail request is superseded.
 	detailToken: number,
+	-- Bumped whenever the project page's detail request is superseded (page closed, reopened, reloaded).
+	pageToken: number,
 	-- What the in-flight foreground request is: only loads may supersede loads.
 	fgKind: ("load" | "mutation")?,
 	-- tern.now() of the last successful board load.
@@ -222,6 +224,25 @@ local function emptyProjects(): types.ProjectsState
 	}
 end
 
+-- A saved project page (`save().projectPage`): the project id and a known tab, else nil.
+local function restorePage(saved: any): types.ProjectPageState?
+	if type(saved) ~= "table" then
+		return nil
+	end
+	local page: any = (saved :: { [string]: any }).projectPage
+	if type(page) ~= "table" or type(page.id) ~= "string" or page.id == "" then
+		return nil
+	end
+	return {
+		projectId = page.id,
+		tab = model.projectTab(page.tab) or "overview",
+		detail = nil,
+		loading = true,
+		error = nil,
+		fetchedAt = nil,
+	}
+end
+
 local function newState(cx: BlockCx, prefs: Prefs): BlockState
 	return {
 		cx = cx,
@@ -236,6 +257,7 @@ local function newState(cx: BlockCx, prefs: Prefs): BlockState
 		fetchedAt = nil,
 		maxUpdatedAt = nil,
 		projects = emptyProjects(),
+		projectPage = nil,
 		prefs = prefs,
 		query = text.new(""),
 		focus = nil,
@@ -285,6 +307,16 @@ local function findProject(state: BlockState, id: string): Project?
 		end
 	end
 	return nil
+end
+
+-- A project of the list, or the open page's project (a restored page may show one the list does not hold).
+local function knownProject(state: BlockState, id: string): Project?
+	local page = state.projectPage
+	local detail = if page ~= nil then page.detail else nil
+	if detail ~= nil and detail.project.id == id then
+		return detail.project
+	end
+	return findProject(state, id)
 end
 
 local function selectedProject(state: BlockState): Project?
@@ -468,6 +500,8 @@ local function resetData(state: BlockState, run: Run)
 	run.metaReady = false
 	run.reloadQueued = false
 	supersedeDetail(state, run)
+	run.pageToken += 1
+	state.projectPage = nil
 	run.editAfterLoad = nil
 	state.viewer = nil
 	state.teams = {}
@@ -1042,6 +1076,80 @@ local function checkForChanges(state: BlockState, run: Run)
 	end
 end
 
+-- ─── Project page ───────────────────────────────────────────────────────────
+-- Own token, never `busy`: the page's detail loads like the drawer's. The list underneath stays as it was.
+
+local function closeProjectPage(state: BlockState, run: Run)
+	local page = state.projectPage
+	if page == nil then
+		return
+	end
+	run.pageToken += 1
+	state.projectPage = nil
+	if findProject(state, page.projectId) ~= nil then
+		state.projects.selectedId = page.projectId
+	end
+end
+
+-- Loads the open page's detail. `shown` marks it loading (open, `r`, Refresh); a poll reload stays silent.
+-- `notfound` closes the page with a notice; other failures show in the page and keep what it had.
+local function fetchProjectPage(state: BlockState, run: Run, shown: boolean)
+	local page = state.projectPage
+	local cfg = run.cfg
+	if page == nil or cfg == nil then
+		return
+	end
+	run.pageToken += 1
+	local token = run.pageToken
+	if shown then
+		page.loading = true
+	end
+	linear.project(cfg, page.projectId, function(detail, err)
+		local live = liveRun(state)
+		if live == nil or live.pageToken ~= token or state.projectPage ~= page then
+			return
+		end
+		page.loading = false
+		if detail ~= nil then
+			detail.milestones = model.sortMilestones(detail.milestones)
+			page.detail = detail
+			page.error = nil
+			page.fetchedAt = os.time()
+			state.error = nil
+		else
+			local failure = err or unknownError()
+			if failure.kind == "notfound" then
+				closeProjectPage(state, live)
+				setNotice(state, live, "Project not found")
+			else
+				fail(state, failure, function(message: string)
+					page.error = message
+				end)
+			end
+		end
+		state.cx:render()
+	end)
+end
+
+local function openProjectPage(state: BlockState, run: Run, id: string)
+	if findProject(state, id) == nil then
+		return
+	end
+	state.projects.selectedId = id
+	if state.focus == "search" then
+		setFocus(state, nil)
+	end
+	state.projectPage = { projectId = id, tab = "overview", detail = nil, loading = true, error = nil, fetchedAt = nil }
+	fetchProjectPage(state, run, true)
+end
+
+local function selectProjectTab(state: BlockState, tab: types.ProjectTab?)
+	local page = state.projectPage
+	if page ~= nil and tab ~= nil then
+		page.tab = tab
+	end
+end
+
 local function tick(state: BlockState, run: Run)
 	if run.cfg == nil then
 		return
@@ -1068,6 +1176,14 @@ local function tick(state: BlockState, run: Run)
 	if not run.metaReady or (inProjects(state) and #state.projects.statuses == 0) then
 		loadAll(state, run.metaReady)
 		state.cx:render()
+		return
+	end
+	-- While the project page is open the list's polling pauses; the page's detail reloads on the same tick.
+	local page = if inProjects(state) then state.projectPage else nil
+	if page ~= nil then
+		if not page.loading then
+			fetchProjectPage(state, run, false)
+		end
 		return
 	end
 	if tern.now() - run.lastFullAt >= FULL_RELOAD_MS then
@@ -2123,6 +2239,9 @@ local function setMode(state: BlockState, run: Run, value: any)
 		if state.form ~= nil then
 			cancelForm(state, run)
 		end
+	else
+		-- The project page belongs to projects mode; coming back shows the list.
+		closeProjectPage(state, run)
 	end
 	if state.focus == "search" then
 		setFocus(state, nil)
@@ -2300,19 +2419,28 @@ local ACTIONS: { [string]: ActionHandler } = {
 			setProjectScope(state, run, "team", value)
 		end
 	end,
-	["select-project"] = function(state, _run, value)
+	["open-project"] = function(state, run, value)
 		if value ~= nil then
-			selectProject(state, value)
+			openProjectPage(state, run, value)
 		end
 	end,
+	["project-back"] = function(state, run, _value)
+		closeProjectPage(state, run)
+	end,
+	["project-tab"] = function(state, _run, value)
+		selectProjectTab(state, model.projectTab(value))
+	end,
+	["refresh-project"] = function(state, run, _value)
+		fetchProjectPage(state, run, true)
+	end,
 	["open-project-url"] = function(state, run, value)
-		local project = if value ~= nil then findProject(state, value) else nil
+		local project = if value ~= nil then knownProject(state, value) else nil
 		if project ~= nil then
 			openLinearUrl(state, run, project.url)
 		end
 	end,
 	["copy-project-url"] = function(state, run, value)
-		local project = if value ~= nil then findProject(state, value) else nil
+		local project = if value ~= nil then knownProject(state, value) else nil
 		if project ~= nil then
 			copyProject(state, run, project)
 		end
@@ -2345,7 +2473,10 @@ local ACTION_MODES: { [string]: Mode } = {
 	["unlink"] = "issues",
 	["project-scope"] = "projects",
 	["project-team"] = "projects",
-	["select-project"] = "projects",
+	["open-project"] = "projects",
+	["project-back"] = "projects",
+	["project-tab"] = "projects",
+	["refresh-project"] = "projects",
 	["open-project-url"] = "projects",
 	["copy-project-url"] = "projects",
 }
@@ -2673,7 +2804,7 @@ local function projectColumnKey(delta: number): KeyHandler
 	end
 end
 
--- Projects mode: the issue keys without an issue to act on (n e c a x [ ]) are absent; `enter` opens nothing.
+-- Projects mode: the issue keys without an issue to act on (n e c a x [ ]) are absent; `enter` opens the project page.
 local PROJECT_KEYS: { [string]: KeyHandler } = {
 	["/"] = KEYS["/"],
 	["1"] = KEYS["1"],
@@ -2701,6 +2832,9 @@ local PROJECT_KEYS: { [string]: KeyHandler } = {
 	["left"] = projectColumnKey(-1),
 	["l"] = projectColumnKey(1),
 	["right"] = projectColumnKey(1),
+	["enter"] = selectedProjectAction(function(state, run, project)
+		openProjectPage(state, run, project.id)
+	end),
 	["escape"] = function(state, _run)
 		if state.projects.selectedId == nil then
 			return false
@@ -2713,6 +2847,39 @@ local PROJECT_KEYS: { [string]: KeyHandler } = {
 	end),
 	["y"] = selectedProjectAction(copyProject),
 }
+
+-- The project page hides the list, so none of the list's keys apply.
+local function handlePageKey(state: BlockState, run: Run, page: types.ProjectPageState, k: Key): boolean
+	local name = k.name
+	if name == "escape" or name == "backspace" or name == "p" then
+		closeProjectPage(state, run)
+		return true
+	elseif name == "tab" then
+		if #model.PROJECT_TABS < 2 then
+			return false
+		end
+		selectProjectTab(state, model.stepProjectTab(page.tab, if k.shift then -1 else 1))
+		return true
+	elseif name == "r" then
+		fetchProjectPage(state, run, true)
+		return true
+	elseif name == "i" then
+		setMode(state, run, "issues")
+		return true
+	elseif name == "o" or name == "y" then
+		local project = knownProject(state, page.projectId)
+		if project == nil then
+			return false
+		end
+		if name == "o" then
+			openLinearUrl(state, run, project.url)
+		else
+			copyProject(state, run, project)
+		end
+		return true
+	end
+	return false
+end
 
 local function handleKey(state: BlockState, k: Key, _cx: BlockCx): boolean?
 	local run = runOf(state)
@@ -2729,6 +2896,10 @@ local function handleKey(state: BlockState, k: Key, _cx: BlockCx): boolean?
 	end
 	if k.ctrl or k.alt or k.meta then
 		return false
+	end
+	local page = if inProjects(state) then state.projectPage else nil
+	if page ~= nil then
+		return handlePageKey(state, run, page, k)
 	end
 	local handler = (if inProjects(state) then PROJECT_KEYS else KEYS)[k.name]
 	if handler == nil then
@@ -2886,16 +3057,20 @@ local function onChange(state: BlockState, run: Run, ev: UiEvent)
 end
 
 -- Table row events. Issues: `select` highlights (and follows an open drawer), `activate` opens the drawer.
--- Projects: both select the project; nothing opens yet.
+-- Projects: `select` selects the project, `activate` opens its page.
 local function onRow(state: BlockState, run: Run, ev: UiEvent, open: boolean)
 	local item = ev.item
 	if type(item) ~= "string" or state.phase ~= "ready" then
 		return
 	end
 	if inProjects(state) then
-		if findProject(state, item) ~= nil then
+		if findProject(state, item) ~= nil and state.projectPage == nil then
 			blurTextFocus(state)
-			selectProject(state, item)
+			if open then
+				openProjectPage(state, run, item)
+			else
+				selectProject(state, item)
+			end
 		end
 		return
 	end
@@ -2938,6 +3113,8 @@ local function startRun(state: BlockState, run: Run)
 		state.keySource = credentials.source()
 		state.phase = "loading"
 		loadAll(state, false)
+		-- A restored project page loads beside the list; it shows once the list is ready.
+		fetchProjectPage(state, run, true)
 	end
 	schedulePoll(state, run)
 end
@@ -2954,6 +3131,7 @@ local function register(state: BlockState): Run
 		noticeTimer = nil,
 		detailTimer = nil,
 		detailToken = 0,
+		pageToken = 0,
 		fgKind = nil,
 		lastFullAt = tern.now(),
 		focusQueued = false,
@@ -2971,6 +3149,11 @@ local function blockTitle(state: BlockState): string
 	end
 	local prefs = state.prefs
 	if prefs.mode == "projects" then
+		local page = state.projectPage
+		if page ~= nil then
+			local project = knownProject(state, page.projectId)
+			return if project ~= nil then `Linear · {project.name}` else "Linear · Project"
+		end
 		if prefs.projectScope == "mine" then
 			return "Linear · My projects"
 		end
@@ -2994,6 +3177,9 @@ local def: BlockDef<BlockState> = {
 	features = featureList,
 	init = function(cx, _args, saved)
 		local state = newState(cx, restorePrefs(saved))
+		if state.prefs.mode == "projects" then
+			state.projectPage = restorePage(saved)
+		end
 		startRun(state, register(state))
 		return state
 	end,
@@ -3005,6 +3191,7 @@ local def: BlockDef<BlockState> = {
 	event = handleEvent,
 	save = function(state)
 		local prefs = state.prefs
+		local page = state.projectPage
 		return {
 			mode = prefs.mode,
 			sort = prefs.sort,
@@ -3018,6 +3205,10 @@ local def: BlockDef<BlockState> = {
 			projectView = prefs.projectView,
 			projectSort = prefs.projectSort,
 			projectSortAsc = prefs.projectSortAsc,
+			-- The open project page, reopened on restore (projects mode only).
+			projectPage = if prefs.mode == "projects" and page ~= nil
+				then { id = page.projectId, tab = page.tab }
+				else nil,
 		}
 	end,
 }

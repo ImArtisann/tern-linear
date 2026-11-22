@@ -179,6 +179,7 @@ export async function startTern({ env = {}, out, pluginDir = repoRoot, keep = fa
 		key: (combo) => ctl(`key ${combo}`),
 		type: (text) => ctl(`type ${quote(text)}`),
 		click: (selector) => ctl(`click ${quote(selector)}`),
+		dblclick: (selector) => ctl(`dblclick ${quote(selector)}`),
 
 		/** Warnings, errors and the plugin's own log lines (`tern::plugin`) written since the start. */
 		logs() {

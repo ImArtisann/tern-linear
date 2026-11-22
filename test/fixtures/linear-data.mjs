@@ -20,6 +20,8 @@ const KIND = {
 	cycle: 9,
 	org: 10,
 	projectStatus: 11,
+	projectLabel: 12,
+	milestone: 13,
 };
 
 /** Stable UUID-shaped ids: the first group names the entity kind, the last one its ordinal. */
@@ -108,6 +110,26 @@ const PROJECT_STATUSES = [
 	["Retired status", "started", "#95a2b3", 1, true],
 ];
 
+// The organization's project labels: [name, color]. The group label never shows on a project page.
+const PROJECT_LABELS = [
+	["Platform", "#5e6ad2"],
+	["Customer request", "#f2994a"],
+	["Q3 bet", "#26b5ce"],
+	["Initiatives", "#95a2b3", true],
+];
+
+const DESKTOP_DOC = `## Why
+
+The web app cannot reach the file system or run in the background. A native client fixes both.
+
+## Scope
+
+- Tray icon with unread counts
+- Offline cache of the last 500 issues
+- \`linear://\` deep links
+
+See the [design spec](https://linear.app/acme/document/desktop-spec) and the [old prototype](javascript:alert(1)).`;
+
 // The viewer is ada. `members` are handles; `teams` team keys (they double as the project's accessible teams).
 // Dates: `target`/`start` in days from now (negative: past), the rest in ms ago.
 // "Desktop app" stays first: the issue seed refers to projects by index.
@@ -115,6 +137,17 @@ const PROJECTS = [
 	{
 		name: "Desktop app",
 		description: "The native desktop client for macOS, Windows and Linux.",
+		content: DESKTOP_DOC,
+		labels: ["Platform", "Customer request", "Initiatives"],
+		healthUpdated: 3 * DAY,
+		// [name, status, progress, target in days from now (null: none), sortOrder]. Linear's order is the sortOrder:
+		// Alpha, Beta, Accessibility audit, Public launch (neither by name nor by target date).
+		milestones: [
+			["Public launch", "unstarted", 0, 30, 300],
+			["Accessibility audit", "overdue", 0.3, -3, 250],
+			["Beta", "next", 0.45, 10, 200],
+			["Alpha", "done", 1, -20, 100],
+		],
 		icon: "Computer",
 		color: "#5e6ad2",
 		status: "In Progress",
@@ -132,6 +165,14 @@ const PROJECTS = [
 	{
 		name: "Sync engine v2",
 		description: "Conflict-free sync with offline support.",
+		content: "Replace the polling sync with **CRDT** documents.",
+		labels: ["Platform"],
+		healthUpdated: 1 * DAY,
+		milestones: [
+			["Protocol draft", "done", 1, -10, 1],
+			["Offline mode", "next", 0.2, 10, 2],
+			["Conflict UI", "unstarted", 0, null, 3],
+		],
 		color: "#f2994a",
 		status: "In Progress",
 		health: "atRisk",
@@ -164,6 +205,7 @@ const PROJECTS = [
 		name: "Public API",
 		description: "Stable, documented REST and GraphQL endpoints.",
 		color: "#4ea7fc",
+		healthUpdated: 6 * DAY,
 		status: "Paused",
 		health: "offTrack",
 		progress: 0.2,
@@ -618,14 +660,25 @@ function build(now) {
 		updatedAt: ago(365 * DAY),
 		archivedAt: archived ? ago(30 * DAY) : null,
 	}));
-	const day = (days) => (days === undefined ? null : new Date(now + days * DAY).toISOString().slice(0, 10));
+	const day = (days) => (days === undefined || days === null ? null : new Date(now + days * DAY).toISOString().slice(0, 10));
 	const msAgo = (ms) => (ms === undefined ? null : ago(ms));
+	const projectLabels = PROJECT_LABELS.map(([name, color, isGroup], i) => ({
+		id: uuid("projectLabel", i + 1),
+		name,
+		color,
+		isGroup: isGroup === true,
+	}));
+	let milestoneOrdinal = 0;
+	const projectMilestones = [];
 	const projects = PROJECTS.map((p, i) => ({
 		id: uuid("project", i + 1),
 		name: p.name,
 		slugId: (0xa1b2c3d4e5 + i).toString(16),
 		url: p.url ?? null,
 		description: p.description,
+		content: p.content ?? null,
+		healthUpdatedAt: msAgo(p.healthUpdated),
+		labelIds: (p.labels ?? []).map((name) => projectLabels.find((label) => label.name === name).id),
 		icon: p.icon ?? null,
 		color: p.color,
 		statusId: projectStatuses.find((s) => s.name === p.status && s.archivedAt === null).id,
@@ -645,6 +698,23 @@ function build(now) {
 		canceledAt: msAgo(p.canceled),
 		archivedAt: msAgo(p.archived),
 	}));
+	PROJECTS.forEach((p, i) => {
+		for (const [name, status, progress, target, sortOrder] of p.milestones ?? []) {
+			projectMilestones.push({
+				id: uuid("milestone", ++milestoneOrdinal),
+				projectId: projects[i].id,
+				name,
+				status,
+				progress,
+				targetDate: day(target),
+				sortOrder,
+				description: null,
+				createdAt: ago(20 * DAY),
+				updatedAt: ago(DAY),
+				archivedAt: null,
+			});
+		}
+	});
 
 	const issues = ISSUES.map((spec, i) => {
 		const team = teamByKey.get(spec.team);
@@ -711,6 +781,8 @@ function build(now) {
 		users,
 		projectStatuses,
 		projects,
+		projectLabels,
+		projectMilestones,
 		teams,
 		issues,
 		relations,

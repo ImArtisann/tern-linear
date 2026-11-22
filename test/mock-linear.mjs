@@ -1,4 +1,4 @@
-// A stateful fake of the Linear GraphQL API for the fifteen operations in lib/queries.luau.
+// A stateful fake of the Linear GraphQL API for the sixteen operations in lib/queries.luau.
 //
 // Requests are executed by graphql-js against Linear's real SDL (.cache/linear-schema.graphql), so variable coercion,
 // validation errors and the shape of every response follow the documents the plugin sends. Resolvers read and mutate an
@@ -373,6 +373,9 @@ class Database {
 	project(id) {
 		return this.state_.projects.find((p) => p.id === id) ?? null;
 	}
+	projectLabel(id) {
+		return this.state_.projectLabels.find((l) => l.id === id) ?? null;
+	}
 	projectStatus(id) {
 		return this.state_.projectStatuses.find((s) => s.id === id) ?? null;
 	}
@@ -425,10 +428,21 @@ class Database {
 			completedAt: iso(project.completedAt),
 			canceledAt: iso(project.canceledAt),
 			archivedAt: iso(project.archivedAt),
+			healthUpdatedAt: iso(project.healthUpdatedAt),
 			status: this.projectStatusView(this.projectStatus(project.statusId)),
 			lead: this.userView(this.user(project.leadId)),
 			members: (args) => connection(project.memberIds.map((id) => this.userView(this.user(id))), args),
 			teams: (args) => connection(project.teamIds.map((id) => this.teamView(this.team(id))), args),
+			labels: (args) => connection(project.labelIds.map((id) => ({ ...this.projectLabel(id) })), args),
+			// Linear documents no order; the highest sortOrder first keeps clients sorting milestones themselves.
+			projectMilestones: (args) =>
+				connection(
+					this.state_.projectMilestones
+						.filter((m) => m.projectId === project.id && m.archivedAt === null)
+						.sort((a, b) => b.sortOrder - a.sortOrder)
+						.map((m) => ({ ...m, createdAt: iso(m.createdAt), updatedAt: iso(m.updatedAt), archivedAt: null })),
+					args,
+				),
 		};
 	}
 
@@ -553,13 +567,19 @@ function buildRoot(db, now) {
 			projectMatcher.now = now();
 			const key = orderBy === "createdAt" ? "createdAt" : "updatedAt";
 			const matching = db.state_.projects
-				.filter((project) => includeArchived || project.archivedAt === null)
+				.filter((project) => !project.deleted && (includeArchived || project.archivedAt === null))
 				.filter((project) => projectMatcher.match(project, filter))
 				.sort((a, b) => b[key] - a[key] || a.name.localeCompare(b.name));
 			return connection(
 				matching.map((project) => db.projectView(project)),
 				{ first, after },
 			);
+		},
+
+		project: ({ id }) => {
+			const project = db.project(id);
+			if (!project || project.deleted) throw notFound("Project");
+			return db.projectView(project);
 		},
 
 		teams: (args) => connection(db.state_.teams.map((t) => db.teamView(t)), args),
@@ -836,6 +856,10 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		},
 		state: () => snapshot(db),
 		reset,
+		/** Deletes a project: the list no longer returns it and `project(id)` answers "Entity not found". */
+		deleteProject: (id) => {
+			db.project(id).deleted = true;
+		},
 		stop: () => server.stop(true),
 	};
 }

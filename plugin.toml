@@ -5,7 +5,7 @@ version = "0.1.0"
 description = "Your Linear issues as a native Tern board: views, search, details, comments and edits."
 icon = "kanban"
 host = "host.luau"
-styles = ["styles/linear.css", "styles/detail.css"]
+styles = ["styles/linear.css", "styles/detail.css", "styles/project.css"]
 
 [[blocks]]
 id = "board"

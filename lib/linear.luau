@@ -895,6 +895,64 @@ function linear.projectsChanged(cfg: types.Config, filter: any, sinceIso: string
 	end, cb)
 end
 
+local function normalizeMilestone(raw: Json): types.ProjectMilestone?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local name = text(raw.name)
+	if id == nil or name == nil then
+		return nil
+	end
+	return {
+		id = id,
+		name = name,
+		status = text(raw.status) or "unstarted",
+		progress = math.clamp(number(raw.progress) or 0, 0, 1),
+		targetDate = text(raw.targetDate),
+		sortOrder = number(raw.sortOrder) or 0,
+	}
+end
+
+-- The project page's detail. Milestones come in the server's order (the caller sorts them); group labels are dropped.
+function linear.project(cfg: types.Config, id: string, cb: types.Callback<types.ProjectDetail>)
+	run(cfg, "Project", queries.Project, { id = id }, function(data: Json): types.ProjectDetail
+		local raw: Json = data.project
+		if type(raw) ~= "table" then
+			error(failure("notfound", "Linear could not find that project."))
+		end
+		local members: { types.User } = {}
+		for _, node in nodes(raw.members) do
+			local member = normalizeUser(node)
+			if member ~= nil then
+				table.insert(members, member)
+			end
+		end
+		local labels: { types.Label } = {}
+		for _, node in nodes(raw.labels) do
+			local label = normalizeLabel(node)
+			if label ~= nil and label.isGroup ~= true then
+				table.insert(labels, label)
+			end
+		end
+		local milestones: { types.ProjectMilestone } = {}
+		for _, node in nodes(raw.projectMilestones) do
+			local milestone = normalizeMilestone(node)
+			if milestone ~= nil then
+				table.insert(milestones, milestone)
+			end
+		end
+		return {
+			project = normalizeProject(raw),
+			content = text(raw.content) or "",
+			healthUpdatedAt = text(raw.healthUpdatedAt),
+			members = members,
+			labels = labels,
+			milestones = milestones,
+		}
+	end, cb)
+end
+
 local function sortComments(comments: { types.Comment }): { types.Comment }
 	local order: { [types.Comment]: number } = {}
 	for index, comment in comments do

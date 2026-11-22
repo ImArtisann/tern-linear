@@ -695,6 +695,60 @@ check(
 	model.projectStatusRank("backlog") == 1 and model.projectStatusRank("paused") == 4
 )
 
+-- project page
+
+local function milestone(id: string, name: string, sortOrder: number, targetDate: string?): types.ProjectMilestone
+	return { id = id, name = name, status = "unstarted", progress = 0, targetDate = targetDate, sortOrder = sortOrder }
+end
+
+local function milestoneNames(list: { types.ProjectMilestone }): string
+	local out: { string } = {}
+	for _, m in list do
+		table.insert(out, m.name)
+	end
+	return table.concat(out, " ")
+end
+
+local unsortedMilestones = {
+	milestone("m-launch", "Launch", 3, "2025-09-01"),
+	milestone("m-alpha", "Alpha", 1, "2025-08-01"),
+	milestone("m-undated", "Undated", 2, nil),
+	milestone("m-beta", "Beta", 2, "2025-08-15"),
+	milestone("m-zulu", "zulu", 4, "2025-07-01"),
+	milestone("m-echo", "echo", 4, "2025-07-01"),
+}
+check(
+	"milestones follow sortOrder, then target date (none last), then name",
+	milestoneNames(model.sortMilestones(unsortedMilestones)) == "Alpha Beta Undated Launch echo zulu"
+)
+check("sorting milestones does not mutate its input", unsortedMilestones[1].name == "Launch")
+check(
+	"milestone status labels",
+	model.milestoneStatusLabel("done") == "Done"
+		and model.milestoneStatusLabel("next") == "Next"
+		and model.milestoneStatusLabel("overdue") == "Overdue"
+		and model.milestoneStatusLabel("unstarted") == "Not started"
+		and model.milestoneStatusLabel("someday") == "Not started"
+)
+check(
+	"namesLabel caps the list with a count",
+	model.namesLabel({ "ada", "grace", "linus" }, 2) == "ada, grace +1"
+		and model.namesLabel({ "ada", "grace" }, 2) == "ada, grace"
+		and model.namesLabel({}, 3) == ""
+)
+check(
+	"projectTab accepts known tabs only",
+	model.projectTab("overview") == "overview" and model.projectTab("gantt") == nil and model.projectTab(nil) == nil
+)
+check("PROJECT_TABS starts with Overview", model.PROJECT_TABS[1].id == "overview")
+local tabCount = #model.PROJECT_TABS
+check(
+	"stepProjectTab wraps around the tab list",
+	model.stepProjectTab("overview", 1) == model.PROJECT_TABS[1 % tabCount + 1].id
+		and model.stepProjectTab("overview", -1) == model.PROJECT_TABS[tabCount].id
+		and model.stepProjectTab("overview", tabCount) == "overview"
+)
+
 if failures > 0 then
 	error(`{failures} model test(s) failed`)
 end

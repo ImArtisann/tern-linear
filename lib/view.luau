@@ -4,6 +4,8 @@
 
 local detail = require("./view_detail")
 local model = require("./model")
+local parts = require("./view_parts")
+local projectPage = require("./view_project")
 local types = require("./types")
 
 type BlockState = types.BlockState
@@ -32,39 +34,10 @@ local KEY_URL = "https://linear.app/settings/account/security"
 
 -- ─── Look-up tables ─────────────────────────────────────────────────────────
 
--- Linear's state colours cannot be inline, so a state type maps to the nearest tone.
-local STATE_TONES: { [string]: string } = {
-	triage = "info",
-	backlog = "muted",
-	unstarted = "neutral",
-	started = "warning",
-	completed = "success",
-	canceled = "muted",
-	duplicate = "muted",
-}
-
--- Project statuses map to tones by ProjectStatusType, like workflow states.
-local PROJECT_STATUS_TONES: { [string]: string } = {
-	backlog = "muted",
-	planned = "neutral",
-	started = "warning",
-	paused = "info",
-	completed = "success",
-	canceled = "muted",
-}
-
-local HEALTH_TONES: { [string]: string } = {
-	onTrack = "success",
-	atRisk = "warning",
-	offTrack = "error",
-}
-
-local PRIORITY_TONES: { [number]: string } = {
-	[1] = "error",
-	[2] = "warning",
-	[3] = "info",
-	[4] = "muted",
-}
+local STATE_TONES = parts.STATE_TONES
+local PROJECT_STATUS_TONES = parts.PROJECT_STATUS_TONES
+local HEALTH_TONES = parts.HEALTH_TONES
+local PRIORITY_TONES = parts.PRIORITY_TONES
 
 local SORT_COLUMNS: { { key: string, label: string } } = {
 	{ key = "identifier", label = "ID" },
@@ -113,25 +86,12 @@ local MIN_COLUMN_LINES = 8
 
 -- ─── Helpers ────────────────────────────────────────────────────────────────
 
-local function with(node: Node, props: { [string]: any }): Node
-	local merged: { [string]: any } = node.p or {}
-	for name, value in props do
-		merged[name] = value
-	end
-	node.p = merged
-	return node
-end
-
-local function compact(nodes: { Node? }, count: number): { Node }
-	local out: { Node } = {}
-	for index = 1, count do
-		local node = nodes[index]
-		if node ~= nil then
-			table.insert(out, node)
-		end
-	end
-	return out
-end
+local with = parts.with
+local compact = parts.compact
+local banner = parts.banner
+local statusDot = parts.statusDot
+local healthBadge = parts.healthBadge
+local syncedLabel = parts.syncedLabel
 
 local function selectedTeam(state: BlockState): Team?
 	if state.prefs.scope ~= "team" then
@@ -165,20 +125,6 @@ end
 
 local function viewerIdOf(state: BlockState): string?
 	return if state.viewer ~= nil then state.viewer.user.id else nil
-end
-
-local function syncedLabel(fetchedAt: number?, now: number): string
-	if fetchedAt == nil then
-		return "Refresh"
-	end
-	local iso = os.date("!%Y-%m-%dT%H:%M:%SZ", fetchedAt) :: string
-	local relative = model.relativeTime(iso, now)
-	if relative == "now" then
-		return "Synced just now"
-	elseif string.match(relative, "^%d+[mhd]$") ~= nil then
-		return `Synced {relative} ago`
-	end
-	return `Synced {relative}`
 end
 
 local function pluralIssues(count: number): string
@@ -595,27 +541,7 @@ local function projectFilterRow(state: BlockState, visibleCount: number): Node
 	return filterRow(state, { leadSelect(state), healthSelect(state) }, pluralProjects(visibleCount), truncatedAt)
 end
 
--- ─── Banners ────────────────────────────────────────────────────────────────
-
-local function banner(key: string, role: string, tone: string, icon: string, message: string): Node
-	return ui.node("row", { key = key, role = role, tone = tone, gap = "sm" }, {
-		ui.node("icon", { key = "icon", name = icon, tone = tone }),
-		ui.node("text", { key = "text", spans = { message }, grow = 1 }),
-	})
-end
-
 -- ─── Board ──────────────────────────────────────────────────────────────────
-
--- A status dot: an empty text node drawn by CSS per `mark` (the state or project status type).
-local function statusDot(tone: string, mark: string): Node
-	return ui.node("text", {
-		key = "dot",
-		role = "linear.state-dot",
-		tone = tone,
-		mark = mark,
-		spans = { "\u{00A0}" },
-	})
-end
 
 local function labelChips(issue: Issue): { Node }
 	local chips: { Node } = {}
@@ -776,18 +702,6 @@ local function teamKeys(project: Project): string
 	return table.concat(keys, " · ")
 end
 
-local function healthBadge(health: string?): Node?
-	local tone = if health ~= nil then HEALTH_TONES[health] else nil
-	if health == nil or tone == nil then
-		return nil
-	end
-	return with(ui.badge(model.healthLabel(health), tone), {
-		key = "health",
-		role = "linear.project-health",
-		mark = `health-{health}`,
-	})
-end
-
 local function projectCardFoot(project: Project, now: number): Node
 	local lead = project.lead
 	local target = project.targetDate
@@ -840,7 +754,7 @@ local function projectCard(project: Project, selectedId: string?, now: number): 
 		role = "linear.project-card",
 		gap = "xs",
 		mark = if project.id == selectedId then "selected" else nil,
-		actions = { click = `select-project={project.id}` },
+		actions = { click = `open-project={project.id}` },
 	}, {
 		head,
 		ui.node("text", {
@@ -1125,10 +1039,14 @@ end
 
 function view.render(state: BlockState, cx: BlockCx): BlockView
 	local children: { Node }
+	local page = if inProjects(state) then state.projectPage else nil
 	if state.phase == "setup" then
 		children = { setupCard(state) }
 	elseif state.phase == "loading" then
 		children = { loadingNode() }
+	elseif page ~= nil then
+		-- The project page replaces the list (top bar and filter row included).
+		children = projectPage.render(state, page, cx)
 	else
 		children = readyChildren(state, cx)
 	end

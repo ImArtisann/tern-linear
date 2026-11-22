@@ -1,5 +1,5 @@
 // Smoke test against the real Linear API (no mock).
-//   bun test/live-smoke.mjs            read-only: projects board and table, then the issue board, table, detail drawer
+//   bun test/live-smoke.mjs            read-only: projects board, table and a project page, then the issue board, table, detail drawer
 //   bun test/live-smoke.mjs --write    also creates, comments on and completes one issue
 //
 // It also sends the read-only project queries once directly and prints Linear's `x-complexity` for each
@@ -32,7 +32,8 @@ const MAX_COMPLEXITY = 10_000;
 
 /**
  * Sends each read-only project operation of lib/queries.luau once, with the variables the plugin uses, and returns
- * `{ operation, request, complexity, nodes }` per request. Throws on a GraphQL error or a cost above the cap.
+ * `{ operation, request, complexity, nodes }` per request. `Project` (the project page) asks for the first project of
+ * the unfiltered list. Throws on a GraphQL error or a cost above the cap.
  */
 async function measureComplexity(key) {
 	const docs = Object.fromEntries(
@@ -46,7 +47,7 @@ async function measureComplexity(key) {
 		["ProjectsChanged", { filter: active }, "change check, Active view"],
 	];
 	const results = [];
-	for (const [operation, variables, request] of requests) {
+	const send = async (operation, variables, request) => {
 		const response = await fetch(LINEAR_ENDPOINT, {
 			method: "POST",
 			headers: { "content-type": "application/json", authorization: key.startsWith("lin_oauth_") ? `Bearer ${key}` : key },
@@ -56,9 +57,19 @@ async function measureComplexity(key) {
 		if (body.errors?.length) throw new Error(`${operation}: ${body.errors[0].message}`);
 		const complexity = Number(response.headers.get("x-complexity"));
 		if (!(complexity <= MAX_COMPLEXITY)) throw new Error(`${operation}: complexity ${complexity} over ${MAX_COMPLEXITY}`);
-		const nodes = body.data.projects?.nodes?.length ?? body.data.organization?.projectStatuses?.length;
+		const nodes =
+			body.data.projects?.nodes?.length ??
+			body.data.organization?.projectStatuses?.length ??
+			body.data.project?.projectMilestones?.nodes?.length;
 		results.push({ operation, request, complexity, nodes });
+		return body.data;
+	};
+	let firstProject;
+	for (const [operation, variables, request] of requests) {
+		const data = await send(operation, variables, request);
+		if (operation === "Projects" && !variables.filter) firstProject = data.projects.nodes[0]?.id;
 	}
+	if (firstProject) await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
 	return results;
 }
 
@@ -156,6 +167,43 @@ async function scenario() {
 		await t.key("v");
 		await present(role("board"));
 		await t.key("1");
+	});
+
+	// Read-only: opens the first project of the Active view (else of the All view) on its page, then goes back.
+	await runner.step("project-page", async (label) => {
+		await waitFor(async () => (await t.wait(150), !(await exists(role("reloading")))), { what: "the Active view", timeout: 45_000, interval: 0 });
+		let allView = false;
+		if (!(await exists(role("project-card")))) {
+			allView = true;
+			await t.key("3");
+			await waitFor(async () => (await t.wait(150), !(await exists(role("reloading")))), { what: "the All view", timeout: 45_000, interval: 0 });
+		}
+		if (!(await exists(role("project-card")))) {
+			console.log("note: the workspace has no projects; the project page is skipped");
+			await t.key("1");
+			return;
+		}
+		await t.key("j");
+		await t.key("Enter");
+		await present(role("project-header"));
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("project-error"))) throw new Error(`project page error: ${(await t.text(role("project-error"))).slice(0, 300)}`);
+				return (await exists(role("project-description"))) || (await exists(role("project-description-empty")));
+			},
+			{ what: "the project detail", timeout: 45_000, interval: 0 },
+		);
+		if (await exists(role("error"))) throw new Error(`error banner: ${(await t.text(role("error"))).slice(0, 300)}`);
+		const milestones = ((await t.tree(role("milestone"))).nodes ?? []).length;
+		const described = await exists(role("project-description"));
+		console.log(`note: project page: ${described ? "with" : "without"} a description, ${milestones} milestones`);
+		report.projectPage = { described, milestones };
+		await runner.shot(label);
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await present(role("board"));
+		if (allView) await t.key("1");
 	});
 
 	await runner.step("project-query-complexity", async () => {

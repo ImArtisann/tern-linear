@@ -111,6 +111,33 @@ async function tableOrder() {
 /** The label of the focused pane (a web pane opened by `o` is labelled with the site's host). */
 const focusedLabel = async () => (await t.ctl("state")).focused?.label ?? "";
 
+const SELECTED_CARD = `${role("project-card")}[data-mark='selected']`;
+const projectNamed = (name) => mock.state().projects.find((project) => project.name === name);
+// Linear's milestone order is the sortOrder; the mock sends milestones highest sortOrder first.
+const DESKTOP_MILESTONES = "Alpha,Beta,Accessibility audit,Public launch";
+
+/** Milestone names on the project page, top to bottom. */
+const milestoneNames = async () =>
+	(await nodesOf(`${role("milestone")} ${role("milestone-name")}`)).map((node) => node.text).join(",");
+
+/** Waits for the project page of `name` with its detail loaded (the description or its empty state shows). */
+async function pageOpen(name) {
+	await present(role("project-header"));
+	await t.waitFor(role("project-name"), name);
+	await waitFor(async () => (await t.wait(150), (await exists(role("project-description"))) || exists(role("project-description-empty"))), {
+		what: `the detail of ${name}`,
+		interval: 0,
+	});
+}
+
+/** Leaves the project page with Escape; the list is back with `name` selected. */
+async function backToList(name) {
+	await t.key("Escape");
+	await absent(role("project-header"));
+	await present(role("bar"));
+	if (name) await t.waitFor(SELECTED_CARD, name);
+}
+
 let operations = []; // operation names the mock saw before the README run reset it
 let opened; // identifier of the issue the drawer showed in step 8
 let created; // the issue created in step 12
@@ -245,6 +272,182 @@ async function scenario() {
 			throw new Error(`the poll does not ask for newer projects: ${JSON.stringify(check.variables.filter)}`);
 		}
 		assertEqual(opsSince(before, "IssuesChanged").length, 0, "issue polls in projects mode");
+	});
+
+	// The project page. Board order of the Active view: Search revamp, Onboarding redesign, Sync engine v2, Desktop app.
+	await runner.step("project-page-enter", async (label) => {
+		await t.key("Escape");
+		await absent(SELECTED_CARD);
+		for (let i = 0; i < 4; i += 1) await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		const before = mark();
+		await t.key("Enter");
+		await pageOpen("Desktop app");
+		const [detail] = opsSince(before, "Project");
+		if (!detail) throw new Error("no Project request");
+		assertEqual(detail.variables.id, projectNamed("Desktop app").id, "project requested");
+		for (const listOnly of ["bar", "filters", "board", "table"]) {
+			if (await exists(role(listOnly))) throw new Error(`the project page shows linear.${listOnly}`);
+		}
+		await t.waitFor(role("project-status"), "In Progress");
+		await t.waitFor(role("project-header"), "On track");
+		await present(role("project-open-url"));
+		await present(role("project-refresh"));
+		const tabs = await nodesOf(`${role("project-tabs")} [data-role^='linear.project-tab-']`);
+		assertEqual(tabs.map((node) => node.text).join(","), "Overview", "project tabs");
+
+		await t.waitFor(role("project-summary"), "The native desktop client");
+		const doc = await t.text(role("project-description"));
+		for (const part of ["Why", "Tray icon with unread counts", "design spec", "old prototype"]) {
+			if (!doc.includes(part)) throw new Error(`the description lacks ${JSON.stringify(part)}: ${doc.slice(0, 300)}`);
+		}
+		assertEqual(await milestoneNames(), DESKTOP_MILESTONES, "milestones in Linear's order");
+		const rows = (await nodesOf(role("milestone"))).map((node) => node.text ?? "");
+		const row = (name) => rows.find((text) => text.includes(name)) ?? "";
+		for (const [name, parts] of [
+			["Alpha", ["Done", "100%"]],
+			["Beta", ["Next", "45%"]],
+			["Accessibility audit", ["Overdue", "30%"]],
+			["Public launch", ["Not started", "0%"]],
+		]) {
+			for (const part of parts) if (!row(name).includes(part)) throw new Error(`milestone ${name} lacks ${part}: ${row(name)}`);
+		}
+		const props = await t.text(role("project-props"));
+		for (const part of ["Lead", "ada", "Members", "ada, grace", "Engineering, Design", "High", "62%", "updated 3d ago", "Platform", "Customer request"]) {
+			if (!props.includes(part)) throw new Error(`the properties lack ${JSON.stringify(part)}: ${props.slice(0, 400)}`);
+		}
+		if (props.includes("Initiatives")) throw new Error("the properties show a group label");
+		await present(`${role("project-overview")}[data-mark='wide']`);
+		await runner.shot(label);
+		await runner.shot("project-overview");
+
+		// A narrow pane stacks the properties above the content.
+		await t.ctl("size 760 900");
+		await present(`${role("project-overview")}[data-mark='stacked']`);
+		await runner.shot("project-overview-narrow");
+		await t.ctl("size 1440 900");
+		await present(`${role("project-overview")}[data-mark='wide']`);
+	});
+
+	await runner.step("project-page-keys", async () => {
+		await t.click(role("project-tab-overview"));
+		await t.key("Tab");
+		await t.key("Shift+Tab");
+		await present(role("project-overview"));
+		await settle();
+		const before = mark();
+		for (const key of ["j", "k", "h", "l", "v", "1", "3", "m", "t", "/", "n", "x"]) await t.key(key);
+		await t.wait(300);
+		await present(role("project-header"));
+		if (await exists(role("search"))) throw new Error("a list key closed the project page");
+		assertEqual(opsSince(before, "Projects").length, 0, "list reloads from keys on the page");
+		await t.key("y");
+		await t.waitFor(role("notice"), "Copied link to Desktop app");
+	});
+
+	await runner.step("project-page-back", async (label) => {
+		await backToList("Desktop app");
+		await present(role("board"));
+		assertEqual(await columnTitles(), "Planned,In Progress,Paused", "columns after Back");
+		await t.waitFor(role("team-select"), "All projects");
+		await runner.shot(label);
+		await runner.shot("project-back-list");
+
+		// A card click opens the page; the Back button and Backspace return to the list.
+		await t.click(SELECTED_CARD);
+		await pageOpen("Desktop app");
+		await t.click(role("project-back"));
+		await absent(role("project-header"));
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await t.key("Enter");
+		await pageOpen("Desktop app");
+		await t.key("Backspace");
+		await absent(role("project-header"));
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+	});
+
+	await runner.step("project-page-empty", async (label) => {
+		await t.key("v");
+		await present(role("table"));
+		await search("onboarding");
+		await waitFor(async () => (await t.wait(150), (await tableOrder()) === "Onboarding redesign"), {
+			what: "the table filtered to Onboarding redesign",
+			interval: 0,
+		});
+		// Activating a table row (double-click) opens the page.
+		await t.dblclick(`${role("table")} .sf-tbl-row:not(.head)`);
+		await pageOpen("Onboarding redesign");
+		await t.waitFor(role("project-description-empty"), "No description");
+		await t.waitFor(role("milestones-empty"), "No milestones");
+		await t.waitFor(role("project-props"), "No update");
+		await runner.shot(label);
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await present(role("table"));
+		await clearSearch("onboarding".length);
+		await t.key("v");
+		await present(role("board"));
+		await t.waitFor(SELECTED_CARD, "Onboarding redesign");
+	});
+
+	// While the page is open the poll tick reloads its detail; the list's change check pauses.
+	await runner.step("project-page-poll", async () => {
+		await t.key("Enter");
+		await pageOpen("Onboarding redesign");
+		await settle();
+		const before = mark();
+		await t.wait(31_000);
+		await waitFor(() => opsSince(before, "Project").length > 0, { what: "a Project reload on the poll tick" });
+		assertEqual(opsSince(before, "ProjectsChanged").length, 0, "list polls while the page is open");
+		await present(role("project-header"));
+	});
+
+	// `plugins fixtures` re-creates the block from `save`: the open page comes back.
+	await runner.step("project-page-restore", async (label) => {
+		await settle();
+		const before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Viewer").length > 0, { what: "the block to restart" });
+		await pageOpen("Onboarding redesign");
+		if (opsSince(before, "Project").length === 0) throw new Error("no Project request after restoring the page");
+		await runner.shot(label);
+		await backToList("Onboarding redesign");
+	});
+
+	await runner.step("project-page-notfound", async (label) => {
+		await search("public");
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Public API");
+		await t.key("Enter");
+		await pageOpen("Public API");
+		mock.deleteProject(projectNamed("Public API").id);
+		await t.key("r");
+		await absent(role("project-header"));
+		await t.waitFor(role("notice"), "Project not found");
+		await present(role("board"));
+		await runner.shot(label);
+		await clearSearch("public".length);
+	});
+
+	await runner.step("project-page-restore-missing", async (label) => {
+		await t.key("3");
+		await see("Billing migration");
+		await search("billing");
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Billing migration");
+		await t.key("Enter");
+		await pageOpen("Billing migration");
+		await settle();
+		mock.deleteProject(projectNamed("Billing migration").id);
+		const before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Project").length > 0, { what: "the restored page's Project request" });
+		await t.waitFor(role("notice"), "Project not found");
+		await present(role("board"));
+		if (await exists(role("project-header"))) throw new Error("the page of a missing project stayed open");
+		await runner.shot(label);
+		await t.key("1");
+		await see("Desktop app");
 	});
 
 	// From here on the original issue scenario runs in issues mode.
@@ -492,7 +695,7 @@ async function scenario() {
 		await present(role("project-card"));
 	});
 
-	// Last in this Tern: a successful `o` opens a web pane that takes the focus.
+	// Last in this Tern: a successful `o` (here on the project page) opens a web pane that takes the focus.
 	await runner.step("projects-select-open", async (label) => {
 		const selected = `${role("project-card")}[data-mark='selected']`;
 		await t.key("Escape");
@@ -503,14 +706,17 @@ async function scenario() {
 		await t.waitFor(selected, "Onboarding redesign");
 		await t.key("l");
 		await t.waitFor(selected, "Sync engine v2");
-		await t.key("Enter");
-		await t.wait(300);
-		if (await exists(role("drawer"))) throw new Error("Enter opened a drawer in projects mode");
 		await t.key("y");
 		await t.waitFor(role("notice"), "Copied link to Sync engine v2");
+		// A click on another card selects it and opens its page.
 		await t.click(`${role("project-card")}:not([data-mark='selected'])`);
-		await waitFor(async () => (await t.wait(150), (await nodesOf(selected)).length === 1 && !(await t.text(selected)).includes("Sync engine v2")), {
-			what: "a click to select another card",
+		await present(role("project-header"));
+		const clicked = (await nodesOf(role("project-name")))[0]?.text ?? "";
+		if (clicked.includes("Sync engine v2")) throw new Error("the click opened the previously selected project");
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await waitFor(async () => (await t.wait(150), (await nodesOf(selected)).length === 1 && (await t.text(selected)).includes(clicked)), {
+			what: "the clicked card to stay selected",
 			interval: 0,
 		});
 
@@ -534,6 +740,8 @@ async function scenario() {
 		await t.waitFor(selected, PROGRESS_DESC.split(",")[0]);
 		await runner.shot(label);
 
+		await t.key("Enter");
+		await pageOpen(PROGRESS_DESC.split(",")[0]);
 		await t.key("o");
 		await waitFor(async () => (await t.wait(150), (await focusedLabel()).includes("linear.app")), {
 			what: "a linear.app pane opened by o",
@@ -561,6 +769,13 @@ async function scenario() {
 		await runner.shot("readme-projects-table");
 		await t.key("v");
 		await present(role("board"));
+		for (let i = 0; i < 4; i += 1) await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await t.key("Enter");
+		await pageOpen("Desktop app");
+		await runner.shot("readme-project");
+		await t.key("Escape");
+		await absent(role("project-header"));
 
 		await t.key("i");
 		await see("Crash when opening large workspace");
