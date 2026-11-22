@@ -66,6 +66,12 @@ type Run = {
 	goneProjects: { [string]: number },
 	-- A notice reported while the first load runs (the loading view shows none); it starts once the list shows.
 	readyNotice: string?,
+	-- The same for the Issues tab's requests (loads and change checks).
+	issuesToken: number,
+	-- An Issues tab request is in flight; the poll tick waits for it.
+	issuesInFlight: boolean,
+	-- tern.now() of the Issues tab's last successful load (its 5-minute full reload).
+	issuesFullAt: number,
 	-- What the in-flight foreground request is: only loads may supersede loads.
 	fgKind: ("load" | "mutation")?,
 	-- tern.now() of the last successful board load.
@@ -230,7 +236,32 @@ local function emptyProjects(): types.ProjectsState
 	}
 end
 
--- A project page with nothing loaded yet: the detail loads at once, the activity when its tab is first shown.
+-- The project page's Issues tab: its state, requests, polling and leaving it (one table: the controller's top level is
+-- close to Luau's 200-local limit). The requests are defined with the project page below.
+local projectIssues = {}
+
+-- The Issues tab before its first show: nothing loaded, the Active view, no filters, newest first.
+function projectIssues.new(): types.ProjectIssuesState
+	return {
+		items = {},
+		truncated = false,
+		fetchedAt = nil,
+		maxUpdatedAt = nil,
+		loading = false,
+		error = nil,
+		view = "active",
+		priority = nil,
+		assignee = nil,
+		labelId = nil,
+		query = text.new(""),
+		sort = "updated",
+		sortAsc = false,
+		selectedId = nil,
+	}
+end
+
+-- A project page with nothing loaded yet: the detail loads at once, the activity and the issues when their tab is
+-- first shown.
 local function newPage(id: string, tab: types.ProjectTab): types.ProjectPageState
 	return {
 		projectId = id,
@@ -245,6 +276,7 @@ local function newPage(id: string, tab: types.ProjectTab): types.ProjectPageStat
 		activityError = nil,
 		activityFetchedAt = nil,
 		expandedUpdates = {},
+		issues = projectIssues.new(),
 	}
 end
 
@@ -296,8 +328,22 @@ local function newState(cx: BlockCx, prefs: Prefs): BlockState
 	}
 end
 
+-- ─── The issue list on screen ───────────────────────────────────────────────
+-- Issues mode's list and selection (BlockState), or the project page's Issues tab's (ProjectIssuesState) while that
+-- tab is on screen (model.issueList, model.selectedIssueId). The drawer, its inputs and the issue actions work on
+-- whichever is on screen; leaving the tab closes the drawer, so a drawer always belongs to the list on screen.
+
+local function setSelectedId(state: BlockState, id: string?)
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		tab.selectedId = id
+	else
+		state.selectedId = id
+	end
+end
+
 local function findIssue(state: BlockState, id: string): Issue?
-	for _, issue in state.issues do
+	for _, issue in model.issueList(state) do
 		if issue.id == id then
 			return issue
 		end
@@ -310,7 +356,7 @@ local function findIssue(state: BlockState, id: string): Issue?
 end
 
 local function selectedIssue(state: BlockState): Issue?
-	local id = state.selectedId
+	local id = model.selectedIssueId(state)
 	if id == nil then
 		return nil
 	end
@@ -348,8 +394,12 @@ local function inProjects(state: BlockState): boolean
 	return state.prefs.mode == "projects"
 end
 
--- The search text of the active mode.
+-- The search text on screen: issues mode's, projects mode's list's, or the Issues tab's.
 local function activeQuery(state: BlockState): Field
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		return tab.query
+	end
 	return if inProjects(state) then state.projects.query else state.query
 end
 
@@ -409,6 +459,10 @@ local function focusTarget(state: BlockState): string?
 			return nil
 		end
 		return view.fieldId("form:" .. field.name)
+	end
+	-- The Issues tab has its own search field.
+	if focus == "search" and model.issuesTab(state) ~= nil then
+		return view.fieldId("project-search")
 	end
 	return view.fieldId(focus)
 end
@@ -508,9 +562,21 @@ end
 
 local function clearSelection(state: BlockState, run: Run)
 	closeDrawer(state, run)
-	state.selectedId = nil
+	setSelectedId(state, nil)
 	state.detail = nil
 	text.set(state.comment, "")
+end
+
+-- The drawer, its link input and edit form belong to the Issues tab while it is on screen: leaving the tab (another
+-- tab, Back, a closed page) closes them. The tab keeps its selection.
+function projectIssues.leave(state: BlockState, run: Run)
+	if model.issuesTab(state) == nil then
+		return
+	end
+	closeDrawer(state, run)
+	if state.focus == "search" then
+		setFocus(state, nil)
+	end
 end
 
 local function clearProjectSelection(state: BlockState)
@@ -529,6 +595,8 @@ local function resetData(state: BlockState, run: Run)
 	supersedeDetail(state, run)
 	run.pageToken += 1
 	run.activityToken += 1
+	run.issuesToken += 1
+	run.issuesInFlight = false
 	state.projectPage = nil
 	run.editAfterLoad = nil
 	state.viewer = nil
@@ -616,9 +684,11 @@ local function mergeDetail(old: Issue, fresh: Issue): Issue
 	return merged
 end
 
+-- Applies a mutation's issue to the list on screen (and the drawer's detail).
 local function applyIssue(state: BlockState, issue: Issue, insertIfNew: boolean)
-	if not replaceIssue(state.issues, issue) and insertIfNew then
-		table.insert(state.issues, 1, issue)
+	local list = model.issueList(state)
+	if not replaceIssue(list, issue) and insertIfNew then
+		table.insert(list, 1, issue)
 	end
 	local detail = state.detail
 	if detail ~= nil and detail.id == issue.id then
@@ -638,8 +708,23 @@ local function commitIssues(state: BlockState, run: Run, page: types.IssuePage)
 	end
 	state.maxUpdatedAt = newest
 	run.lastFullAt = tern.now()
+	-- Issues mode's selection; the Issues tab may be on screen when a background reload of issues mode lands.
 	local id = state.selectedId
-	if id ~= nil and findIssue(state, id) == nil and not state.detailLoading then
+	if id == nil or state.detailLoading then
+		return
+	end
+	for _, issue in state.issues do
+		if issue.id == id then
+			return
+		end
+	end
+	local detail = state.detail
+	if detail ~= nil and detail.id == id then
+		return
+	end
+	if model.issuesTab(state) ~= nil then
+		state.selectedId = nil
+	else
 		clearSelection(state, run)
 	end
 end
@@ -691,7 +776,7 @@ local openEditForm: (state: BlockState) -> ()
 
 local function fetchDetail(state: BlockState, run: Run)
 	local cfg = run.cfg
-	local id = state.selectedId
+	local id = model.selectedIssueId(state)
 	if cfg == nil or id == nil then
 		return
 	end
@@ -706,7 +791,7 @@ local function fetchDetail(state: BlockState, run: Run)
 		if issue ~= nil then
 			state.error = nil
 			state.detail = issue
-			replaceIssue(state.issues, issue)
+			replaceIssue(model.issueList(state), issue)
 			if live.editAfterLoad == id then
 				live.editAfterLoad = nil
 				openEditForm(state)
@@ -727,7 +812,7 @@ end
 local function requestDetail(state: BlockState, run: Run, delayMs: number)
 	cancelTimer(run.detailTimer)
 	run.detailTimer = nil
-	local id = state.selectedId
+	local id = model.selectedIssueId(state)
 	if id == nil then
 		return
 	end
@@ -748,16 +833,16 @@ local function requestDetail(state: BlockState, run: Run, delayMs: number)
 			return
 		end
 		live.detailTimer = nil
-		if state.selectedId == id and state.drawerOpen then
+		if model.selectedIssueId(state) == id and state.drawerOpen then
 			fetchDetail(state, live)
 		end
 	end)
 end
 
 local function selectIssue(state: BlockState, run: Run, id: string, open: boolean, delayMs: number)
-	local changed = state.selectedId ~= id
+	local changed = model.selectedIssueId(state) ~= id
 	if changed then
-		state.selectedId = id
+		setSelectedId(state, id)
 		text.set(state.comment, "")
 		dropDrawerInputs(state, run)
 		supersedeDetail(state, run)
@@ -850,10 +935,14 @@ reloadData = function(state: BlockState, run: Run)
 	end
 end
 
--- Authoritative reload after a mutation: the board, and the drawer if open.
+-- Authoritative reload after a mutation: the list on screen (issues mode's or the Issues tab's), and the drawer if open.
 local function reloadAfterMutation(state: BlockState, run: Run)
-	reloadIssues(state, run)
-	if state.drawerOpen and state.selectedId ~= nil then
+	if model.issuesTab(state) ~= nil then
+		projectIssues.fetch(state, run, false)
+	elseif not inProjects(state) then
+		reloadIssues(state, run)
+	end
+	if state.drawerOpen and model.selectedIssueId(state) ~= nil then
 		requestDetail(state, run, 0)
 	end
 end
@@ -1133,8 +1222,11 @@ local function closeProjectPage(state: BlockState, run: Run)
 	if page == nil then
 		return
 	end
+	projectIssues.leave(state, run)
 	run.pageToken += 1
 	run.activityToken += 1
+	run.issuesToken += 1
+	run.issuesInFlight = false
 	state.projectPage = nil
 	if findProject(state, page.projectId) ~= nil then
 		state.projects.selectedId = page.projectId
@@ -1271,19 +1363,126 @@ local function fetchActivity(state: BlockState, run: Run, mode: "shown" | "poll"
 	end)
 end
 
--- Shows a tab; the Activity tab loads the first time it is shown (and after a failed first load).
+-- ─── Project page: the Issues tab ───────────────────────────────────────────
+-- The project's issues (model.projectIssueFilter), kept in `ProjectPageState.issues`, never in issues mode's list.
+-- Own token, never `busy`, like the activity; a result for a superseded token or a closed page is dropped.
+
+function projectIssues.commit(state: BlockState, run: Run, tab: types.ProjectIssuesState, result: types.IssuePage)
+	tab.items = result.issues
+	tab.truncated = result.truncated
+	tab.fetchedAt = os.time()
+	local updatedAts: { string } = {}
+	for _, issue in result.issues do
+		table.insert(updatedAts, issue.updatedAt)
+	end
+	tab.maxUpdatedAt = newestUpdate(updatedAts)
+	run.issuesFullAt = tern.now()
+	-- Like issues mode: a selection that left the list goes, unless the drawer still holds or loads it.
+	local id = tab.selectedId
+	if id == nil or state.detailLoading then
+		return
+	end
+	for _, issue in tab.items do
+		if issue.id == id then
+			return
+		end
+	end
+	local detail = state.detail
+	if detail ~= nil and detail.id == id then
+		return
+	end
+	if model.issuesTab(state) == tab then
+		clearSelection(state, run)
+	else
+		tab.selectedId = nil
+	end
+end
+
+-- A full load of the open page's Issues tab. `shown` (first show, view change, `r`, Refresh) shows the loading row;
+-- poll and post-mutation reloads stay silent. Failures show in the tab and keep what it had.
+function projectIssues.fetch(state: BlockState, run: Run, shown: boolean)
+	local page = state.projectPage
+	local cfg = run.cfg
+	if page == nil or cfg == nil then
+		return
+	end
+	local tab = page.issues
+	run.issuesToken += 1
+	local token = run.issuesToken
+	run.issuesInFlight = true
+	if shown then
+		tab.loading = true
+	end
+	linear.issues(cfg, model.projectIssueFilter(page.projectId, tab.view), function(result, err)
+		local live = liveRun(state)
+		if live == nil or live.issuesToken ~= token or state.projectPage ~= page then
+			return
+		end
+		live.issuesInFlight = false
+		tab.loading = false
+		if result ~= nil then
+			projectIssues.commit(state, live, tab, result)
+			tab.error = nil
+		else
+			fail(state, err or unknownError(), function(message: string)
+				tab.error = message
+			end)
+		end
+		state.cx:render()
+	end)
+end
+
+-- The tab's change check (IssuesChanged under its filter): something newer than its newest issue reloads it.
+function projectIssues.check(state: BlockState, run: Run)
+	local page = state.projectPage
+	local cfg = run.cfg
+	if page == nil or cfg == nil then
+		return
+	end
+	local tab = page.issues
+	run.issuesToken += 1
+	local token = run.issuesToken
+	run.issuesInFlight = true
+	local filter = model.projectIssueFilter(page.projectId, tab.view)
+	linear.changedSince(cfg, filter, tab.maxUpdatedAt, function(newest, err)
+		local live = liveRun(state)
+		if live == nil or live.issuesToken ~= token or state.projectPage ~= page then
+			return
+		end
+		live.issuesInFlight = false
+		if err ~= nil then
+			fail(state, err, function(message: string)
+				tab.error = message
+			end)
+		else
+			local known = tab.maxUpdatedAt
+			if newest ~= nil and (known == nil or newest > known) then
+				projectIssues.fetch(state, live, false)
+			end
+		end
+		state.cx:render()
+	end)
+end
+
+-- Shows a tab; the Activity and Issues tabs load the first time they are shown (and after a failed first load).
+-- Leaving the Issues tab closes its drawer.
 local function selectProjectTab(state: BlockState, run: Run, tab: types.ProjectTab?)
 	local page = state.projectPage
 	if page == nil or tab == nil then
 		return
 	end
+	if tab ~= page.tab then
+		projectIssues.leave(state, run)
+	end
 	page.tab = tab
 	if tab == "activity" and page.activity == nil and not page.activityLoading then
 		fetchActivity(state, run, "shown")
+	elseif tab == "issues" and page.issues.fetchedAt == nil and not page.issues.loading then
+		projectIssues.fetch(state, run, true)
 	end
 end
 
--- `r` / Refresh on the page: reloads the tab on screen.
+-- `r` / Refresh on the page: reloads the tab on screen (on the Issues tab, also the open drawer's issue).
 local function refreshProjectTab(state: BlockState, run: Run)
 	local page = state.projectPage
 	if page == nil then
@@ -1291,8 +1490,29 @@ local function refreshProjectTab(state: BlockState, run: Run)
 	end
 	if page.tab == "activity" then
 		fetchActivity(state, run, "shown")
+	elseif page.tab == "issues" then
+		projectIssues.fetch(state, run, true)
+		if state.drawerOpen and model.selectedIssueId(state) ~= nil then
+			requestDetail(state, run, 0)
+		end
 	else
 		fetchProjectPage(state, run, true)
+	end
+end
+
+-- The poll tick on the Issues tab: a full reload before the first load and every FULL_RELOAD_MS, else the change check;
+-- the open drawer's issue reloads beside it.
+function projectIssues.poll(state: BlockState, run: Run, page: types.ProjectPageState)
+	local tab = page.issues
+	if not run.issuesInFlight then
+		if tab.fetchedAt == nil or tern.now() - run.issuesFullAt >= FULL_RELOAD_MS then
+			projectIssues.fetch(state, run, false)
+		else
+			projectIssues.check(state, run)
+		end
+	end
+	if state.drawerOpen and tab.selectedId ~= nil and not state.detailLoading then
+		requestDetail(state, run, 0)
 	end
 end
 
@@ -1325,7 +1545,7 @@ local function tick(state: BlockState, run: Run)
 		return
 	end
 	-- While the project page is open the list's polling pauses; the page's detail reloads on the same tick, and the
-	-- activity too while its tab is shown.
+	-- activity or the Issues tab's list (and its drawer) too while their tab is shown.
 	local page = if inProjects(state) then state.projectPage else nil
 	if page ~= nil then
 		if not page.loading then
@@ -1333,6 +1553,8 @@ local function tick(state: BlockState, run: Run)
 		end
 		if page.tab == "activity" and not page.activityLoading and not page.activityPaging then
 			fetchActivity(state, run, "poll")
+		elseif page.tab == "issues" then
+			projectIssues.poll(state, run, page)
 		end
 		return
 	end
@@ -1341,7 +1563,7 @@ local function tick(state: BlockState, run: Run)
 	else
 		checkForChanges(state, run)
 	end
-	if state.drawerOpen and state.selectedId ~= nil and not state.detailLoading then
+	if state.drawerOpen and model.selectedIssueId(state) ~= nil and not state.detailLoading then
 		requestDetail(state, run, 0)
 	end
 end
@@ -1424,12 +1646,17 @@ local function toggleClosed(state: BlockState, issue: Issue)
 	end
 end
 
+-- `[` / `]`: the previous/next column's state. Issues mode steps through the board's columns (model.adjacentState);
+-- the Issues tab's board has one column per state type, so it steps by type within the issue's own team.
 local function moveAdjacent(state: BlockState, run: Run, issue: Issue, delta: number)
 	local team = issueTeam(state, issue)
 	if team == nil then
 		return
 	end
-	local target = model.adjacentState(team, issue, delta, state.prefs.view)
+	local tab = model.issuesTab(state)
+	local target = if tab ~= nil
+		then model.adjacentTypeState(team, issue, delta, tab.view)
+		else model.adjacentState(team, issue, delta, state.prefs.view)
 	if target == nil then
 		setNotice(state, run, if delta < 0 then "Already in the first column" else "Already in the last column")
 		return
@@ -1467,7 +1694,7 @@ local function setPriority(state: BlockState, issue: Issue, priority: number)
 end
 
 local function submitComment(state: BlockState)
-	local id = state.selectedId
+	local id = model.selectedIssueId(state)
 	local body = text.trimmed(state.comment)
 	if id == nil or body == "" then
 		return
@@ -1475,7 +1702,7 @@ local function submitComment(state: BlockState)
 	runMutation(state, nil, function(cfg: types.Config, done: types.Callback<types.Comment>)
 		linear.createComment(cfg, id, body, done)
 	end, function(comment: types.Comment, run: Run)
-		if state.selectedId == id then
+		if model.selectedIssueId(state) == id then
 			if text.trimmed(state.comment) == body then
 				text.set(state.comment, "")
 			end
@@ -1504,7 +1731,7 @@ end
 -- ─── Relations ──────────────────────────────────────────────────────────────
 
 local function openLink(state: BlockState, mode: "blocked-by" | "blocks" | "related")
-	if state.selectedId == nil or not state.drawerOpen then
+	if model.selectedIssueId(state) == nil or not state.drawerOpen then
 		return
 	end
 	state.link = { mode = mode, field = text.new(""), error = nil }
@@ -1520,7 +1747,7 @@ end
 
 local function submitLink(state: BlockState)
 	local link = state.link
-	local selectedId = state.selectedId
+	local selectedId = model.selectedIssueId(state)
 	if link == nil or selectedId == nil then
 		return
 	end
@@ -1828,7 +2055,7 @@ end
 
 openEditForm = function(state: BlockState)
 	local detail = state.detail
-	if state.form ~= nil or detail == nil or detail.id ~= state.selectedId then
+	if state.form ~= nil or detail == nil or detail.id ~= model.selectedIssueId(state) then
 		return
 	end
 	local team = teamById(state, detail.teamId)
@@ -1852,7 +2079,7 @@ end
 
 -- `e`/`edit`: the form needs the full issue, so wait for the detail when it is missing.
 local function beginEdit(state: BlockState, run: Run)
-	local id = state.selectedId
+	local id = model.selectedIssueId(state)
 	if id == nil or state.form ~= nil then
 		return
 	end
@@ -2036,19 +2263,37 @@ end
 
 -- ─── Navigation and filters ─────────────────────────────────────────────────
 
+-- The list on screen after its client filters: issues mode's (Prefs) or the Issues tab's.
 local function visibleIssues(state: BlockState): { Issue }
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		return model.visible(tab.items, tab, tab.query.text, viewerId(state))
+	end
 	return model.visible(state.issues, state.prefs, state.query.text, viewerId(state))
+end
+
+-- The board columns on screen: issues mode's (team states or state types) or the Issues tab's (state types).
+local function issueColumns(state: BlockState, visible: { Issue }): { model.Column }
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		return model.typeColumns(visible, tab.view)
+	end
+	return model.columns(visible, state.prefs, scopeTeam(state))
 end
 
 -- The order the active layout renders issues in.
 local function orderedIssues(state: BlockState): { Issue }
 	local visible = visibleIssues(state)
 	if state.prefs.layout == "table" then
+		local tab = model.issuesTab(state)
+		if tab ~= nil then
+			return model.sortTable(visible, tab.sort, tab.sortAsc)
+		end
 		return model.sortTable(visible, state.prefs.sort, state.prefs.sortAsc)
 	end
-	-- Board: the cards' order, column by column (mine scope re-sorts each column by priority).
+	-- Board: the cards' order, column by column (type columns re-sort each column by priority).
 	local ordered: { Issue } = {}
-	for _, column in model.columns(visible, state.prefs, scopeTeam(state)) do
+	for _, column in issueColumns(state, visible) do
 		for _, issue in column.issues do
 			table.insert(ordered, issue)
 		end
@@ -2061,11 +2306,12 @@ local function moveSelection(state: BlockState, run: Run, delta: number): boolea
 	for _, issue in orderedIssues(state) do
 		table.insert(ids, issue.id)
 	end
-	local target = model.steppedId(ids, state.selectedId, delta)
+	local selected = model.selectedIssueId(state)
+	local target = model.steppedId(ids, selected, delta)
 	if target == nil then
 		return false
 	end
-	if target ~= state.selectedId then
+	if target ~= selected then
 		selectIssue(state, run, target, false, DETAIL_DEBOUNCE_MS)
 	end
 	return true
@@ -2077,14 +2323,14 @@ local function moveColumn(state: BlockState, run: Run, delta: number): boolean
 		return false
 	end
 	local columns: { { string } } = {}
-	for _, column in model.columns(visibleIssues(state), state.prefs, scopeTeam(state)) do
+	for _, column in issueColumns(state, visibleIssues(state)) do
 		local ids: { string } = {}
 		for _, issue in column.issues do
 			table.insert(ids, issue.id)
 		end
 		table.insert(columns, ids)
 	end
-	local target = model.adjacentColumnId(columns, state.selectedId, delta)
+	local target = model.adjacentColumnId(columns, model.selectedIssueId(state), delta)
 	if target == nil then
 		return false
 	end
@@ -2124,7 +2370,7 @@ local function selectProject(state: BlockState, id: string)
 	end
 end
 
-local function moveProjectSelection(state: BlockState, delta: number): boolean
+local function moveProjectSelection(state: BlockState, _run: Run, delta: number): boolean
 	local ids: { string } = {}
 	for _, project in orderedProjects(state) do
 		table.insert(ids, project.id)
@@ -2137,7 +2383,7 @@ local function moveProjectSelection(state: BlockState, delta: number): boolean
 	return true
 end
 
-local function moveProjectColumn(state: BlockState, delta: number): boolean
+local function moveProjectColumn(state: BlockState, _run: Run, delta: number): boolean
 	if state.prefs.layout ~= "board" then
 		return false
 	end
@@ -2194,6 +2440,15 @@ end
 
 local function setView(state: BlockState, run: Run, value: any)
 	local parsed: ("active" | "backlog" | "all")? = parse.view(value)
+	-- The Issues tab's view is its own server filter: a shown reload of the tab, never `busy`.
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		if parsed ~= nil and parsed ~= tab.view then
+			tab.view = parsed
+			projectIssues.fetch(state, run, true)
+		end
+		return
+	end
 	local prefs = state.prefs
 	local currentView = if inProjects(state) then prefs.projectView else prefs.view
 	if parsed == nil or parsed == currentView or not canReload(state, run) then
@@ -2283,33 +2538,33 @@ local function nextProjectTeam(state: BlockState, run: Run): boolean
 	return true
 end
 
--- Same key toggles direction; a new key starts ascending, except "updated" (newest first).
+-- The table sort on screen: the Issues tab's, projects mode's or issues mode's.
 local function setSort(state: BlockState, key: string)
 	local prefs = state.prefs
-	if inProjects(state) then
-		if not PROJECT_SORT_KEYS[key] then
-			return
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		if SORT_KEYS[key] then
+			tab.sort, tab.sortAsc = model.nextSort(tab.sort, tab.sortAsc, key)
 		end
-		if prefs.projectSort == key then
-			prefs.projectSortAsc = not prefs.projectSortAsc
-		else
-			prefs.projectSort = key
-			prefs.projectSortAsc = key ~= "updated"
+	elseif inProjects(state) then
+		if PROJECT_SORT_KEYS[key] then
+			prefs.projectSort, prefs.projectSortAsc = model.nextSort(prefs.projectSort, prefs.projectSortAsc, key)
 		end
-		return
-	end
-	if not SORT_KEYS[key] then
-		return
-	end
-	if prefs.sort == key then
-		prefs.sortAsc = not prefs.sortAsc
-	else
-		prefs.sort = key
-		prefs.sortAsc = key ~= "updated"
+	elseif SORT_KEYS[key] then
+		prefs.sort, prefs.sortAsc = model.nextSort(prefs.sort, prefs.sortAsc, key)
 	end
 end
 
+-- The client filters and search on screen.
 local function clearFilters(state: BlockState)
+	local tab = model.issuesTab(state)
+	if tab ~= nil then
+		tab.priority = nil
+		tab.assignee = nil
+		tab.labelId = nil
+		text.set(tab.query, "")
+		return
+	end
 	if inProjects(state) then
 		state.prefs.projectLead = nil
 		state.prefs.projectHealth = nil
@@ -2583,30 +2838,44 @@ local ACTIONS: { [string]: ActionHandler } = {
 	end,
 }
 
--- Actions that only apply in one mode; a stale click from the other mode is ignored. Unlisted: both modes.
-local ACTION_MODES: { [string]: Mode } = {
+-- Where an action or select applies: "issues" (issues mode only), "projects" (projects mode only) or "issue" (an
+-- issue list is on screen: issues mode, or the project page's Issues tab). A stale event from elsewhere is ignored.
+type Gate = Mode | "issue"
+
+local function gateOpen(state: BlockState, gate: Gate?): boolean
+	if gate == nil then
+		return true
+	elseif gate == "issue" then
+		return not inProjects(state) or model.issuesTab(state) ~= nil
+	end
+	return gate == state.prefs.mode
+end
+
+-- Unlisted actions apply in both modes. The drawer's and the selected issue's actions are "issue"; creating issues
+-- and the issue scope stay in issues mode.
+local ACTION_MODES: { [string]: Gate } = {
 	["scope"] = "issues",
 	["team"] = "issues",
 	["focus-team"] = "issues",
-	["select"] = "issues",
-	["close-detail"] = "issues",
-	["open-url"] = "issues",
-	["copy-id"] = "issues",
-	["copy-branch"] = "issues",
-	["set-state"] = "issues",
-	["assign-me"] = "issues",
-	["unassign"] = "issues",
-	["close-issue"] = "issues",
-	["reopen"] = "issues",
-	["edit"] = "issues",
 	["create"] = "issues",
-	["submit-form"] = "issues",
-	["cancel-form"] = "issues",
-	["submit-comment"] = "issues",
-	["link"] = "issues",
-	["submit-link"] = "issues",
-	["cancel-link"] = "issues",
-	["unlink"] = "issues",
+	["select"] = "issue",
+	["close-detail"] = "issue",
+	["open-url"] = "issue",
+	["copy-id"] = "issue",
+	["copy-branch"] = "issue",
+	["set-state"] = "issue",
+	["assign-me"] = "issue",
+	["unassign"] = "issue",
+	["close-issue"] = "issue",
+	["reopen"] = "issue",
+	["edit"] = "issue",
+	["submit-form"] = "issue",
+	["cancel-form"] = "issue",
+	["submit-comment"] = "issue",
+	["link"] = "issue",
+	["submit-link"] = "issue",
+	["cancel-link"] = "issue",
+	["unlink"] = "issue",
 	["project-scope"] = "projects",
 	["project-team"] = "projects",
 	["open-project"] = "projects",
@@ -2656,13 +2925,31 @@ local SELECTS: { [string]: SelectHandler } = {
 		end
 	end,
 	["filter-priority"] = function(state, _run, value)
-		state.prefs.priority = if value == "" then nil else tonumber(value)
+		local priority = if value == "" then nil else tonumber(value)
+		local tab = model.issuesTab(state)
+		if tab ~= nil then
+			tab.priority = priority
+		else
+			state.prefs.priority = priority
+		end
 	end,
 	["filter-assignee"] = function(state, _run, value)
-		state.prefs.assignee = if value == "" then nil else value
+		local assignee = if value == "" then nil else value
+		local tab = model.issuesTab(state)
+		if tab ~= nil then
+			tab.assignee = assignee
+		else
+			state.prefs.assignee = assignee
+		end
 	end,
 	["filter-label"] = function(state, _run, value)
-		state.prefs.labelId = if value == "" then nil else value
+		local labelId = if value == "" then nil else value
+		local tab = model.issuesTab(state)
+		if tab ~= nil then
+			tab.labelId = labelId
+		else
+			state.prefs.labelId = labelId
+		end
 	end,
 	["state-select"] = function(state, run, value)
 		ACTIONS["set-state"](state, run, value)
@@ -2693,6 +2980,21 @@ local SELECTS: { [string]: SelectHandler } = {
 	["filter-health"] = function(state, _run, value)
 		state.prefs.projectHealth = if value == "" then nil else value
 	end,
+}
+
+-- Where each select applies (see Gate): the filter row's and the drawer's issue selects follow the issue list on
+-- screen. Unlisted: both modes.
+local SELECT_MODES: { [string]: Gate } = {
+	["team-select"] = "issues",
+	["filter-priority"] = "issue",
+	["filter-assignee"] = "issue",
+	["filter-label"] = "issue",
+	["state-select"] = "issue",
+	["assignee-select"] = "issue",
+	["priority-select"] = "issue",
+	["project-scope-select"] = "projects",
+	["filter-lead"] = "projects",
+	["filter-health"] = "projects",
 }
 
 -- ─── Keys ───────────────────────────────────────────────────────────────────
@@ -2812,15 +3114,10 @@ local function selectedAction(use: (BlockState, Run, Issue) -> ()): KeyHandler
 	end
 end
 
-local function moveKey(delta: number): KeyHandler
+-- A selection key: `step(state, run, delta)` (issues or projects, rows or columns).
+local function stepKey(step: (BlockState, Run, number) -> boolean, delta: number): KeyHandler
 	return function(state, run)
-		return moveSelection(state, run, delta)
-	end
-end
-
-local function columnKey(delta: number): KeyHandler
-	return function(state, run)
-		return moveColumn(state, run, delta)
+		return step(state, run, delta)
 	end
 end
 
@@ -2831,7 +3128,7 @@ local function escapeKey(state: BlockState, run: Run): boolean
 		cancelLink(state)
 	elseif state.drawerOpen then
 		closeDrawer(state, run)
-	elseif state.selectedId ~= nil then
+	elseif model.selectedIssueId(state) ~= nil then
 		clearSelection(state, run)
 	else
 		return false
@@ -2856,16 +3153,16 @@ local KEYS: { [string]: KeyHandler } = {
 		return true
 	end,
 	["t"] = nextTeam,
-	["j"] = moveKey(1),
-	["down"] = moveKey(1),
-	["k"] = moveKey(-1),
-	["up"] = moveKey(-1),
-	["h"] = columnKey(-1),
-	["left"] = columnKey(-1),
-	["l"] = columnKey(1),
-	["right"] = columnKey(1),
+	["j"] = stepKey(moveSelection, 1),
+	["down"] = stepKey(moveSelection, 1),
+	["k"] = stepKey(moveSelection, -1),
+	["up"] = stepKey(moveSelection, -1),
+	["h"] = stepKey(moveColumn, -1),
+	["left"] = stepKey(moveColumn, -1),
+	["l"] = stepKey(moveColumn, 1),
+	["right"] = stepKey(moveColumn, 1),
 	["enter"] = function(state, run)
-		local id = state.selectedId
+		local id = model.selectedIssueId(state)
 		if id == nil or state.drawerOpen then
 			return false
 		end
@@ -2930,18 +3227,6 @@ local function selectedProjectAction(use: (BlockState, Run, Project) -> ()): Key
 	end
 end
 
-local function projectMoveKey(delta: number): KeyHandler
-	return function(state, _run)
-		return moveProjectSelection(state, delta)
-	end
-end
-
-local function projectColumnKey(delta: number): KeyHandler
-	return function(state, _run)
-		return moveProjectColumn(state, delta)
-	end
-end
-
 -- Projects mode: the issue keys without an issue to act on (n e c a x [ ]) are absent; `enter` opens the project page.
 local PROJECT_KEYS: { [string]: KeyHandler } = {
 	["/"] = KEYS["/"],
@@ -2962,14 +3247,14 @@ local PROJECT_KEYS: { [string]: KeyHandler } = {
 		return true
 	end,
 	["t"] = nextProjectTeam,
-	["j"] = projectMoveKey(1),
-	["down"] = projectMoveKey(1),
-	["k"] = projectMoveKey(-1),
-	["up"] = projectMoveKey(-1),
-	["h"] = projectColumnKey(-1),
-	["left"] = projectColumnKey(-1),
-	["l"] = projectColumnKey(1),
-	["right"] = projectColumnKey(1),
+	["j"] = stepKey(moveProjectSelection, 1),
+	["down"] = stepKey(moveProjectSelection, 1),
+	["k"] = stepKey(moveProjectSelection, -1),
+	["up"] = stepKey(moveProjectSelection, -1),
+	["h"] = stepKey(moveProjectColumn, -1),
+	["left"] = stepKey(moveProjectColumn, -1),
+	["l"] = stepKey(moveProjectColumn, 1),
+	["right"] = stepKey(moveProjectColumn, 1),
 	-- Only a project the list shows: search and the lead/health filters keep a selection they hide.
 	["enter"] = function(state, run)
 		local id = state.projects.selectedId
@@ -2997,9 +3282,55 @@ local PROJECT_KEYS: { [string]: KeyHandler } = {
 	["y"] = selectedProjectAction(copyProject),
 }
 
--- The project page hides the list, so none of the list's keys apply.
+-- The project page's Issues tab: issues mode's keys for the tab's list, selection and drawer. Absent: `n` (no
+-- create), `m` / `t` (no scope), `r`, `p`, `i` and `escape` (the page handles them).
+local ISSUES_TAB_KEYS: { [string]: KeyHandler } = {}
+for _, name in
+	{
+		"/",
+		"1",
+		"2",
+		"3",
+		"v",
+		"j",
+		"down",
+		"k",
+		"up",
+		"h",
+		"left",
+		"l",
+		"right",
+		"enter",
+		"e",
+		"c",
+		"a",
+		"x",
+		"[",
+		"]",
+		"o",
+		"y",
+	}
+do
+	ISSUES_TAB_KEYS[name] = KEYS[name]
+end
+
+-- The project page hides the list, so none of the list's keys apply. On the Issues tab its issue keys come first:
+-- `escape` closes the form, the link input, the drawer, then clears the selection, and only then goes back; `o` /
+-- `y` act on the selected issue, and on the project when nothing is selected.
 local function handlePageKey(state: BlockState, run: Run, page: types.ProjectPageState, k: Key): boolean
 	local name = k.name
+	if page.tab == "issues" then
+		if name == "escape" then
+			if escapeKey(state, run) then
+				return true
+			end
+		else
+			local handler = ISSUES_TAB_KEYS[name]
+			if handler ~= nil and handler(state, run) then
+				return true
+			end
+		end
+	end
 	if name == "escape" or name == "backspace" or name == "p" then
 		closeProjectPage(state, run)
 		return true
@@ -3061,7 +3392,8 @@ end
 
 -- Maps a view field name to its focus key, editable text and (form fields) index.
 local function resolveField(state: BlockState, name: string): (string?, Field?, number?)
-	if name == "search" then
+	-- The Issues tab's search field is the "search" focus while the tab is on screen (activeQuery is its text).
+	if name == "search" or (name == "project-search" and model.issuesTab(state) ~= nil) then
 		return "search", activeQuery(state), nil
 	elseif name == "setup" then
 		return "setup", state.setupKey, nil
@@ -3162,8 +3494,7 @@ local function onAction(state: BlockState, run: Run, ev: UiEvent)
 	elseif state.phase ~= "ready" then
 		return
 	end
-	local only = ACTION_MODES[act]
-	if only ~= nil and only ~= state.prefs.mode then
+	if not gateOpen(state, ACTION_MODES[act]) then
 		return
 	end
 	if not KEEPS_FOCUS[act] then
@@ -3195,7 +3526,7 @@ local function onChange(state: BlockState, run: Run, ev: UiEvent)
 		return
 	end
 	local handler = SELECTS[key]
-	if handler ~= nil then
+	if handler ~= nil and gateOpen(state, SELECT_MODES[key]) then
 		blurTextFocus(state)
 		local before = state.generation
 		handler(state, run, value)
@@ -3205,14 +3536,14 @@ local function onChange(state: BlockState, run: Run, ev: UiEvent)
 	end
 end
 
--- Table row events. Issues: `select` highlights (and follows an open drawer), `activate` opens the drawer.
--- Projects: `select` selects the project, `activate` opens its page.
+-- Table row events. Issues (issues mode, or the project page's Issues tab): `select` highlights (and follows an open
+-- drawer), `activate` opens the drawer. Projects: `select` selects the project, `activate` opens its page.
 local function onRow(state: BlockState, run: Run, ev: UiEvent, open: boolean)
 	local item = ev.item
 	if type(item) ~= "string" or state.phase ~= "ready" then
 		return
 	end
-	if inProjects(state) then
+	if inProjects(state) and model.issuesTab(state) == nil then
 		if findProject(state, item) ~= nil and state.projectPage == nil then
 			blurTextFocus(state)
 			if open then
@@ -3290,6 +3621,9 @@ local function register(state: BlockState): Run
 		goneProjects = {},
 		readyNotice = nil,
 		activityToken = 0,
+		issuesToken = 0,
+		issuesInFlight = false,
+		issuesFullAt = tern.now(),
 		fgKind = nil,
 		lastFullAt = tern.now(),
 		focusQueued = false,

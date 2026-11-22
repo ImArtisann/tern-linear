@@ -229,7 +229,8 @@ const SYNC_HISTORY = [
 
 // The viewer is ada. `members` are handles; `teams` team keys (they double as the project's accessible teams).
 // Dates: `target`/`start` in days from now (negative: past), the rest in ms ago.
-// "Desktop app" stays first: the issue seed refers to projects by index.
+// "Desktop app" stays first: the issue seed refers to projects by index. Its issues span ENG and DES (the Issues tab):
+// Todo and In Progress in both teams, In Review in ENG, ENG-146 blocked by ENG-140, ENG-150 in Backlog, ENG-137 done.
 const PROJECTS = [
 	{
 		name: "Desktop app",
@@ -502,6 +503,7 @@ const ISSUES = [
 		creator: "linus",
 		labels: ["Bug"],
 		estimate: 2,
+		project: 1,
 		cycle: true,
 		created: 6 * DAY,
 		updated: 5 * 60 * MINUTE,
@@ -575,6 +577,7 @@ const ISSUES = [
 		creator: "ada",
 		labels: ["Improvement"],
 		estimate: 2,
+		project: 0,
 		created: 11 * DAY,
 		updated: 5 * DAY,
 		completed: 5 * DAY,
@@ -615,6 +618,7 @@ const ISSUES = [
 		state: "Backlog",
 		creator: "linus",
 		labels: ["Improvement"],
+		project: 0,
 		created: 2 * DAY,
 		updated: 4 * 24 * 60 * MINUTE,
 	},
@@ -628,6 +632,7 @@ const ISSUES = [
 		assignee: "ada",
 		creator: "dieter",
 		labels: ["UI"],
+		project: 0,
 		created: 8 * DAY,
 		updated: 90 * MINUTE,
 	},
@@ -641,6 +646,7 @@ const ISSUES = [
 		assignee: "ada",
 		creator: "dieter",
 		labels: ["UI", "Research"],
+		project: 0,
 		created: 3 * DAY,
 		updated: 400 * MINUTE,
 	},

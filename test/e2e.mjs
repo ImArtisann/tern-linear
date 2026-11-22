@@ -87,6 +87,19 @@ async function search(query) {
 	await t.key("Escape");
 }
 
+const SELECT_MENU = ".sf-select-menu";
+
+/** Opens a select of the filter row (by role) and picks the option labelled `label`. */
+async function pick(selectRole, label) {
+	await t.click(role(selectRole));
+	await present(SELECT_MENU);
+	const options = (await nodesOf(`${SELECT_MENU} .sf-select-opt`)).map((node) => node.text);
+	const index = options.indexOf(label);
+	if (index < 0) throw new Error(`${selectRole} has no option ${label}: ${options.join(", ")}`);
+	await t.click(`${SELECT_MENU} .sf-select-opt:nth-child(${index + 1})`);
+	await absent(SELECT_MENU);
+}
+
 async function clearSearch(length) {
 	await t.key("/");
 	await backspaces(length);
@@ -105,6 +118,26 @@ const PROGRESS_ASC = "Onboarding redesign,Search revamp,Public API,Sync engine v
 const PROGRESS_DESC = "Desktop app,Sync engine v2,Public API,Onboarding redesign,Search revamp";
 
 const projectFilter = (statusTypes) => ({ and: [{ status: { type: { in: statusTypes } } }] });
+
+// The project page's Issues tab: the project AND the view's state types (model.projectIssueFilter).
+const ACTIVE_TYPES = ["triage", "unstarted", "started"];
+const projectIssueFilter = (projectId, stateTypes) => ({
+	and: [{ project: { id: { eq: projectId } } }, { state: { type: { in: stateTypes } } }],
+});
+// Desktop app's Active issues in board order: Todo, then In Progress; by priority, then manual order.
+const DESKTOP_ACTIVE = "ENG-139,ENG-146,DES-15,ENG-142,ENG-140,ENG-138,ENG-131,DES-12";
+// Its table by priority: ties by identifier (team key, number) in both directions.
+const PRIORITY_ASC = "ENG-142,ENG-138,ENG-139,ENG-140,DES-12,ENG-131,ENG-146,DES-15";
+const PRIORITY_DESC = "DES-15,DES-12,ENG-131,ENG-146,ENG-138,ENG-139,ENG-140,ENG-142";
+// Card and row texts run the identifier into the next word ("ENG-139High…"), so no trailing word boundary.
+const ISSUE_ID = /\b[A-Z]+-\d+/;
+
+/** Issue identifiers of the board's cards, in board order. */
+const cardIds = async () => (await nodesOf(role("card"))).map((node) => ISSUE_ID.exec(node.text ?? "")?.[0]).join(",");
+
+/** Issue identifiers of the table's rows, top to bottom. */
+const tableIds = async () =>
+	(await nodesOf(`${role("table")} .sf-tbl-row:not(.head)`)).map((node) => ISSUE_ID.exec(node.text ?? "")?.[0]).join(",");
 
 /** Board column titles, left to right (the head's text minus its count). */
 const columnTitles = async () =>
@@ -343,7 +376,7 @@ async function scenario() {
 		await present(role("project-open-url"));
 		await present(role("project-refresh"));
 		const tabs = await nodesOf(`${role("project-tabs")} [data-role^='linear.project-tab-']`);
-		assertEqual(tabs.map((node) => node.text).join(","), "Overview,Activity", "project tabs");
+		assertEqual(tabs.map((node) => node.text).join(","), "Overview,Activity,Issues", "project tabs");
 		// The activity loads when its tab is first shown, not with the Overview.
 		await settle();
 		for (const op of ["ProjectUpdates", "ProjectHistory"]) assertEqual(opsSince(before, op).length, 0, `${op} before the Activity tab`);
@@ -436,13 +469,14 @@ async function scenario() {
 		await t.click(role("activity-comments-toggle"));
 		await absent(role("activity-comment"));
 
-		// `tab` / `shift+tab` cycle the tabs; a loaded Activity tab does not reload when shown again. Right after a
+		// `tab` / `shift+tab` cycle the tabs (Overview, Activity, Issues, wrapping); a loaded Activity tab does not
+		// reload when shown again. The Issues tab stays unvisited here: its lazy load is checked later. Right after a
 		// poll tick, so the next one stays out of this check and the `r` one below.
 		await afterPageTick();
 		before = mark();
-		await t.key("Tab");
-		await present(role("project-overview"));
 		await t.key("Shift+Tab");
+		await present(role("project-overview"));
+		await t.key("Tab");
 		await present(role("activity-update"));
 		await t.wait(300);
 		assertEqual(opsSince(before, "ProjectUpdates").length, 0, "activity reloads when the tab shows again");
@@ -522,6 +556,248 @@ async function scenario() {
 		assertEqual(opsSince(before, "Projects").length, 0, "list reloads from keys on the page");
 		await t.key("y");
 		await t.waitFor(role("notice"), "Copied link to Desktop app");
+	});
+
+	// The Issues tab of Desktop app: its issues (ENG and DES) on issues mode's board, table and drawer.
+	await runner.step("project-issues-board", async (label) => {
+		const desktop = projectNamed("Desktop app").id;
+		await settle();
+		assertEqual(mock.log.filter((entry) => entry.operationName === "Issues").length, 0, "Issues requests before the Issues tab");
+		const before = mark();
+		await t.click(role("project-tab-issues"));
+		await present(role("project-issues"));
+		await present(`${role("project-issues")} ${role("board")}`);
+		const [load] = opsSince(before, "Issues");
+		if (!load) throw new Error("no Issues request when the Issues tab opened");
+		assertEqual(JSON.stringify(load.variables.filter), JSON.stringify(projectIssueFilter(desktop, ACTIVE_TYPES)), "Issues tab filter");
+		assertEqual(await columnTitles(), "Triage,Todo,In Progress", "Issues tab columns (one per state type)");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), {
+			what: `the project's issues on the board (${DESKTOP_ACTIVE})`,
+			interval: 0,
+		});
+		const cards = await nodesOf(role("card"));
+		const card = (id) => cards.find((node) => (node.text ?? "").includes(id))?.text ?? "";
+		if (!card("ENG-146").includes("Blocked")) throw new Error(`ENG-146 shows no Blocked badge: ${card("ENG-146")}`);
+		if (card("ENG-140").includes("Blocked")) throw new Error("ENG-140 is not blocked");
+		for (const part of ["DES-12", "Redesign empty states", "ada", "UI", "Medium"]) {
+			if (!card("DES-12").includes(part)) throw new Error(`the DES-12 card lacks ${part}: ${card("DES-12")}`);
+		}
+		await t.waitFor(`${role("project-issues")} ${role("count")}`, "8 issues");
+		await t.waitFor(`${role("project-issues")} ${role("search")}`, "Search issues");
+		await present(`${role("project-issues-bar")} ${role("view-active")}`);
+		await present(`${role("project-issues")} ${role("filters")} ${role("filter-assignee")}`);
+		if (await exists(role("bar"))) throw new Error("the Issues tab shows the list's top bar");
+		if (await exists(role("drawer"))) throw new Error("a drawer before any issue was opened");
+		await runner.shot(label);
+		await runner.shot("project-issues-board");
+	});
+
+	await runner.step("project-issues-views-search", async (label) => {
+		const desktop = projectNamed("Desktop app").id;
+		let before = mark();
+		await t.key("3");
+		await see("Upgrade build tooling to Node 22");
+		const all = opsSince(before, "Issues").at(-1).variables.filter;
+		if (all.and[0].project?.id?.eq !== desktop || !all.and[1].or) throw new Error(`All view filter: ${JSON.stringify(all)}`);
+		assertEqual(await columnTitles(), "Triage,Backlog,Todo,In Progress,Done,Canceled", "All view columns");
+		before = mark();
+		await t.key("2");
+		await see("Evaluate Tauri for the desktop shell");
+		await gone("Crash when opening large workspace");
+		assertEqual(
+			JSON.stringify(opsSince(before, "Issues").at(-1).variables.filter),
+			JSON.stringify(projectIssueFilter(desktop, ["backlog"])),
+			"Backlog view filter",
+		);
+		await t.key("1");
+		await see("Crash when opening large workspace");
+		await gone("Evaluate Tauri for the desktop shell");
+
+		// The tab's search is its own: it filters the tab's list only.
+		await search("icon");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === "DES-15"), { what: "only DES-15 to match", interval: 0 });
+		await t.waitFor(`${role("project-issues")} ${role("count")}`, "1 issue");
+		await present(role("clear-filters"));
+		await runner.shot(label);
+		await t.click(role("clear-filters"));
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the search cleared", interval: 0 });
+
+		// The filter row: priority filters the tab's list; the assignee options are the members of every team the
+		// project's issues belong to (ENG and DES), not of one team.
+		await pick("filter-priority", "High");
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === "ENG-139,ENG-140,ENG-138"), {
+			what: "the High issues only",
+			interval: 0,
+		});
+		await t.waitFor(`${role("project-issues")} ${role("count")}`, "3 issues");
+		await t.click(role("filter-assignee"));
+		await present(SELECT_MENU);
+		const options = await t.text(SELECT_MENU);
+		for (const name of ["Me", "Unassigned", "dieter", "grace", "linus"]) {
+			if (!options.includes(name)) throw new Error(`the assignee filter lacks ${name}: ${options}`);
+		}
+		await t.click(role("filter-assignee"));
+		await absent(SELECT_MENU);
+		await present(role("project-issues"));
+		await t.click(role("clear-filters"));
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the filters cleared", interval: 0 });
+	});
+
+	await runner.step("project-issues-table", async (label) => {
+		await t.key("v");
+		await present(`${role("project-issues")} ${role("table")}`);
+		await t.click(role("sort-priority"));
+		await waitFor(async () => (await t.wait(150), (await tableIds()) === PRIORITY_ASC), {
+			what: `the tab's table sorted by priority (${PRIORITY_ASC})`,
+			interval: 0,
+		});
+		await t.click(role("sort-priority"));
+		await waitFor(async () => (await t.wait(150), (await tableIds()) === PRIORITY_DESC), {
+			what: `the tab's table sorted by priority, descending (${PRIORITY_DESC})`,
+			interval: 0,
+		});
+		await runner.shot(label);
+		await runner.shot("project-issues-table");
+		// Activating a row opens the issue drawer over the page.
+		await t.dblclick(`${role("table")} .sf-tbl-row:not(.head)`);
+		await present(role("drawer"));
+		await t.waitFor(role("drawer"), "Audit icon set for consistency");
+		await present(role("project-header"));
+		// One Escape per layer: a second one would clear the selection, a third go back to the list.
+		await t.key("Escape");
+		await absent(role("drawer"));
+		await present(`${role("project-issues")} ${role("table")}`);
+		await t.key("Escape");
+		await present(role("project-issues"));
+		await t.key("v");
+		await present(`${role("project-issues")} ${role("board")}`);
+	});
+
+	// A card click opens the drawer over the page; its edits reload the tab's list, never issues mode's.
+	await runner.step("project-issues-drawer", async (label) => {
+		const viewerId = mock.state().viewerId;
+		const issue = issueNamed("ENG-139");
+		await t.click(role("card"));
+		await present(role("drawer"));
+		await t.waitFor(role("drawer"), "Drag cards between board columns");
+		await present(role("project-header"));
+		await t.waitFor(role("drawer"), "Comments");
+		await runner.shot(label);
+		await runner.shot("project-issues-drawer");
+
+		let before = mark();
+		await t.key("a");
+		const assign = await waitFor(
+			() => opsSince(before, "IssueUpdate").find((op) => "assigneeId" in (op.variables.input ?? {})),
+			{ what: "an IssueUpdate with assigneeId" },
+		);
+		await waitFor(() => opsSince(before, "Issues").length > 0, { what: "the tab's list to reload after the edit" });
+		await settle();
+		assertEqual(assign.variables.input.assigneeId, viewerId, "assigneeId sent from the tab's drawer");
+		assertEqual(issueById(issue.id).assigneeId, viewerId, "assignee stored by the mock");
+		for (const op of opsSince(before, "Issues")) {
+			if (!JSON.stringify(op.variables.filter).includes(projectNamed("Desktop app").id)) {
+				throw new Error(`a mutation on the Issues tab reloaded another list: ${JSON.stringify(op.variables.filter)}`);
+			}
+		}
+		if (opsSince(before, "Issue").length === 0) throw new Error("no drawer reload after the edit");
+		await t.waitFor(role("notice"), "Assigned to you");
+		await present(role("drawer"));
+
+		// `]` moves by state type within the issue's team: Todo → ENG's first started state.
+		before = mark();
+		await t.key("]");
+		const move = await waitFor(
+			() => opsSince(before, "IssueUpdate").find((op) => "stateId" in (op.variables.input ?? {})),
+			{ what: "an IssueUpdate with stateId" },
+		);
+		await settle();
+		assertEqual(move.variables.input.stateId, teamState("ENG", "In Progress").id, "state after ]");
+		const inProgress = async () =>
+			(await nodesOf(role("column"))).find((node) => (node.text ?? "").includes("In Progress"))?.text ?? "";
+		await waitFor(async () => (await t.wait(150), (await inProgress()).includes("ENG-139")), {
+			what: "ENG-139 in the In Progress column",
+			interval: 0,
+		});
+
+		// `[` steps back a state type and `a` again unassigns: ENG-139 is as the fixture had it for issues mode.
+		before = mark();
+		await t.key("[");
+		await waitFor(() => opsSince(before, "IssueUpdate").find((op) => op.variables.input?.stateId === teamState("ENG", "Todo").id), {
+			what: "an IssueUpdate back to Todo",
+		});
+		await settle();
+		before = mark();
+		await t.key("a");
+		await waitFor(() => opsSince(before, "IssueUpdate").find((op) => op.variables.input?.assigneeId === null), {
+			what: "an IssueUpdate unassigning ENG-139",
+		});
+		await settle();
+		assertEqual(issueById(issue.id).stateId, issue.stateId, "ENG-139 back in Todo");
+		assertEqual(issueById(issue.id).assigneeId, null, "ENG-139 unassigned again");
+
+		// Escape: the edit form, then the drawer, then the selection, and only then back to the list.
+		await t.key("e");
+		await present(role("edit-form"));
+		await t.key("Escape");
+		await absent(role("edit-form"));
+		await present(role("drawer"));
+		await t.key("Escape");
+		await absent(role("drawer"));
+		await present(`${role("card")}[data-mark='selected']`);
+		await present(role("project-header"));
+		await t.key("Escape");
+		await absent(`${role("card")}[data-mark='selected']`);
+		await present(role("project-issues"));
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await t.key("Enter");
+		await pageOpen("Desktop app");
+	});
+
+	// The poll tick runs the tab's change check only while the Issues tab shows.
+	await runner.step("project-issues-poll", async () => {
+		const desktop = projectNamed("Desktop app").id;
+		await t.click(role("project-tab-issues"));
+		await present(`${role("project-issues")} ${role("board")}`);
+		await settle();
+		let before = mark();
+		await t.wait(31_000);
+		const check = await waitFor(() => opsSince(before, "IssuesChanged")[0], { what: "an IssuesChanged poll on the Issues tab" });
+		const filter = JSON.stringify(check.variables.filter);
+		if (!filter.includes(desktop) || !filter.includes("updatedAt")) throw new Error(`the tab's change check: ${filter}`);
+		assertEqual(opsSince(before, "ProjectsChanged").length, 0, "list polls while the page is open");
+		await t.click(role("project-tab-overview"));
+		await present(role("project-overview"));
+		await settle();
+		before = mark();
+		await t.wait(31_000);
+		await waitFor(() => opsSince(before, "Project").length > 0, { what: "a detail reload on the poll tick" });
+		assertEqual(opsSince(before, "IssuesChanged").length, 0, "issue polls while the Overview shows");
+		assertEqual(opsSince(before, "Issues").length, 0, "issue reloads while the Overview shows");
+	});
+
+	// A page saved on its Issues tab comes back on that tab and loads its issues.
+	await runner.step("project-issues-restore", async (label) => {
+		const desktop = projectNamed("Desktop app").id;
+		await t.click(role("project-tab-issues"));
+		await present(`${role("project-issues")} ${role("board")}`);
+		await settle();
+		const before = mark();
+		await t.ctl("plugins fixtures");
+		await waitFor(() => opsSince(before, "Viewer").length > 0, { what: "the block to restart" });
+		await present(role("project-header"));
+		await present(`${role("project-issues")} ${role("board")}`);
+		const [load] = opsSince(before, "Issues");
+		if (!load || !JSON.stringify(load.variables.filter).includes(desktop)) {
+			throw new Error(`no project Issues request after restoring the Issues tab: ${JSON.stringify(load?.variables)}`);
+		}
+		await t.waitFor(role("card"), "Drag cards between board columns");
+		await runner.shot(label);
+		await runner.shot("project-issues-restore");
+		await t.click(role("project-tab-overview"));
+		await present(role("project-overview"));
 	});
 
 	await runner.step("project-page-back", async (label) => {
@@ -729,6 +1005,10 @@ async function scenario() {
 
 	// From here on the original issue scenario runs in issues mode.
 	await runner.step("mode-issues", async (label) => {
+		// The Issues tab never loaded issues mode's list: every Issues request so far was scoped to a project.
+		for (const op of mock.log.filter((entry) => entry.operationName === "Issues")) {
+			if (!JSON.stringify(op.variables.filter).includes('"project"')) throw new Error(`an unscoped Issues request: ${JSON.stringify(op.variables.filter)}`);
+		}
 		const before = mark();
 		await t.key("i");
 		await see("Crash when opening large workspace");
@@ -738,6 +1018,9 @@ async function scenario() {
 			throw new Error(`first board load is not scoped to my issues: ${JSON.stringify(issues[0].variables.filter)}`);
 		}
 		await t.waitFor(role("search"), "Search issues");
+		// The Issues tab's search and filters stayed in the tab.
+		await t.waitFor(role("filter-priority"), "Any priority");
+		if (await exists(role("clear-filters"))) throw new Error("issues mode starts with filters from the Issues tab");
 		await present(role("new"));
 		await present(role("board"));
 		await runner.shot(label);
@@ -766,6 +1049,8 @@ async function scenario() {
 	await runner.step("table-view", async (label) => {
 		await t.key("v");
 		await present(role("table"));
+		// The Issues tab's priority sort stayed in the tab: issues mode's table is still newest first.
+		await t.waitFor(role("sort-updated"), "↓");
 		await see("Crash when opening large workspace");
 		await runner.shot(label);
 		await t.key("v");

@@ -171,3 +171,12 @@
 .sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-empty'] {
 	font-style: italic;
 }
+
+/* ── Issues ────────────────────────────────────────────────────────────── */
+
+/* The tab's toolbar (view switch, search, layout toggle) lines up like the list's top bar; the filter row, board,
+ * table and cards below are styled by their shared `linear.*` roles in linear.css. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-issues-bar'] {
+	align-items: center;
+	row-gap: 8px;
+}

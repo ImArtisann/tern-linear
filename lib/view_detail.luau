@@ -130,13 +130,14 @@ local function findTeam(teams: { Team }, id: string): Team?
 	return nil
 end
 
+-- The drawer's issue: the selection of the list on screen (issues mode, or the project page's Issues tab).
 local function currentIssue(state: BlockState): Issue?
-	local id = state.selectedId
+	local id = model.selectedIssueId(state)
 	local full = state.detail
 	if full and full.id == id then
 		return full
 	end
-	for _, issue in state.issues do
+	for _, issue in model.issueList(state) do
 		if issue.id == id then
 			return issue
 		end
@@ -886,7 +887,7 @@ function detail.layer(state: BlockState, cx: BlockCx): Node?
 	local form = state.form
 	if form ~= nil and form.kind == "create" then
 		panel = dialog(state, form)
-	elseif state.drawerOpen and state.selectedId ~= nil then
+	elseif state.drawerOpen then
 		local issue = currentIssue(state)
 		if issue then
 			panel = drawer(state, cx, issue)

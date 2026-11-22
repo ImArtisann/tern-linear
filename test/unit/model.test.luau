@@ -754,20 +754,140 @@ check(
 	"projectTab accepts known tabs only",
 	model.projectTab("overview") == "overview"
 		and model.projectTab("activity") == "activity"
+		and model.projectTab("issues") == "issues"
 		and model.projectTab("gantt") == nil
 		and model.projectTab(nil) == nil
 )
 check(
-	"PROJECT_TABS: Overview, then Activity",
-	model.PROJECT_TABS[1].id == "overview" and model.PROJECT_TABS[2].id == "activity" and #model.PROJECT_TABS == 2
+	"PROJECT_TABS: Overview, Activity, then Issues",
+	model.PROJECT_TABS[1].id == "overview"
+		and model.PROJECT_TABS[2].id == "activity"
+		and model.PROJECT_TABS[3].id == "issues"
+		and #model.PROJECT_TABS == 3
 )
 local tabCount = #model.PROJECT_TABS
 check(
 	"stepProjectTab wraps around the tab list",
 	model.stepProjectTab("overview", 1) == "activity"
-		and model.stepProjectTab("activity", 1) == "overview"
-		and model.stepProjectTab("overview", -1) == "activity"
+		and model.stepProjectTab("activity", 1) == "issues"
+		and model.stepProjectTab("issues", 1) == "overview"
+		and model.stepProjectTab("overview", -1) == "issues"
 		and model.stepProjectTab("overview", tabCount) == "overview"
+)
+
+-- the project page's Issues tab
+
+local projectActive: any = model.projectIssueFilter("p-1", "active", nil)
+check(
+	"projectIssueFilter: the project AND the view's state types",
+	#projectActive["and"] == 2
+		and projectActive["and"][1].project.id.eq == "p-1"
+		and table.concat(projectActive["and"][2].state.type["in"], ",") == "triage,unstarted,started"
+)
+local projectAll: any = model.projectIssueFilter("p-1", "all", nil)
+check(
+	"projectIssueFilter: the All view keeps open and recently closed issues",
+	projectAll["and"][2]["or"][2].completedAt.gt == "-P14D"
+)
+local projectMilestone: any = model.projectIssueFilter("p-1", "backlog", "m-1")
+check(
+	"projectIssueFilter: a milestone narrows the project before the view",
+	#projectMilestone["and"] == 3
+		and projectMilestone["and"][2].projectMilestone.id.eq == "m-1"
+		and projectMilestone["and"][3].state.type["in"][1] == "backlog"
+)
+
+local function titles(columns: { model.Column }): string
+	local out: { string } = {}
+	for _, column in columns do
+		table.insert(out, `{column.title}:{#column.issues}`)
+	end
+	return table.concat(out, ",")
+end
+local designDoing = issue("d1", { teamKey = "DES", number = 4, state = state("s-des-doing", "Doing", "started", 3) })
+check(
+	"typeColumns: one column per state type of the view across teams, empty ones included",
+	titles(model.typeColumns({ inTodo, designDoing, urgent, inReview }, "active")) == "Triage:0,Todo:1,In Progress:3"
+)
+check(
+	"typeColumns: the All view folds duplicate into canceled",
+	titles(model.typeColumns({ issue("x1", { state = DUPLICATE }) }, "all"))
+		== "Triage:0,Backlog:0,Todo:0,In Progress:0,Done:0,Canceled:1"
+)
+
+local function stateId(target: types.WorkflowState?): string
+	return if target ~= nil then target.id else "nil"
+end
+check(
+	"adjacentTypeState moves to the next type's first state",
+	stateId(model.adjacentTypeState(team, issue("m1", { state = TODO }), 1, "active")) == "s-doing"
+		and stateId(model.adjacentTypeState(team, issue("m2", { state = REVIEW }), -1, "active")) == "s-todo"
+)
+check(
+	"adjacentTypeState stops at the view's edges and skips types the team lacks",
+	model.adjacentTypeState(team, issue("m3", { state = REVIEW }), 1, "active") == nil
+		and model.adjacentTypeState(team, issue("m4", { state = TODO }), -1, "active") == nil
+)
+check(
+	"adjacentTypeState: duplicate sits in the canceled column",
+	stateId(model.adjacentTypeState(team, issue("m5", { state = DUPLICATE }), -1, "all")) == "s-done"
+		and model.adjacentTypeState(team, issue("m6", { state = CANCELED }), 1, "all") == nil
+)
+check(
+	"adjacentTypeState: an issue outside the view steps through every type",
+	stateId(model.adjacentTypeState(team, issue("m7", { state = BACKLOG }), 1, "active")) == "s-todo"
+)
+local lean: types.Team = table.clone(team)
+lean.states = { BACKLOG, TODO, DONE }
+check(
+	"adjacentTypeState uses the issue's own team: a team without a started state goes straight to done",
+	stateId(model.adjacentTypeState(lean, issue("m8", { state = TODO }), 1, "all")) == "s-done"
+)
+
+local design: types.Team = table.clone(team)
+design.id = "t-des"
+local ops: types.Team = table.clone(team)
+ops.id = "t-ops"
+local owners = model.issueTeams({ inTodo, designDoing, urgent }, { design, ops, team })
+check(
+	"issueTeams: the teams owning the issues, in team-list order",
+	#owners == 2 and owners[1].id == "t-des" and owners[2].id == "t-eng"
+)
+
+local tabState = { prefs = { mode = "projects" }, projectPage = { tab = "issues", issues = { items = {} } } }
+check("issuesTab: the page's Issues tab on screen", model.issuesTab(tabState :: any) == tabState.projectPage.issues)
+tabState.projectPage.tab = "overview"
+check("issuesTab: nil on another tab", model.issuesTab(tabState :: any) == nil)
+tabState.projectPage.tab = "issues"
+tabState.prefs.mode = "issues"
+check("issuesTab: nil in issues mode", model.issuesTab(tabState :: any) == nil)
+
+check(
+	"steppedId clamps at the ends and starts at the first id",
+	model.steppedId({ "a", "b", "c" }, "b", 1) == "c"
+		and model.steppedId({ "a", "b", "c" }, "c", 1) == "c"
+		and model.steppedId({ "a", "b", "c" }, "a", -1) == "a"
+		and model.steppedId({ "a", "b" }, "gone", 1) == "a"
+		and model.steppedId({}, nil, 1) == nil
+)
+check(
+	"adjacentColumnId skips empty columns and stops at the edge",
+	model.adjacentColumnId({ { "a" }, {}, { "c", "d" } }, "a", 1) == "c"
+		and model.adjacentColumnId({ { "a" }, {}, { "c", "d" } }, "d", -1) == "a"
+		and model.adjacentColumnId({ { "a" }, { "b" } }, "b", 1) == nil
+		and model.adjacentColumnId({ {}, { "b" } }, nil, -1) == "b"
+)
+local sortKey, sortAsc = model.nextSort("updated", false, "priority")
+local againKey, againAsc = model.nextSort("priority", true, "priority")
+local newestKey, newestAsc = model.nextSort("title", true, "updated")
+check(
+	"nextSort: a new key ascends (updated descends), the same key flips",
+	sortKey == "priority"
+		and sortAsc
+		and againKey == "priority"
+		and not againAsc
+		and newestKey == "updated"
+		and not newestAsc
 )
 
 -- project activity

@@ -6,10 +6,13 @@ local types = require("./types")
 
 type Issue = types.Issue
 type IssueRef = types.IssueRef
+type BlockState = types.BlockState
+type IssueFilters = types.IssueFilters
 type Prefs = types.Prefs
 type Project = types.Project
 type ProjectStatus = types.ProjectStatus
 type ProjectMilestone = types.ProjectMilestone
+type ProjectIssuesState = types.ProjectIssuesState
 type ProjectTab = types.ProjectTab
 type Team = types.Team
 type WorkflowState = types.WorkflowState
@@ -152,6 +155,16 @@ function model.serverFilter(prefs: Prefs): any
 		table.insert(parts, { team = { id = { eq = prefs.teamId } } })
 	end
 	table.insert(parts, viewFilter(prefs.view))
+	return { ["and"] = parts }
+end
+
+-- The project page's Issues tab: the project's issues in a view, AND (layer 5) one of its milestones.
+function model.projectIssueFilter(projectId: string, view: string, milestoneId: string?): any
+	local parts: { any } = { { project = { id = { eq = projectId } } } }
+	if milestoneId ~= nil then
+		table.insert(parts, { projectMilestone = { id = { eq = milestoneId } } })
+	end
+	table.insert(parts, viewFilter(view))
 	return { ["and"] = parts }
 end
 
@@ -385,7 +398,7 @@ local function hasLabel(issue: Issue, labelId: string): boolean
 	return false
 end
 
-function model.visible(issues: { Issue }, prefs: Prefs, query: string, viewerId: string?): { Issue }
+function model.visible(issues: { Issue }, filters: IssueFilters, query: string, viewerId: string?): { Issue }
 	local needle = string.lower(string.match(query, "^%s*(.-)%s*$") :: string)
 	local key, number = model.parseIdentifier(needle)
 	local seen: { [string]: boolean } = {}
@@ -393,9 +406,9 @@ function model.visible(issues: { Issue }, prefs: Prefs, query: string, viewerId:
 	for _, issue in issues do
 		local keep = not seen[issue.id]
 			and (needle == "" or matchesQuery(issue, needle, key, number))
-			and (prefs.priority == nil or issue.priority == prefs.priority)
-			and (prefs.assignee == nil or matchesAssignee(issue, prefs.assignee, viewerId))
-			and (prefs.labelId == nil or hasLabel(issue, prefs.labelId))
+			and (filters.priority == nil or issue.priority == filters.priority)
+			and (filters.assignee == nil or matchesAssignee(issue, filters.assignee, viewerId))
+			and (filters.labelId == nil or hasLabel(issue, filters.labelId))
 		if keep then
 			table.insert(out, issue)
 		end
@@ -472,12 +485,23 @@ local function mineColumns(visible: { Issue }, stateTypes: { string }): { Column
 	return columns
 end
 
+-- One column per workflow state of `team` whose type the view shows, empty ones included.
+function model.teamColumns(visible: { Issue }, team: Team, view: string): { Column }
+	return teamColumns(visible, team, model.viewTypes(view))
+end
+
+-- One column per state type of the view (duplicate folds into canceled), empty ones included; cards by priority.
+-- The board of My issues and of the project page's Issues tab: their issues come from several teams.
+function model.typeColumns(visible: { Issue }, view: string): { Column }
+	return mineColumns(visible, model.viewTypes(view))
+end
+
+-- Issues mode's board: team columns in team scope, type columns for My issues.
 function model.columns(visible: { Issue }, prefs: Prefs, team: Team?): { Column }
-	local stateTypes = model.viewTypes(prefs.view)
 	if prefs.scope == "team" and team ~= nil then
-		return teamColumns(visible, team, stateTypes)
+		return model.teamColumns(visible, team, prefs.view)
 	end
-	return mineColumns(visible, stateTypes)
+	return model.typeColumns(visible, prefs.view)
 end
 
 -- ─── Table sorting ──────────────────────────────────────────────────────────
@@ -526,6 +550,15 @@ function model.sortTable(visible: { Issue }, key: string, asc: boolean): { Issue
 		end)
 	)
 	return out
+end
+
+-- A table sort button: the same key toggles the direction; a new key starts ascending, except "updated" (newest
+-- first). Returns the new key and direction.
+function model.nextSort(current: string, asc: boolean, key: string): (string, boolean)
+	if current == key then
+		return key, not asc
+	end
+	return key, key ~= "updated"
 end
 
 -- ─── Keyboard navigation ────────────────────────────────────────────────────
@@ -622,6 +655,58 @@ function model.adjacentState(team: Team, issue: Issue, delta: number, view: stri
 		return nil
 	end
 	return candidates[current + delta]
+end
+
+-- The state types a type-column board shows for `view`, left to right (duplicate folds into canceled).
+local function columnTypes(stateTypes: { string }): { string }
+	local out: { string } = {}
+	for _, stateType in stateTypes do
+		if stateType ~= "duplicate" then
+			table.insert(out, stateType)
+		end
+	end
+	return out
+end
+
+-- `[` / `]` on a board with one column per state type (model.typeColumns): the first state (lowest position) of
+-- `team` (the issue's own team) in the nearest column before (delta < 0) or after (delta > 0) the issue's that the
+-- team has a state for; nil at the edge. An issue outside the view's columns steps through every state type.
+function model.adjacentTypeState(team: Team, issue: Issue, delta: number, view: string): WorkflowState?
+	local own = mineColumnType(issue.state.type)
+	local columns = columnTypes(model.viewTypes(view))
+	local index = table.find(columns, own)
+	if index == nil then
+		columns = columnTypes(STATE_TYPES)
+		index = table.find(columns, own)
+	end
+	if index == nil then
+		return nil
+	end
+	local step = if delta < 0 then -1 else 1
+	local position = index + step
+	while position >= 1 and position <= #columns do
+		local target = model.stateFor(team, columns[position])
+		if target ~= nil then
+			return target
+		end
+		position += step
+	end
+	return nil
+end
+
+-- The teams (in `teams` order) that own at least one of `issues`: the Issues tab's assignee and label options.
+function model.issueTeams(issues: { Issue }, teams: { Team }): { Team }
+	local owners: { [string]: boolean } = {}
+	for _, issue in issues do
+		owners[issue.teamId] = true
+	end
+	local out: { Team } = {}
+	for _, team in teams do
+		if owners[team.id] then
+			table.insert(out, team)
+		end
+	end
+	return out
 end
 
 -- ─── Forms ──────────────────────────────────────────────────────────────────
@@ -949,6 +1034,7 @@ end
 local PROJECT_TABS: { { id: ProjectTab, label: string } } = table.freeze({
 	table.freeze({ id = "overview" :: ProjectTab, label = "Overview" }),
 	table.freeze({ id = "activity" :: ProjectTab, label = "Activity" }),
+	table.freeze({ id = "issues" :: ProjectTab, label = "Issues" }),
 })
 model.PROJECT_TABS = PROJECT_TABS
 
@@ -974,6 +1060,28 @@ function model.stepProjectTab(current: ProjectTab, delta: number): ProjectTab
 		return PROJECT_TABS[1].id
 	end
 	return PROJECT_TABS[(index - 1 + delta) % #PROJECT_TABS + 1].id
+end
+
+-- The project page's Issues tab while it is on screen (projects mode, a page open on that tab), else nil. The issue
+-- list, selection and drawer then belong to it instead of issues mode.
+function model.issuesTab(state: BlockState): ProjectIssuesState?
+	local page = state.projectPage
+	if state.prefs.mode ~= "projects" or page == nil or page.tab ~= "issues" then
+		return nil
+	end
+	return page.issues
+end
+
+-- The issue list on screen: the Issues tab's while it shows, else issues mode's.
+function model.issueList(state: BlockState): { Issue }
+	local tab = model.issuesTab(state)
+	return if tab ~= nil then tab.items else state.issues
+end
+
+-- The selected issue of the list on screen (the drawer's issue while it is open).
+function model.selectedIssueId(state: BlockState): string?
+	local tab = model.issuesTab(state)
+	return if tab ~= nil then tab.selectedId else state.selectedId
 end
 
 local MILESTONE_STATUS_LABELS: { [string]: string } = {

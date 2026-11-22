@@ -2,7 +2,9 @@
 -- The project page in the `main` region: a header (Back, name, status, health, Open in Linear, refresh), the tab bar
 -- and the open tab's content. It replaces the list while `BlockState.projectPage` is set.
 -- Pure: reads the block state, never mutates it. The tab bar lists model.PROJECT_TABS; TAB_CONTENT renders each tab.
+-- The Issues tab renders its list with view_issues, the issue list of issues mode.
 
+local issueList = require("./view_issues")
 local model = require("./model")
 local parts = require("./view_parts")
 local text = require("./text")
@@ -19,6 +21,11 @@ local with = parts.with
 local compact = parts.compact
 
 local projectPage = {}
+
+-- Node ids are `<parent id>.<key>` from the region root: the Issues tab's search field is the tab root ("tab"),
+-- its toolbar ("bar") and the input ("search").
+local ISSUES_SEARCH_FIELD = "project-search"
+local ISSUES_SEARCH_ID = "main.tab.bar.search"
 
 -- From this pane width (columns) up the Overview is two columns: content beside a properties sidebar.
 local WIDE_COLS = 110
@@ -64,6 +71,25 @@ local function sectionHeading(title: string, count: string?): Node
 end
 
 -- ─── Header ─────────────────────────────────────────────────────────────────
+
+-- The sync time and loading state of the tab on screen (the header's Refresh).
+local function tabFetchedAt(page: ProjectPageState): number?
+	if page.tab == "activity" then
+		return page.activityFetchedAt
+	elseif page.tab == "issues" then
+		return page.issues.fetchedAt
+	end
+	return page.fetchedAt
+end
+
+local function tabLoading(page: ProjectPageState): boolean
+	if page.tab == "activity" then
+		return page.activityLoading
+	elseif page.tab == "issues" then
+		return page.issues.loading
+	end
+	return page.loading
+end
 
 local function header(page: ProjectPageState, project: Project?, now: number): Node
 	local nameNode: Node
@@ -121,12 +147,12 @@ local function header(page: ProjectPageState, project: Project?, now: number): N
 		linkButtons[1],
 		linkButtons[2],
 		-- Refresh reloads the tab on screen: its own loading state and sync time.
-		ui.button(parts.syncedLabel(if page.tab == "activity" then page.activityFetchedAt else page.fetchedAt, now), {
+		ui.button(parts.syncedLabel(tabFetchedAt(page), now), {
 			key = "refresh",
 			role = "linear.project-refresh",
 			icon = "repeat",
 			keys = { "r" },
-			busy = if page.tab == "activity" then page.activityLoading else page.loading,
+			busy = tabLoading(page),
 			actions = { click = "refresh-project" },
 		}),
 	}, 8)
@@ -612,12 +638,117 @@ local function activityTab(
 	return ui.node("col", { key = "tab", role = "linear.activity", gap = "sm" }, children)
 end
 
+-- ─── Issues ─────────────────────────────────────────────────────────────────
+
+-- Pane rows above the cards: header, tab bar, toolbar, filter row, column heads and their gaps.
+local ISSUES_CHROME_ROWS = 16
+local BANNER_ROWS = 3
+
+-- The assignee and label options: the members and labels of the teams the loaded issues belong to.
+local function issueOptions(state: BlockState, issues: { types.Issue }): ({ types.User }, { types.Label })
+	local members: { types.User } = {}
+	local labels: { types.Label } = {}
+	local seenMember: { [string]: boolean } = {}
+	local seenLabel: { [string]: boolean } = {}
+	for _, team in model.issueTeams(issues, state.teams) do
+		for _, member in team.members do
+			if not seenMember[member.id] then
+				seenMember[member.id] = true
+				table.insert(members, member)
+			end
+		end
+		for _, label in team.labels do
+			if not seenLabel[label.id] then
+				seenLabel[label.id] = true
+				table.insert(labels, label)
+			end
+		end
+	end
+	table.sort(members, function(a, b)
+		return string.lower(a.displayName) < string.lower(b.displayName)
+	end)
+	table.sort(labels, function(a, b)
+		return string.lower(a.name) < string.lower(b.name)
+	end)
+	return members, labels
+end
+
+-- View switch, search and layout toggle of the tab (the top bar's controls for its own list).
+local function issuesToolbar(state: BlockState, tab: types.ProjectIssuesState): Node
+	local query = tab.query
+	return ui.node("row", { key = "bar", role = "linear.project-issues-bar", gap = "sm", wrap = true }, {
+		parts.viewSwitcher(tab.view),
+		ui.node("input", {
+			key = "search",
+			role = "linear.search",
+			text = query.text,
+			cursor = query.cursor,
+			anchor = query.anchor,
+			placeholder = "Search issues",
+			icon = "search",
+			keys = { "/" },
+			variant = "field",
+			grow = 1,
+			min = { w = "16ch" },
+			max = { w = "40ch" },
+		}),
+		parts.layoutSwitcher(state.prefs.layout),
+	})
+end
+
+-- The Issues tab: the toolbar, then issues mode's filter row and board or table over the project's issues.
+local function issuesTab(state: BlockState, page: ProjectPageState, _project: Project?, cx: BlockCx, now: number): Node
+	local tab = page.issues
+	local banners = 0
+	for _, shown in { state.error ~= nil, state.notice ~= nil, page.error ~= nil, tab.error ~= nil } do
+		if shown then
+			banners += 1
+		end
+	end
+	local members, labels = issueOptions(state, tab.items)
+	local failedFirst = tab.fetchedAt == nil and tab.error ~= nil and not tab.loading
+	local list: issueList.IssueList = {
+		items = tab.items,
+		truncated = tab.truncated,
+		view = tab.view,
+		filters = tab,
+		query = tab.query.text,
+		sort = tab.sort,
+		sortAsc = tab.sortAsc,
+		selectedId = tab.selectedId,
+		team = nil,
+		members = members,
+		labels = labels,
+		-- Until the first load the tab shows the loading row too.
+		reloading = tab.loading or (tab.fetchedAt == nil and not failedFirst),
+		emptyHelp = "all",
+		chromeRows = ISSUES_CHROME_ROWS + banners * BANNER_ROWS,
+	}
+	local visible = issueList.visible(state, list)
+	local children: { Node } = { issuesToolbar(state, tab), issueList.filterRow(state, list, #visible) }
+	local failure = tab.error
+	if failure ~= nil then
+		table.insert(
+			children,
+			parts.banner("issues-error", "linear.project-issues-error", "error", "x-circle", failure)
+		)
+	end
+	-- A first load that failed has nothing to show but the error.
+	if not failedFirst then
+		for _, node in issueList.content(state, cx, list, visible, now) do
+			table.insert(children, node)
+		end
+	end
+	return ui.node("col", { key = "tab", role = "linear.project-issues", gap = "md" }, children)
+end
+
 type TabRenderer = (BlockState, ProjectPageState, Project?, BlockCx, number) -> Node
 
 -- One renderer per tab id of model.PROJECT_TABS.
 local TAB_CONTENT: { [string]: TabRenderer } = {
 	overview = overview,
 	activity = activityTab,
+	issues = issuesTab,
 }
 
 -- ─── Public API ─────────────────────────────────────────────────────────────
@@ -641,6 +772,14 @@ function projectPage.render(state: BlockState, page: ProjectPageState, cx: Block
 	local renderTab: TabRenderer = TAB_CONTENT[page.tab] or overview
 	table.insert(children, renderTab(state, page, project, cx, now))
 	return children
+end
+
+function projectPage.fieldId(name: string): string?
+	return if name == ISSUES_SEARCH_FIELD then ISSUES_SEARCH_ID else nil
+end
+
+function projectPage.fieldName(id: string): string?
+	return if id == ISSUES_SEARCH_ID then ISSUES_SEARCH_FIELD else nil
 end
 
 return projectPage

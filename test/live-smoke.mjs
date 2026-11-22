@@ -1,5 +1,6 @@
 // Smoke test against the real Linear API (no mock).
-//   bun test/live-smoke.mjs            read-only: projects board, table, a project page and its Activity tab, then the issue board, table, detail drawer
+//   bun test/live-smoke.mjs            read-only: projects board, table, a project page with its Activity and Issues tabs,
+//                                      then the issue board, table, detail drawer
 //   bun test/live-smoke.mjs --write    also creates, comments on and completes one issue
 //
 // It also sends the read-only project queries once directly and prints Linear's `x-complexity` for each
@@ -33,7 +34,8 @@ const MAX_COMPLEXITY = 10_000;
 /**
  * Sends each read-only project operation of lib/queries.luau once, with the variables the plugin uses, and returns
  * `{ operation, request, complexity, nodes }` per request. `Project` (the project page) asks for the first project of
- * the unfiltered list. Throws on a GraphQL error or a cost above the cap.
+ * the unfiltered list; so do the Issues tab's `Issues` and `IssuesChanged`. Throws on a GraphQL error or a cost above
+ * the cap.
  */
 async function measureComplexity(key) {
 	const docs = Object.fromEntries(
@@ -59,6 +61,7 @@ async function measureComplexity(key) {
 		if (!(complexity <= MAX_COMPLEXITY)) throw new Error(`${operation}: complexity ${complexity} over ${MAX_COMPLEXITY}`);
 		const nodes =
 			body.data.projects?.nodes?.length ??
+			body.data.issues?.nodes?.length ??
 			body.data.organization?.projectStatuses?.length ??
 			body.data.project?.projectUpdates?.nodes?.length ??
 			body.data.project?.history?.nodes?.length ??
@@ -73,6 +76,14 @@ async function measureComplexity(key) {
 	}
 	if (firstProject) {
 		await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
+		// The Issues tab: model.projectIssueFilter (the project AND the Active view), first page of 50 as linear.issues
+		// sends it, and the poll's change check.
+		const tabFilter = {
+			and: [{ project: { id: { eq: firstProject } } }, { state: { type: { in: ["triage", "unstarted", "started"] } } }],
+		};
+		await send("Issues", { filter: tabFilter, first: 50 }, "Issues tab, first 50, Active view");
+		const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+		await send("IssuesChanged", { filter: { and: [tabFilter, { updatedAt: { gt: since } }] } }, "Issues tab change check");
 		// The Activity tab's first pages, with the plugin's page sizes (the documents' defaults).
 		await send("ProjectUpdates", { id: firstProject }, "Activity tab, first 20 updates with 10 comments each");
 		const history = await send("ProjectHistory", { id: firstProject }, "Activity tab, first 25 history records");
@@ -228,6 +239,39 @@ async function scenario() {
 		console.log(`note: activity tab: ${updates} updates, ${events} history events${more ? ", Load more offered" : ""}`);
 		report.projectActivity = { updates, events, more };
 		await runner.shot("project-activity");
+
+		// Read-only: the Issues tab of the same project, and the issue drawer over the page for its first card.
+		await t.click(role("project-tab-issues"));
+		await present(role("project-issues"));
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("project-issues-error"))) {
+					throw new Error(`issues tab error: ${(await t.text(role("project-issues-error"))).slice(0, 300)}`);
+				}
+				if (await exists(role("reloading"))) return false;
+				return (await exists(`${role("project-issues")} ${role("board")}`)) || (await exists(`${role("project-issues")} ${role("empty")}`));
+			},
+			{ what: "the project's issues", timeout: 45_000, interval: 0 },
+		);
+		const issueCards = ((await t.tree(role("card"))).nodes ?? []).length;
+		const issueColumns = ((await t.tree(role("column-head"))).nodes ?? []).map((node) => (node.text ?? "").replace(/\d+$/, ""));
+		const count = (await t.text(`${role("project-issues")} ${role("count")}`)).split("\n")[0];
+		console.log(`note: issues tab (Active): ${issueCards} cards in columns ${issueColumns.join(", ")}; count "${count}"`);
+		report.projectIssues = { cards: issueCards, columns: issueColumns, count };
+		await runner.shot("project-issues");
+		if (issueCards > 0) {
+			await t.click(role("card"));
+			await present(role("drawer"));
+			await t.waitFor(role("drawer"), "Comments", { timeout: 30_000 });
+			if (!(await exists(role("project-header")))) throw new Error("the drawer did not open over the project page");
+			await runner.shot("project-issues-drawer");
+			await t.key("Escape");
+			await absent(role("drawer"));
+			// The next Escape clears the selection; the one after that goes back.
+			await t.key("Escape");
+			await present(role("project-issues"));
+		}
 		await t.key("Escape");
 		await absent(role("project-header"));
 		await present(role("board"));

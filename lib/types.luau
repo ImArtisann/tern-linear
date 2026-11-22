@@ -326,7 +326,8 @@ export type Prefs = {
 	-- Table sort column: "identifier" | "title" | "state" | "priority" | "assignee" | "updated"
 	sort: string,
 	sortAsc: boolean,
-	-- Client-side filters; nil means "any".
+	-- Client-side filters; nil means "any". The same fields of the project page's Issues tab are its own
+	-- (ProjectIssuesState); both are an IssueFilters.
 	priority: number?,
 	-- "me" | "none" | <user id>
 	assignee: string?,
@@ -346,6 +347,14 @@ export type Prefs = {
 	projectLead: string?,
 	-- "onTrack" | "atRisk" | "offTrack" | "none"
 	projectHealth: string?,
+}
+
+-- The client filters of an issue list (model.visible): issues mode's Prefs or the Issues tab's ProjectIssuesState.
+export type IssueFilters = {
+	priority: number?,
+	-- "me" | "none" | <user id>
+	assignee: string?,
+	labelId: string?,
 }
 
 -- ─── Forms ──────────────────────────────────────────────────────────────────
@@ -407,7 +416,35 @@ export type ProjectsState = {
 
 -- A tab of the project page. Each tab is one entry of model.PROJECT_TABS (the tab bar's order); a layer that
 -- adds a tab extends this union and that list, and keeps its own data in ProjectPageState.
-export type ProjectTab = "overview" | "activity"
+export type ProjectTab = "overview" | "activity" | "issues"
+
+-- The project page's Issues tab: the project's issues on the issue board/table, with its own view, filters, search,
+-- table sort and selection (issues mode's are untouched). The issue drawer opens over the page for `selectedId`.
+export type ProjectIssuesState = {
+	items: { Issue },
+	-- True when MAX_ISSUES was reached and more matched on the server.
+	truncated: boolean,
+	-- Epoch seconds of the last successful load; nil until the tab first loaded.
+	fetchedAt: number?,
+	-- Greatest updatedAt seen under the tab's server filter (ISO string, server clock).
+	maxUpdatedAt: string?,
+	-- A shown load is in flight (first show, view change, `r`, Refresh): the list shows a loading row.
+	-- Poll and post-mutation reloads keep it false.
+	loading: boolean,
+	-- The last request failed (shown in the tab; what it had stays).
+	error: string?,
+	-- The server filter's view (model.projectIssueFilter), like Prefs.view.
+	view: "active" | "backlog" | "all",
+	-- Client-side filters (IssueFilters); nil means "any".
+	priority: number?,
+	assignee: string?,
+	labelId: string?,
+	query: Field,
+	-- Table sort, like Prefs.sort / Prefs.sortAsc.
+	sort: string,
+	sortAsc: boolean,
+	selectedId: string?,
+}
 
 -- The project page: full-screen over projects mode's list, which stays loaded (scope, view, layout and
 -- selection untouched) for Back.
@@ -435,6 +472,9 @@ export type ProjectPageState = {
 	activityFetchedAt: number?,
 	-- Project updates whose comments are expanded, by update id.
 	expandedUpdates: { [string]: boolean },
+
+	-- The Issues tab: its list loads the first time the tab is shown (`fetchedAt` nil until then).
+	issues: ProjectIssuesState,
 }
 
 export type BlockState = {
@@ -463,11 +503,13 @@ export type BlockState = {
 	-- Which field owns the keyboard: nil | "search" | "setup" | "comment" | "link" | "form"
 	focus: string?,
 
+	-- Issues mode's selected issue. While the project page's Issues tab is on screen (model.issuesTab) its own
+	-- `ProjectIssuesState.selectedId` is the selection instead, and the drawer fields below serve that tab.
 	selectedId: string?,
 	-- Full issue for the drawer; nil until loaded.
 	detail: Issue?,
 	detailLoading: boolean,
-	-- Drawer open (selectedId set and user opened details).
+	-- Drawer open (a selection is set and the user opened details).
 	drawerOpen: boolean,
 	comment: Field,
 	link: LinkDraft?,
