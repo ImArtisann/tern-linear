@@ -46,6 +46,7 @@ queries.Issues =
       assignee { id name displayName avatarUrl }
       labels(first: 10) { nodes { id name color } }
       project { id name }
+      projectMilestone { id name }
       cycle { id number name }
       parent { id identifier title state { name type } }
       children(first: 10) { nodes { id identifier title state { name type } } }
@@ -66,6 +67,7 @@ queries.Issue = [[query Issue($id: String!, $commentsFirst: Int = 50, $commentsA
     assignee { id name displayName avatarUrl }
     labels(first: 25) { nodes { id name color } }
     project { id name }
+    projectMilestone { id name }
     cycle { id number name }
     parent { id identifier title state { name type } }
     children(first: 50) { nodes { id identifier title state { name type } } }
@@ -89,6 +91,7 @@ queries.IssueCreate = [[mutation IssueCreate($input: IssueCreateInput!) {
       assignee { id name displayName avatarUrl }
       labels(first: 10) { nodes { id name color } }
       project { id name }
+      projectMilestone { id name }
       cycle { id number name }
       parent { id identifier title state { name type } }
       children(first: 10) { nodes { id identifier title state { name type } } }
@@ -109,6 +112,7 @@ queries.IssueUpdate = [[mutation IssueUpdate($id: String!, $input: IssueUpdateIn
       assignee { id name displayName avatarUrl }
       labels(first: 10) { nodes { id name color } }
       project { id name }
+      projectMilestone { id name }
       cycle { id number name }
       parent { id identifier title state { name type } }
       children(first: 10) { nodes { id identifier title state { name type } } }
@@ -145,6 +149,98 @@ queries.IssueLookup = [[query IssueLookup($id: String!) {
 queries.IssuesChanged = [[query IssuesChanged($filter: IssueFilter, $includeArchived: Boolean = false) {
   issues(filter: $filter, first: 1, orderBy: updatedAt, includeArchived: $includeArchived) {
     nodes { id updatedAt }
+  }
+}]]
+
+-- The organization's project statuses: a plain list (no connection), a few per workspace.
+queries.ProjectStatuses = [[query ProjectStatuses {
+  organization { projectStatuses { id name type color position archivedAt } }
+}]]
+
+-- Archived projects are excluded (`includeArchived` defaults to false). `teams` is capped at 5 per project:
+-- the board shows team keys only, and every nested connection multiplies the cost by the page size.
+queries.Projects =
+	[[query Projects($filter: ProjectFilter, $first: Int = 50, $after: String, $orderBy: PaginationOrderBy = updatedAt) {
+  projects(filter: $filter, first: $first, after: $after, orderBy: $orderBy) {
+    nodes {
+      id name url slugId icon color description priority sortOrder progress health
+      startDate targetDate createdAt updatedAt startedAt completedAt canceledAt
+      status { id name type color position }
+      lead { id name displayName avatarUrl }
+      teams(first: 5) { nodes { id key name } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}]]
+
+-- Cheap change detection for projects mode: the most recently updated project under the list's filter.
+queries.ProjectsChanged = [[query ProjectsChanged($filter: ProjectFilter) {
+  projects(filter: $filter, first: 1, orderBy: updatedAt) {
+    nodes { id updatedAt }
+  }
+}]]
+
+-- The project page's status select and `[` / `]` on projects: only `statusId` can change (the input is built here, not
+-- by the caller). The project comes back with the `Projects` list's selection, so it replaces the list item as is.
+queries.ProjectStatusUpdate = [[mutation ProjectStatusUpdate($id: String!, $statusId: String!) {
+  projectUpdate(id: $id, input: { statusId: $statusId }) {
+    success
+    project {
+      id name url slugId icon color description priority sortOrder progress health
+      startDate targetDate createdAt updatedAt startedAt completedAt canceledAt
+      status { id name type color position }
+      lead { id name displayName avatarUrl }
+      teams(first: 5) { nodes { id key name } }
+    }
+  }
+}]]
+
+-- The project page: the list fields (teams up to 10) plus the overview's document, date precisions, members, labels
+-- and milestones. `Query.project` also returns archived projects. IssueConnection has no count, so milestones carry no
+-- issue count: counting would need a nested `issues` page per milestone, multiplying the cost. `filterMilestone` (only
+-- with `$milestoneId`) looks up the Issues tab's milestone filter by id, so one outside the first 50 is not taken as
+-- deleted.
+queries.Project = [[query Project($id: String!, $milestoneId: ID, $withMilestone: Boolean = false) {
+  project(id: $id) {
+    id name url slugId icon color description content priority sortOrder progress health healthUpdatedAt
+    startDate startDateResolution targetDate targetDateResolution createdAt updatedAt startedAt completedAt canceledAt
+    status { id name type color position }
+    lead { id name displayName avatarUrl }
+    teams(first: 10) { nodes { id key name } }
+    members(first: 50) { nodes { id name displayName avatarUrl } }
+    labels(first: 25) { nodes { id name color isGroup } }
+    projectMilestones(first: 50) { nodes { id name status progress targetDate sortOrder } pageInfo { hasNextPage } }
+    filterMilestone: projectMilestones(first: 1, filter: { id: { eq: $milestoneId } }) @include(if: $withMilestone) {
+      nodes { id name status progress targetDate sortOrder }
+    }
+  }
+}]]
+
+-- The Activity tab: published project updates, newest first, each with its newest 10 comments (Linear's `first`
+-- returns the newest; the client sorts them ascending). `commentCount` counts all of them.
+queries.ProjectUpdates = [[query ProjectUpdates($id: String!, $first: Int = 20, $after: String) {
+  project(id: $id) {
+    id
+    projectUpdates(first: $first, after: $after) {
+      nodes {
+        id body health createdAt editedAt commentCount url
+        user { id name displayName avatarUrl }
+        comments(first: 10) { nodes { id body createdAt parentId user { id name displayName avatarUrl } } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}]]
+
+-- The Activity tab: project history records, most recently updated first, so no unloaded record holds an event
+-- newer than the oldest loaded record's `updatedAt`. `entries` is untyped JSON (model.historyEvent reads it).
+queries.ProjectHistory = [[query ProjectHistory($id: String!, $first: Int = 25, $after: String) {
+  project(id: $id) {
+    id
+    history(first: $first, after: $after, orderBy: updatedAt) {
+      nodes { id createdAt updatedAt entries }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }]]
 

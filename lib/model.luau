@@ -6,7 +6,14 @@ local types = require("./types")
 
 type Issue = types.Issue
 type IssueRef = types.IssueRef
+type BlockState = types.BlockState
+type IssueFilters = types.IssueFilters
 type Prefs = types.Prefs
+type Project = types.Project
+type ProjectStatus = types.ProjectStatus
+type ProjectMilestone = types.ProjectMilestone
+type ProjectIssuesState = types.ProjectIssuesState
+type ProjectTab = types.ProjectTab
 type Team = types.Team
 type WorkflowState = types.WorkflowState
 type Form = types.Form
@@ -18,6 +25,16 @@ export type Column = {
 	stateId: string?,
 	color: string?,
 	issues: { Issue },
+}
+
+-- One board column of projects mode: an organization project status.
+export type ProjectColumn = {
+	id: string,
+	title: string,
+	statusType: string,
+	statusId: string,
+	color: string,
+	projects: { Project },
 }
 
 local model = {}
@@ -141,6 +158,16 @@ function model.serverFilter(prefs: Prefs): any
 	return { ["and"] = parts }
 end
 
+-- The project page's Issues tab: the project's issues in a view, AND (when set) one of its milestones.
+function model.projectIssueFilter(projectId: string, view: string, milestoneId: string?): any
+	local parts: { any } = { { project = { id = { eq = projectId } } } }
+	if milestoneId ~= nil then
+		table.insert(parts, { projectMilestone = { id = { eq = milestoneId } } })
+	end
+	table.insert(parts, viewFilter(view))
+	return { ["and"] = parts }
+end
+
 -- ─── Ordering ───────────────────────────────────────────────────────────────
 
 local NO_PRIORITY_RANK = 5
@@ -204,6 +231,18 @@ local function lessWith(compareIssues: (Issue, Issue) -> number): (Issue, Issue)
 		end
 		return a.id < b.id
 	end
+end
+
+-- ─── Rate limits ────────────────────────────────────────────────────────────
+
+-- The banner while Linear's rate limit backs off; `isRateMessage` recognizes it (its countdown is refreshed and
+-- cleared, other errors are left alone).
+function model.rateMessage(waitMs: number): string
+	return string.format("Rate limited by Linear; retrying in %ds", math.ceil(waitMs / 1000))
+end
+
+function model.isRateMessage(message: string?): boolean
+	return message ~= nil and string.find(message, "^Rate limited") ~= nil
 end
 
 -- ─── Dates ──────────────────────────────────────────────────────────────────
@@ -296,6 +335,11 @@ function model.relativeTime(iso: string, now: number): string
 	if at == nil then
 		return ""
 	end
+	return model.relativeSince(at, now)
+end
+
+-- model.relativeTime of an epoch second.
+function model.relativeSince(at: number, now: number): string
 	local elapsed = now - at
 	if elapsed < 60 then
 		return "now"
@@ -354,7 +398,7 @@ local function hasLabel(issue: Issue, labelId: string): boolean
 	return false
 end
 
-function model.visible(issues: { Issue }, prefs: Prefs, query: string, viewerId: string?): { Issue }
+function model.visible(issues: { Issue }, filters: IssueFilters, query: string, viewerId: string?): { Issue }
 	local needle = string.lower(string.match(query, "^%s*(.-)%s*$") :: string)
 	local key, number = model.parseIdentifier(needle)
 	local seen: { [string]: boolean } = {}
@@ -362,9 +406,9 @@ function model.visible(issues: { Issue }, prefs: Prefs, query: string, viewerId:
 	for _, issue in issues do
 		local keep = not seen[issue.id]
 			and (needle == "" or matchesQuery(issue, needle, key, number))
-			and (prefs.priority == nil or issue.priority == prefs.priority)
-			and (prefs.assignee == nil or matchesAssignee(issue, prefs.assignee, viewerId))
-			and (prefs.labelId == nil or hasLabel(issue, prefs.labelId))
+			and (filters.priority == nil or issue.priority == filters.priority)
+			and (filters.assignee == nil or matchesAssignee(issue, filters.assignee, viewerId))
+			and (filters.labelId == nil or hasLabel(issue, filters.labelId))
 		if keep then
 			table.insert(out, issue)
 		end
@@ -441,12 +485,23 @@ local function mineColumns(visible: { Issue }, stateTypes: { string }): { Column
 	return columns
 end
 
+-- One column per workflow state of `team` whose type the view shows, empty ones included.
+function model.teamColumns(visible: { Issue }, team: Team, view: string): { Column }
+	return teamColumns(visible, team, model.viewTypes(view))
+end
+
+-- One column per state type of the view (duplicate folds into canceled), empty ones included; cards by priority.
+-- The board of My issues and of the project page's Issues tab: their issues come from several teams.
+function model.typeColumns(visible: { Issue }, view: string): { Column }
+	return mineColumns(visible, model.viewTypes(view))
+end
+
+-- Issues mode's board: team columns in team scope, type columns for My issues.
 function model.columns(visible: { Issue }, prefs: Prefs, team: Team?): { Column }
-	local stateTypes = model.viewTypes(prefs.view)
 	if prefs.scope == "team" and team ~= nil then
-		return teamColumns(visible, team, stateTypes)
+		return model.teamColumns(visible, team, prefs.view)
 	end
-	return mineColumns(visible, stateTypes)
+	return model.typeColumns(visible, prefs.view)
 end
 
 -- ─── Table sorting ──────────────────────────────────────────────────────────
@@ -495,6 +550,47 @@ function model.sortTable(visible: { Issue }, key: string, asc: boolean): { Issue
 		end)
 	)
 	return out
+end
+
+-- A table sort button: the same key toggles the direction; a new key starts ascending, except "updated" (newest
+-- first). Returns the new key and direction.
+function model.nextSort(current: string, asc: boolean, key: string): (string, boolean)
+	if current == key then
+		return key, not asc
+	end
+	return key, key ~= "updated"
+end
+
+-- ─── Keyboard navigation ────────────────────────────────────────────────────
+
+-- `id` stepped by `delta` through `ids` (clamped at the ends); the first id when `id` is not among them.
+function model.steppedId(ids: { string }, id: string?, delta: number): string?
+	if #ids == 0 then
+		return nil
+	end
+	local index = if id ~= nil then table.find(ids, id) else nil
+	return ids[if index == nil then 1 else math.clamp(index + delta, 1, #ids)]
+end
+
+-- The first id of the previous/next non-empty column (lists of ids) from the one holding `id` (the first non-empty
+-- column when `id` is in none).
+function model.adjacentColumnId(columns: { { string } }, id: string?, delta: number): string?
+	local currentColumn = 0
+	for position, ids in columns do
+		if id ~= nil and table.find(ids, id) ~= nil then
+			currentColumn = position
+		end
+	end
+	local step = if currentColumn == 0 then 1 else delta
+	local position = if currentColumn == 0 then 1 else currentColumn + delta
+	while position >= 1 and position <= #columns do
+		local first = columns[position][1]
+		if first ~= nil then
+			return first
+		end
+		position += step
+	end
+	return nil
 end
 
 -- ─── Workflow states ────────────────────────────────────────────────────────
@@ -561,6 +657,58 @@ function model.adjacentState(team: Team, issue: Issue, delta: number, view: stri
 	return candidates[current + delta]
 end
 
+-- The state types a type-column board shows for `view`, left to right (duplicate folds into canceled).
+local function columnTypes(stateTypes: { string }): { string }
+	local out: { string } = {}
+	for _, stateType in stateTypes do
+		if stateType ~= "duplicate" then
+			table.insert(out, stateType)
+		end
+	end
+	return out
+end
+
+-- `[` / `]` on a board with one column per state type (model.typeColumns): the first state (lowest position) of
+-- `team` (the issue's own team) in the nearest column before (delta < 0) or after (delta > 0) the issue's that the
+-- team has a state for; nil at the edge. An issue outside the view's columns steps through every state type.
+function model.adjacentTypeState(team: Team, issue: Issue, delta: number, view: string): WorkflowState?
+	local own = mineColumnType(issue.state.type)
+	local columns = columnTypes(model.viewTypes(view))
+	local index = table.find(columns, own)
+	if index == nil then
+		columns = columnTypes(STATE_TYPES)
+		index = table.find(columns, own)
+	end
+	if index == nil then
+		return nil
+	end
+	local step = if delta < 0 then -1 else 1
+	local position = index + step
+	while position >= 1 and position <= #columns do
+		local target = model.stateFor(team, columns[position])
+		if target ~= nil then
+			return target
+		end
+		position += step
+	end
+	return nil
+end
+
+-- The teams (in `teams` order) that own at least one of `issues`: the Issues tab's assignee and label options.
+function model.issueTeams(issues: { Issue }, teams: { Team }): { Team }
+	local owners: { [string]: boolean } = {}
+	for _, issue in issues do
+		owners[issue.teamId] = true
+	end
+	local out: { Team } = {}
+	for _, team in teams do
+		if owners[team.id] then
+			table.insert(out, team)
+		end
+	end
+	return out
+end
+
 -- ─── Forms ──────────────────────────────────────────────────────────────────
 
 -- name → current value, for every field that differs from its baseline.
@@ -578,6 +726,948 @@ function model.formDiff(form: Form): { [string]: string }
 		end
 	end
 	return changed
+end
+
+-- ─── Projects ───────────────────────────────────────────────────────────────
+
+local PROJECT_STATUS_TYPES: { string } =
+	table.freeze({ "backlog", "planned", "started", "paused", "completed", "canceled" })
+model.PROJECT_STATUS_TYPES = PROJECT_STATUS_TYPES
+
+local PROJECT_VIEW_TYPES: { [string]: { string } } = {
+	active = table.freeze({ "planned", "started", "paused" }),
+	backlog = table.freeze({ "backlog" }),
+	all = PROJECT_STATUS_TYPES,
+}
+
+local HEALTHS: { { value: string, label: string } } = {
+	{ value = "onTrack", label = "On track" },
+	{ value = "atRisk", label = "At risk" },
+	{ value = "offTrack", label = "Off track" },
+}
+model.HEALTHS = HEALTHS
+
+-- Worst first, so an ascending health sort leads with the projects that need attention.
+local HEALTH_RANK: { [string]: number } = { offTrack = 1, atRisk = 2, onTrack = 3 }
+local NO_HEALTH_RANK = 4
+
+function model.projectStatusRank(t: string): number
+	return table.find(PROJECT_STATUS_TYPES, t) or #PROJECT_STATUS_TYPES + 1
+end
+
+function model.projectViewTypes(view: string): { string }
+	return PROJECT_VIEW_TYPES[view] or PROJECT_VIEW_TYPES.active
+end
+
+function model.healthLabel(health: string?): string
+	for _, entry in HEALTHS do
+		if entry.value == health then
+			return entry.label
+		end
+	end
+	return "No update"
+end
+
+-- 0..1 → "0%"…"100%", rounded down so a project shows 100% only when it is complete.
+function model.progressLabel(progress: number): string
+	return `{math.floor(math.clamp(progress, 0, 1) * 100 + 1e-9)}%`
+end
+
+-- "YYYY-MM-DD" (or an ISO timestamp) → "Mar 4", with the year when it is not the year of `now`.
+function model.shortDate(date: string, now: number): string
+	local at = model.epoch(string.sub(date, 1, 10))
+	if at == nil then
+		return ""
+	end
+	local year, month, day = civilFromDays(at // SECONDS_PER_DAY)
+	local currentYear = civilFromDays(now // SECONDS_PER_DAY)
+	local label = `{MONTH_NAMES[month]} {day}`
+	return if year == currentYear then label else `{label}, {year}`
+end
+
+-- A date at Linear's DateResolutionType precision, as Linear shows it: month "Sep 2026", quarter "Q3 2026",
+-- halfYear "H2 2026", year "2026"; an exact date (nil or an unknown resolution) is model.shortDate.
+function model.resolvedDate(date: string, resolution: string?, now: number): string
+	local at = model.epoch(string.sub(date, 1, 10))
+	if at == nil then
+		return ""
+	end
+	local year, month = civilFromDays(at // SECONDS_PER_DAY)
+	if resolution == "month" then
+		return `{MONTH_NAMES[month]} {year}`
+	elseif resolution == "quarter" then
+		return `Q{(month - 1) // 3 + 1} {year}`
+	elseif resolution == "halfYear" then
+		return `H{if month <= 6 then 1 else 2} {year}`
+	elseif resolution == "year" then
+		return tostring(year)
+	end
+	return model.shortDate(date, now)
+end
+
+-- Linear ProjectFilter as plain tables; `{}` (no condition) when every project of the organization is wanted.
+-- Archived projects are excluded by the query itself (includeArchived defaults to false).
+function model.projectServerFilter(prefs: Prefs): any
+	local parts: { any } = {}
+	if prefs.projectScope == "mine" then
+		local leadOrMember: { any } = {
+			{ lead = { isMe = { eq = true } } },
+			{ members = { some = { isMe = { eq = true } } } },
+		}
+		table.insert(parts, { ["or"] = leadOrMember })
+	elseif prefs.projectScope == "team" and prefs.projectTeamId ~= nil then
+		table.insert(parts, { accessibleTeams = { some = { id = { eq = prefs.projectTeamId } } } })
+	end
+	if prefs.projectView ~= "all" then
+		table.insert(parts, { status = { type = { ["in"] = model.projectViewTypes(prefs.projectView) } } })
+	end
+	if #parts == 0 then
+		return {}
+	end
+	return { ["and"] = parts }
+end
+
+local function compareProjectStatus(a: Project, b: Project): number
+	local byType = compare(model.projectStatusRank(a.status.type), model.projectStatusRank(b.status.type))
+	if byType ~= 0 then
+		return byType
+	end
+	local byPosition = compare(a.status.position, b.status.position)
+	return if byPosition ~= 0 then byPosition else compareText(a.status.name, b.status.name)
+end
+
+local function compareProjectName(a: Project, b: Project): number
+	return compareText(a.name, b.name)
+end
+
+-- Inside a column: priority (1..4, then none), then Linear's manual order, then name.
+local function compareProjectCard(a: Project, b: Project): number
+	local byPriority = compare(priorityRank(a.priority), priorityRank(b.priority))
+	if byPriority ~= 0 then
+		return byPriority
+	end
+	local bySortOrder = compare(a.sortOrder, b.sortOrder)
+	return if bySortOrder ~= 0 then bySortOrder else compareProjectName(a, b)
+end
+
+local function lessProjects(compareWith: (Project, Project) -> number): (Project, Project) -> boolean
+	return function(a: Project, b: Project): boolean
+		local c = compareWith(a, b)
+		if c ~= 0 then
+			return c < 0
+		end
+		return a.id < b.id
+	end
+end
+
+local function projectHaystack(project: Project): string
+	local parts: { string } = { project.name }
+	local lead = project.lead
+	if lead ~= nil then
+		table.insert(parts, lead.name)
+		table.insert(parts, lead.displayName)
+	end
+	for _, team in project.teams do
+		table.insert(parts, team.key)
+	end
+	return string.lower(table.concat(parts, "\n"))
+end
+
+local function matchesLead(project: Project, wanted: string, viewerId: string?): boolean
+	local lead = project.lead
+	if wanted == "none" then
+		return lead == nil
+	end
+	local id = if wanted == "me" then viewerId else wanted
+	return lead ~= nil and id ~= nil and lead.id == id
+end
+
+local function matchesHealth(project: Project, wanted: string): boolean
+	if wanted == "none" then
+		return project.health == nil
+	end
+	return project.health == wanted
+end
+
+-- Client filters (query over name, lead and team keys; lead; health), deduped by id, in board order:
+-- status (type rank, position), then priority, sortOrder and name.
+function model.visibleProjects(projects: { Project }, prefs: Prefs, query: string, viewerId: string?): { Project }
+	local needle = string.lower(string.match(query, "^%s*(.-)%s*$") :: string)
+	local seen: { [string]: boolean } = {}
+	local out: { Project } = {}
+	for _, project in projects do
+		local keep = not seen[project.id]
+			and (needle == "" or string.find(projectHaystack(project), needle, 1, true) ~= nil)
+			and (prefs.projectLead == nil or matchesLead(project, prefs.projectLead, viewerId))
+			and (prefs.projectHealth == nil or matchesHealth(project, prefs.projectHealth))
+		if keep then
+			table.insert(out, project)
+		end
+		seen[project.id] = true
+	end
+	table.sort(
+		out,
+		lessProjects(function(a: Project, b: Project): number
+			local byStatus = compareProjectStatus(a, b)
+			return if byStatus ~= 0 then byStatus else compareProjectCard(a, b)
+		end)
+	)
+	return out
+end
+
+local function statusOrder(a: ProjectStatus, b: ProjectStatus): boolean
+	local rankA, rankB = model.projectStatusRank(a.type), model.projectStatusRank(b.type)
+	if rankA ~= rankB then
+		return rankA < rankB
+	end
+	if a.position ~= b.position then
+		return a.position < b.position
+	end
+	return a.id < b.id
+end
+
+-- One column per organization status whose type is in the view (empty ones included), ordered by type rank
+-- then position. A project whose status is missing from `statuses` (stale list) gets a column of its own.
+function model.projectColumns(visible: { Project }, prefs: Prefs, statuses: { ProjectStatus }): { ProjectColumn }
+	local viewTypes = model.projectViewTypes(prefs.projectView)
+	local wanted: { ProjectStatus } = {}
+	local known: { [string]: boolean } = {}
+	local function want(status: ProjectStatus)
+		if not known[status.id] and inList(viewTypes, status.type) then
+			known[status.id] = true
+			table.insert(wanted, status)
+		end
+	end
+	for _, status in statuses do
+		want(status)
+	end
+	for _, project in visible do
+		want(project.status)
+	end
+	table.sort(wanted, statusOrder)
+
+	local columns: { ProjectColumn } = {}
+	local byStatus: { [string]: ProjectColumn } = {}
+	for _, status in wanted do
+		local column: ProjectColumn = {
+			id = status.id,
+			title = status.name,
+			statusType = status.type,
+			statusId = status.id,
+			color = status.color,
+			projects = {},
+		}
+		table.insert(columns, column)
+		byStatus[status.id] = column
+	end
+	for _, project in visible do
+		local column = byStatus[project.status.id]
+		if column ~= nil then
+			table.insert(column.projects, project)
+		end
+	end
+	for _, column in columns do
+		table.sort(column.projects, lessProjects(compareProjectCard))
+	end
+	return columns
+end
+
+-- The statuses of `statuses` whose type is in `statusTypes` (nil: every type), in board order (type rank, then
+-- position), with `current` among them when its type is: a list that lacks it (an archived or stale status) still
+-- places it.
+local function statusChoices(
+	statuses: { ProjectStatus },
+	current: ProjectStatus,
+	statusTypes: { string }?
+): { ProjectStatus }
+	local out: { ProjectStatus } = {}
+	local listed = false
+	for _, status in statuses do
+		if statusTypes == nil or inList(statusTypes, status.type) then
+			table.insert(out, status)
+			listed = listed or status.id == current.id
+		end
+	end
+	if not listed and (statusTypes == nil or inList(statusTypes, current.type)) then
+		table.insert(out, current)
+	end
+	table.sort(out, statusOrder)
+	return out
+end
+
+-- The project page's status select: every organization status in board order, the project's own included.
+function model.projectStatusChoices(statuses: { ProjectStatus }, current: ProjectStatus): { ProjectStatus }
+	return statusChoices(statuses, current, nil)
+end
+
+-- `[` / `]` on projects: the status before (delta < 0) or after (delta > 0) `current` in board order, or nil at the
+-- edge. `view` (the list's Prefs.projectView) limits the steps to the statuses the board shows as columns; nil (the
+-- project page) steps through every status, and so does a project whose status is outside the view's types.
+function model.adjacentProjectStatus(
+	statuses: { ProjectStatus },
+	current: ProjectStatus,
+	delta: number,
+	view: string?
+): ProjectStatus?
+	local function indexIn(list: { ProjectStatus }): number?
+		for index, status in list do
+			if status.id == current.id then
+				return index
+			end
+		end
+		return nil
+	end
+	local candidates = statusChoices(statuses, current, if view ~= nil then model.projectViewTypes(view) else nil)
+	local index = indexIn(candidates)
+	if index == nil then
+		candidates = statusChoices(statuses, current, nil)
+		index = indexIn(candidates)
+	end
+	if index == nil then
+		return nil
+	end
+	return candidates[index + (if delta < 0 then -1 else 1)]
+end
+
+local function healthRank(health: string?): number
+	return if health ~= nil then HEALTH_RANK[health] or NO_HEALTH_RANK else NO_HEALTH_RANK
+end
+
+-- 1 when only `a` is missing, -1 when only `b` is: missing values (no lead, no target date) sort last.
+local function missingOrder(aMissing: boolean, bMissing: boolean): number
+	return compare(if aMissing then 1 else 0, if bMissing then 1 else 0)
+end
+
+local PROJECT_COMPARATORS: { [string]: (Project, Project) -> number } = {
+	name = compareProjectName,
+	status = compareProjectStatus,
+	health = function(a: Project, b: Project): number
+		return compare(healthRank(a.health), healthRank(b.health))
+	end,
+	lead = function(a: Project, b: Project): number
+		local left, right = a.lead, b.lead
+		if left == nil or right == nil then
+			return missingOrder(left == nil, right == nil)
+		end
+		return compareText(left.name, right.name)
+	end,
+	target = function(a: Project, b: Project): number
+		local left, right = a.targetDate, b.targetDate
+		if left == nil or right == nil then
+			return missingOrder(left == nil, right == nil)
+		end
+		return compare(model.epoch(left) or 0, model.epoch(right) or 0)
+	end,
+	progress = function(a: Project, b: Project): number
+		return compare(a.progress, b.progress)
+	end,
+	updated = function(a: Project, b: Project): number
+		return compare(model.epoch(a.updatedAt) or 0, model.epoch(b.updatedAt) or 0)
+	end,
+}
+
+model.PROJECT_SORT_KEYS = table.freeze({ "name", "status", "health", "lead", "target", "progress", "updated" })
+
+-- Table order for projects mode; ties fall back to the name. Unknown keys sort by name.
+function model.sortProjects(visible: { Project }, key: string, asc: boolean): { Project }
+	local base = PROJECT_COMPARATORS[key] or compareProjectName
+	local out = table.clone(visible)
+	table.sort(
+		out,
+		lessProjects(function(a: Project, b: Project): number
+			local c = base(a, b)
+			if c == 0 then
+				return compareProjectName(a, b)
+			end
+			return if asc then c else -c
+		end)
+	)
+	return out
+end
+
+-- ─── Project page ───────────────────────────────────────────────────────────
+
+-- The project page's tabs in tab-bar order. A layer that adds a tab appends it here (and to types.ProjectTab).
+local PROJECT_TABS: { { id: ProjectTab, label: string } } = table.freeze({
+	table.freeze({ id = "overview" :: ProjectTab, label = "Overview" }),
+	table.freeze({ id = "activity" :: ProjectTab, label = "Activity" }),
+	table.freeze({ id = "issues" :: ProjectTab, label = "Issues" }),
+})
+model.PROJECT_TABS = PROJECT_TABS
+
+-- The tab named `id`, or nil when no tab has that id (a saved tab a later version dropped).
+function model.projectTab(id: any): ProjectTab?
+	for _, tab in PROJECT_TABS do
+		if tab.id == id then
+			return tab.id
+		end
+	end
+	return nil
+end
+
+-- The tab `delta` steps from `current`, wrapping around; the first tab when `current` is unknown.
+function model.stepProjectTab(current: ProjectTab, delta: number): ProjectTab
+	local index = 0
+	for position, tab in PROJECT_TABS do
+		if tab.id == current then
+			index = position
+		end
+	end
+	if index == 0 then
+		return PROJECT_TABS[1].id
+	end
+	return PROJECT_TABS[(index - 1 + delta) % #PROJECT_TABS + 1].id
+end
+
+-- The project page's Issues tab while it is on screen (projects mode, a page open on that tab), else nil. The issue
+-- list, selection and drawer then belong to it instead of issues mode.
+function model.issuesTab(state: BlockState): ProjectIssuesState?
+	local page = state.projectPage
+	if state.prefs.mode ~= "projects" or page == nil or page.tab ~= "issues" then
+		return nil
+	end
+	return page.issues
+end
+
+-- The issue list on screen: the Issues tab's while it shows, else issues mode's.
+function model.issueList(state: BlockState): { Issue }
+	local tab = model.issuesTab(state)
+	return if tab ~= nil then tab.items else state.issues
+end
+
+-- The selected issue of the list on screen (the drawer's issue while it is open).
+function model.selectedIssueId(state: BlockState): string?
+	local tab = model.issuesTab(state)
+	return if tab ~= nil then tab.selectedId else state.selectedId
+end
+
+local MILESTONE_STATUS_LABELS: { [string]: string } = {
+	unstarted = "Not started",
+	next = "Next",
+	overdue = "Overdue",
+	done = "Done",
+}
+
+-- ProjectMilestoneStatus → label; unknown statuses read as not started.
+function model.milestoneStatusLabel(status: string): string
+	return MILESTONE_STATUS_LABELS[status] or MILESTONE_STATUS_LABELS.unstarted
+end
+
+-- Linear's milestone order: sortOrder, then target date (none last), then name, then id. Returns a new list.
+function model.sortMilestones(milestones: { ProjectMilestone }): { ProjectMilestone }
+	local out = table.clone(milestones)
+	table.sort(out, function(a: ProjectMilestone, b: ProjectMilestone): boolean
+		if a.sortOrder ~= b.sortOrder then
+			return a.sortOrder < b.sortOrder
+		end
+		local left, right = a.targetDate, b.targetDate
+		if left ~= right then
+			if left == nil or right == nil then
+				return right == nil
+			end
+			return left < right
+		end
+		local byName = compareText(a.name, b.name)
+		if byName ~= 0 then
+			return byName < 0
+		end
+		return a.id < b.id
+	end)
+	return out
+end
+
+-- The milestone with that id, nil when the list has none (the Issues tab's milestone filter checks a click, a select
+-- pick and a restored or polled filter against the page's milestones).
+function model.milestoneById(milestones: { ProjectMilestone }, id: string?): ProjectMilestone?
+	if id == nil then
+		return nil
+	end
+	for _, milestone in milestones do
+		if milestone.id == id then
+			return milestone
+		end
+	end
+	return nil
+end
+
+-- "ada, grace, linus" with at most `max` names, then "+N" for the rest; "" for none.
+function model.namesLabel(names: { string }, max: number): string
+	if #names <= max then
+		return table.concat(names, ", ")
+	end
+	local shown = table.move(names, 1, max, 1, {})
+	return `{table.concat(shown, ", ")} +{#names - max}`
+end
+
+-- ─── Project activity ───────────────────────────────────────────────────────
+
+-- Display names the Activity tab resolves ids with: users, teams and the project's milestones, by id.
+export type ActivityNames = {
+	users: { [string]: string },
+	teams: { [string]: string },
+	milestones: { [string]: string },
+}
+
+-- One history event the Activity tab can describe: `actor` (nil for events without one, e.g. a milestone that
+-- completed) and `text` read as one line, "<actor> <text>".
+export type HistoryEvent = {
+	-- The event's `type` (status, startDate, …).
+	kind: string,
+	-- Epoch seconds.
+	time: number,
+	actor: string?,
+	text: string,
+}
+
+-- One row of the Activity tab: a project update or a history event, `time` in epoch seconds.
+export type ActivityItem = {
+	-- Update id, or "<history record id>:<entry index>".
+	id: string,
+	time: number,
+	update: types.ProjectUpdate?,
+	event: HistoryEvent?,
+}
+
+export type ActivityTimeline = {
+	-- Newest first; only items no unloaded page can precede (see model.activityTimeline).
+	items: { ActivityItem },
+	-- A source has another page (`Load more`).
+	more: boolean,
+}
+
+local UNKNOWN_ACTOR = "Someone"
+
+-- Names for `users` (display name), `teams` and `milestones` (name); later entries never replace earlier ones.
+function model.activityNames(
+	users: { types.User },
+	teams: { { id: string, name: string } },
+	milestones: { ProjectMilestone }
+): ActivityNames
+	local names: ActivityNames = { users = {}, teams = {}, milestones = {} }
+	for _, user in users do
+		if names.users[user.id] == nil then
+			names.users[user.id] = if user.displayName ~= "" then user.displayName else user.name
+		end
+	end
+	for _, team in teams do
+		if names.teams[team.id] == nil then
+			names.teams[team.id] = team.name
+		end
+	end
+	for _, milestone in milestones do
+		if names.milestones[milestone.id] == nil then
+			names.milestones[milestone.id] = milestone.name
+		end
+	end
+	return names
+end
+
+local function nonEmpty(value: any): string?
+	return if type(value) == "string" and value ~= "" then value else nil
+end
+
+-- "<a>", "<a> and <b>", "<a>, <b> and <c>".
+local function joinNames(names: { string }): string
+	if #names <= 1 then
+		return names[1] or ""
+	end
+	return `{table.concat(names, ", ", 1, #names - 1)} and {names[#names]}`
+end
+
+-- The actor of an entry: `actorId`, else every `actorIds` member; an id nobody resolves reads "Someone"
+-- (an integration's `source.displayName` when it has one). nil when the entry names no actor.
+local function entryActor(entry: any, names: ActivityNames): string?
+	local ids: { string } = {}
+	if type(entry.actorId) == "string" then
+		table.insert(ids, entry.actorId)
+	elseif type(entry.actorIds) == "table" then
+		for _, id in ipairs(entry.actorIds) do
+			if type(id) == "string" then
+				table.insert(ids, id)
+			end
+		end
+	end
+	if #ids == 0 then
+		return nil
+	end
+	local resolved: { string } = {}
+	local unknown = false
+	for _, id in ids do
+		local name = names.users[id]
+		if name ~= nil then
+			table.insert(resolved, name)
+		else
+			unknown = true
+		end
+	end
+	if unknown then
+		local source = entry.source
+		local via = if type(source) == "table" then nonEmpty(source.displayName) else nil
+		table.insert(resolved, via or UNKNOWN_ACTOR)
+	end
+	return joinNames(resolved)
+end
+
+-- Names of one side (added or removed) of a list event; `unknown` counts ids no name resolves.
+type NamedSide = { names: { string }, unknown: number }
+
+-- A milestone reference `{id, name}`: its name, else the project's name for that id (Linear sends `name` empty).
+-- nil when the value is not such a reference; "" when neither names it.
+local function milestoneName(value: any, names: ActivityNames): string?
+	if type(value) ~= "table" or type(value.id) ~= "string" then
+		return nil
+	end
+	return nonEmpty(value.name) or names.milestones[value.id] or ""
+end
+
+-- The names of a list of milestone references; unnamed ones count as unknown. nil when it is not such a list.
+local function milestoneList(value: any, names: ActivityNames): NamedSide?
+	if type(value) ~= "table" then
+		return nil
+	end
+	local side: NamedSide = { names = {}, unknown = 0 }
+	for _, item in ipairs(value) do
+		local name = milestoneName(item, names)
+		if name == nil then
+			return nil
+		elseif name == "" then
+			side.unknown += 1
+		else
+			table.insert(side.names, name)
+		end
+	end
+	return side
+end
+
+-- Team names of a list of team ids; nil when the value is not a list of strings.
+local function teamList(value: any, names: ActivityNames): NamedSide?
+	if type(value) ~= "table" then
+		return nil
+	end
+	local side: NamedSide = { names = {}, unknown = 0 }
+	for _, id in ipairs(value) do
+		if type(id) ~= "string" then
+			return nil
+		end
+		local name = names.teams[id]
+		if name ~= nil then
+			table.insert(side.names, name)
+		else
+			side.unknown += 1
+		end
+	end
+	return side
+end
+
+-- "added team Design", "added teams Design and Engineering", "added a team", "added 2 teams",
+-- "added teams Design and 1 other"; nil for an empty side.
+local function sidePhrase(verb: string, noun: string, side: NamedSide): string?
+	local count = #side.names + side.unknown
+	if count == 0 then
+		return nil
+	elseif #side.names == 0 then
+		return if count == 1 then `{verb} a {noun}` else `{verb} {count} {noun}s`
+	end
+	local list = table.clone(side.names)
+	if side.unknown > 0 then
+		table.insert(list, if side.unknown == 1 then "1 other" else `{side.unknown} others`)
+	end
+	return `{verb} {if count == 1 then noun else noun .. "s"} {joinNames(list)}`
+end
+
+-- "added milestone Alpha and removed milestones Beta and Gamma"; nil when both sides are empty.
+local function addedRemoved(noun: string, added: NamedSide, removed: NamedSide): string?
+	local add = sidePhrase("added", noun, added)
+	local remove = sidePhrase("removed", noun, removed)
+	if add ~= nil and remove ~= nil then
+		return `{add} and {remove}`
+	end
+	return add or remove
+end
+
+-- Describers per entry `type` (the kinds observed in live data; docs/ARCHITECTURE.md lists them). Each returns the
+-- line's text, or nil when the entry does not have the shape that kind was seen with.
+local HISTORY_KINDS: { [string]: (entry: any, names: ActivityNames, now: number) -> string? } = {
+	status = function(entry)
+		local from = if type(entry.fromStatus) == "table" then nonEmpty(entry.fromStatus.name) else nil
+		local to = if type(entry.toStatus) == "table" then nonEmpty(entry.toStatus.name) else nil
+		if to == nil then
+			return nil
+		end
+		return if from ~= nil then `changed status from {from} to {to}` else `changed status to {to}`
+	end,
+	startDate = function(entry, _names, now)
+		local to = nonEmpty(entry.to)
+		local label = if to ~= nil then model.shortDate(to, now) else ""
+		return if label ~= "" then `set the start date to {label}` else nil
+	end,
+	name = function(entry)
+		local from = nonEmpty(entry.from)
+		local to = nonEmpty(entry.to)
+		if to == nil then
+			return nil
+		end
+		return if from ~= nil then `renamed the project from {from} to {to}` else `renamed the project to {to}`
+	end,
+	icon = function()
+		return "changed the icon"
+	end,
+	content = function()
+		return "updated the description"
+	end,
+	description = function()
+		return "updated the summary"
+	end,
+	leadTeamId = function(entry, names)
+		local fromId, toId = entry.from, entry.to
+		-- Each side is a team id or absent (no lead team); anything else is not the shape seen live.
+		if (fromId ~= nil and type(fromId) ~= "string") or (toId ~= nil and type(toId) ~= "string") then
+			return nil
+		elseif fromId == nil and toId == nil then
+			return nil
+		end
+		local from = if fromId ~= nil then names.teams[fromId] else nil
+		local to = if toId ~= nil then names.teams[toId] else nil
+		if from ~= nil and to ~= nil then
+			return `changed the lead team from {from} to {to}`
+		elseif to ~= nil then
+			return `changed the lead team to {to}`
+		end
+		return "changed the lead team"
+	end,
+	teams = function(entry, names)
+		local added = teamList(entry.added or {}, names)
+		local removed = teamList(entry.removed or {}, names)
+		if added == nil or removed == nil then
+			return nil
+		end
+		return addedRemoved("team", added, removed)
+	end,
+	milestones = function(entry, names)
+		local added = milestoneList(entry.added or {}, names)
+		local removed = milestoneList(entry.removed or {}, names)
+		if added == nil or removed == nil then
+			return nil
+		end
+		return addedRemoved("milestone", added, removed)
+	end,
+	milestone_completion = function(entry, names)
+		local name = milestoneName(entry.milestone, names)
+		if name == nil then
+			return nil
+		end
+		return if name ~= "" then `Milestone {name} completed` else "A milestone was completed"
+	end,
+}
+
+-- Kinds that never name an actor: their text is the whole line.
+local ACTORLESS: { [string]: boolean } = { milestone_completion = true }
+
+-- One raw `ProjectHistory.entries` element as a line, or nil when its kind is unknown or its shape is not the one
+-- observed (no `type`, no numeric `at` or one outside the dates the host can show, missing fields). Ids resolve
+-- through `names`; `now` dates short dates.
+function model.historyEvent(entry: any, names: ActivityNames, now: number): HistoryEvent?
+	if type(entry) ~= "table" or type(entry.type) ~= "string" or type(entry.at) ~= "number" then
+		return nil
+	end
+	local time = entry.at / 1000
+	if os.date("*t", math.floor(time)) == nil then
+		return nil
+	end
+	local describe = HISTORY_KINDS[entry.type]
+	if describe == nil then
+		return nil
+	end
+	local ok, line = pcall(describe, entry, names, now)
+	if not ok or type(line) ~= "string" then
+		return nil
+	end
+	local actor: string? = nil
+	if not ACTORLESS[entry.type] then
+		actor = entryActor(entry, names) or UNKNOWN_ACTOR
+	end
+	return { kind = entry.type, time = time, actor = actor, text = line }
+end
+
+-- The oldest time of a source with more pages: anything older may still be preceded by an unloaded item.
+local function sourceFloor<T>(source: types.ActivitySource<T>, timeOf: (T) -> number?): number?
+	if not source.hasMore then
+		return nil
+	end
+	local floor: number? = nil
+	for _, item in source.items do
+		local time = timeOf(item)
+		if time ~= nil and (floor == nil or time < floor) then
+			floor = time
+		end
+	end
+	return floor
+end
+
+local function updateTime(update: types.ProjectUpdate): number?
+	return model.epoch(update.createdAt)
+end
+
+local function recordTime(record: types.ProjectHistoryRecord): number?
+	return model.epoch(record.updatedAt)
+end
+
+-- The Activity tab's timeline: updates and the history events `historyEvent` describes, newest first. Equal times
+-- list history events before updates, each in the order they were loaded (records, then entries; updates), the
+-- order the next pages continue. Items an unloaded page could list above are held back: items older than the
+-- oldest loaded item of a source with more pages and, when that source is the history, updates at that very time
+-- (an unloaded event of that time lists above them). So loading the next page never inserts above a shown item.
+function model.activityTimeline(activity: types.ProjectActivity, names: ActivityNames, now: number): ActivityTimeline
+	local items: { ActivityItem } = {}
+	for _, record in activity.history.items do
+		for index, entry in record.entries do
+			local event = model.historyEvent(entry, names, now)
+			if event ~= nil then
+				table.insert(items, { id = `{record.id}:{index}`, time = event.time, update = nil, event = event })
+			end
+		end
+	end
+	for _, update in activity.updates.items do
+		local time = updateTime(update)
+		if time ~= nil then
+			table.insert(items, { id = update.id, time = time, update = update, event = nil })
+		end
+	end
+	local cutoff = sourceFloor(activity.updates, updateTime)
+	local historyFloor = sourceFloor(activity.history, recordTime)
+	if historyFloor ~= nil and (cutoff == nil or historyFloor > cutoff) then
+		cutoff = historyFloor
+	end
+	local holdUpdates = historyFloor ~= nil and historyFloor == cutoff
+	local order: { [ActivityItem]: number } = {}
+	local shown: { ActivityItem } = {}
+	for index, item in items do
+		order[item] = index
+		if
+			cutoff == nil
+			or item.time > cutoff
+			or (item.time == cutoff and not (holdUpdates and item.update ~= nil))
+		then
+			table.insert(shown, item)
+		end
+	end
+	table.sort(shown, function(a: ActivityItem, b: ActivityItem): boolean
+		if a.time ~= b.time then
+			return a.time > b.time
+		end
+		return order[a] < order[b]
+	end)
+	return { items = shown, more = activity.updates.hasMore or activity.history.hasMore }
+end
+
+-- The cursors `Load more` sends: each source with another page; nil when no source has one.
+function model.activityCursors(activity: types.ProjectActivity): types.ActivityCursors?
+	local updates = if activity.updates.hasMore then activity.updates.cursor else nil
+	local history = if activity.history.hasMore then activity.history.cursor else nil
+	if updates == nil and history == nil then
+		return nil
+	end
+	return { updates = updates, history = history }
+end
+
+-- A reloaded first page merged over what was loaded. The older pages `Load more` added stay, with their cursor, only
+-- where the fresh page provably reaches them: the last fresh item that `old` holds at the same time (so at the same
+-- place in the order) anchors the merge, and the old items after it continue the fresh page. Without such an
+-- item a gap may lie between them, so the fresh page replaces the source and `Load more` pages from its cursor.
+local function reloadSource<T>(
+	old: types.ActivitySource<T>,
+	fresh: types.ActivitySource<T>,
+	idOf: (T) -> string,
+	timeOf: (T) -> number?
+): types.ActivitySource<T>
+	if not fresh.hasMore then
+		return fresh
+	end
+	local oldIndex: { [string]: number } = {}
+	for index, item in old.items do
+		oldIndex[idOf(item)] = index
+	end
+	local freshIds: { [string]: boolean } = {}
+	local anchor: number? = nil
+	for _, item in fresh.items do
+		local id = idOf(item)
+		freshIds[id] = true
+		local index = oldIndex[id]
+		local time = timeOf(item)
+		if index ~= nil and time ~= nil and timeOf(old.items[index]) == time and (anchor == nil or index > anchor) then
+			anchor = index
+		end
+	end
+	if anchor == nil then
+		return fresh
+	end
+	local items = table.clone(fresh.items)
+	for index = anchor + 1, #old.items do
+		local item = old.items[index]
+		if not freshIds[idOf(item)] then
+			table.insert(items, item)
+		end
+	end
+	if #items == #fresh.items then
+		return fresh
+	end
+	return { items = items, cursor = old.cursor, hasMore = old.hasMore }
+end
+
+local function updateId(update: types.ProjectUpdate): string
+	return update.id
+end
+
+local function recordId(record: types.ProjectHistoryRecord): string
+	return record.id
+end
+
+-- A reload of the first pages (`r`, the poll tick) applied over `old` (nil: the first load).
+function model.activityReloaded(old: types.ProjectActivity?, fresh: types.ProjectActivity): types.ProjectActivity
+	if old == nil then
+		return fresh
+	end
+	return {
+		updates = reloadSource(old.updates, fresh.updates, updateId, updateTime),
+		history = reloadSource(old.history, fresh.history, recordId, recordTime),
+	}
+end
+
+local function appendSource<T>(
+	old: types.ActivitySource<T>,
+	page: types.ActivitySource<T>,
+	idOf: (T) -> string
+): types.ActivitySource<T>
+	local seen: { [string]: boolean } = {}
+	local items = table.clone(old.items)
+	for _, item in items do
+		seen[idOf(item)] = true
+	end
+	for _, item in page.items do
+		if not seen[idOf(item)] then
+			seen[idOf(item)] = true
+			table.insert(items, item)
+		end
+	end
+	return { items = items, cursor = page.cursor, hasMore = page.hasMore }
+end
+
+-- The next pages (`Load more` with `cursors`) appended to `old`; sources without a cursor stay as they were.
+function model.activityAppended(
+	old: types.ProjectActivity,
+	page: types.ProjectActivity,
+	cursors: types.ActivityCursors
+): types.ProjectActivity
+	return {
+		updates = if cursors.updates ~= nil then appendSource(old.updates, page.updates, updateId) else old.updates,
+		history = if cursors.history ~= nil then appendSource(old.history, page.history, recordId) else old.history,
+	}
+end
+
+-- "Nov 22, 2026, 19:47" in the host's local time (the title of a relative time).
+function model.absoluteTime(at: number): string
+	local t = os.date("*t", math.floor(at)) :: { [string]: any }
+	return string.format("%s %d, %d, %02d:%02d", MONTH_NAMES[t.month], t.day, t.year, t.hour, t.min)
 end
 
 return model

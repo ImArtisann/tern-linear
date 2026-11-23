@@ -1,4 +1,4 @@
-// A stateful fake of the Linear GraphQL API for the twelve operations in lib/queries.luau.
+// A stateful fake of the Linear GraphQL API for the nineteen operations in lib/queries.luau.
 //
 // Requests are executed by graphql-js against Linear's real SDL (.cache/linear-schema.graphql), so variable coercion,
 // validation errors and the shape of every response follow the documents the plugin sends. Resolvers read and mutate an
@@ -194,6 +194,10 @@ class IssueMatcher {
 				return this.matchRelated(db.project(issue.projectId), condition, (project, sub) =>
 					this.matchEntries(sub, { id: project.id, name: project.name }),
 				);
+			case "projectMilestone":
+				return this.matchRelated(db.projectMilestone(issue.projectMilestoneId), condition, (milestone, sub) =>
+					this.matchEntries(sub, { id: milestone.id, name: milestone.name }),
+				);
 			case "labels":
 				return this.matchLabels(issue, condition);
 			case "hasBlockedByRelations":
@@ -242,6 +246,67 @@ class IssueMatcher {
 		if (condition.some && !labels.some((label) => matches(label, condition.some))) return false;
 		if (condition.every && !labels.every((label) => matches(label, condition.every))) return false;
 		if (condition.none && labels.some((label) => matches(label, condition.none))) return false;
+		return true;
+	}
+}
+
+/** Evaluates the `ProjectFilter` subset the plugin sends (plus a few neighbours) against one project record. */
+class ProjectMatcher extends IssueMatcher {
+	matchKey(project, key, condition) {
+		const db = this.db;
+		const date = (value) => resolveDate(value, this.now);
+		switch (key) {
+			case "and":
+				return condition.every((sub) => this.match(project, sub));
+			case "or":
+				return condition.length === 0 || condition.some((sub) => this.match(project, sub));
+			case "id":
+				return compare(project.id, condition);
+			case "name":
+				return compare(project.name, condition);
+			case "health":
+				return compare(project.health, condition);
+			case "priority":
+				return compare(project.priority, condition);
+			case "startDate":
+			case "targetDate":
+				return compare(project[key], condition);
+			case "createdAt":
+			case "updatedAt":
+			case "completedAt":
+			case "canceledAt":
+				return compare(project[key], condition, date);
+			case "lead":
+				return this.matchRelated(db.user(project.leadId), condition, (user, sub) => this.matchUser(user, sub));
+			case "members":
+				return this.matchCollection(
+					project.memberIds.map((id) => db.user(id)),
+					condition,
+					(user, sub) => this.matchUser(user, sub),
+				);
+			case "accessibleTeams":
+				return this.matchCollection(
+					project.teamIds.map((id) => db.team(id)),
+					condition,
+					(team, sub) => this.matchTeam(team, sub),
+				);
+			case "status": {
+				const { id, name, type, position } = db.projectStatus(project.statusId);
+				return this.matchEntries(condition, { id, name, type, position });
+			}
+			default:
+				throw invalidInput(`The mock does not support ProjectFilter.${key}`);
+		}
+	}
+
+	/** `{some, every, length}` over a list of related entities. */
+	matchCollection(entities, condition, matchEntity) {
+		for (const [op, sub] of Object.entries(condition)) {
+			if (op === "some" && !entities.some((entity) => matchEntity(entity, sub))) return false;
+			if (op === "every" && !entities.every((entity) => matchEntity(entity, sub))) return false;
+			if (op === "length" && !compare(entities.length, sub)) return false;
+			if (!["some", "every", "length"].includes(op)) throw invalidInput(`The mock does not support ${op} on collections`);
+		}
 		return true;
 	}
 }
@@ -312,6 +377,15 @@ class Database {
 	project(id) {
 		return this.state_.projects.find((p) => p.id === id) ?? null;
 	}
+	projectMilestone(id) {
+		return id ? (this.state_.projectMilestones.find((m) => m.id === id) ?? null) : null;
+	}
+	projectLabel(id) {
+		return this.state_.projectLabels.find((l) => l.id === id) ?? null;
+	}
+	projectStatus(id) {
+		return this.state_.projectStatuses.find((s) => s.id === id) ?? null;
+	}
 	issue(id) {
 		return id ? (this.state_.issues.find((i) => i.id === id) ?? null) : null;
 	}
@@ -344,6 +418,86 @@ class Database {
 
 	stateView(state) {
 		return state && { ...state };
+	}
+
+	projectStatusView(status) {
+		return { ...status, createdAt: iso(status.createdAt), updatedAt: iso(status.updatedAt), archivedAt: iso(status.archivedAt) };
+	}
+
+	milestoneView(milestone) {
+		return milestone && { ...milestone, createdAt: iso(milestone.createdAt), updatedAt: iso(milestone.updatedAt), archivedAt: null };
+	}
+
+	projectView(project) {
+		const slug = slugify(project.name);
+		return {
+			...project,
+			url: project.url ?? `https://linear.app/${this.state_.organization.urlKey}/project/${slug}-${project.slugId}`,
+			createdAt: iso(project.createdAt),
+			updatedAt: iso(project.updatedAt),
+			startedAt: iso(project.startedAt),
+			completedAt: iso(project.completedAt),
+			canceledAt: iso(project.canceledAt),
+			archivedAt: iso(project.archivedAt),
+			healthUpdatedAt: iso(project.healthUpdatedAt),
+			status: this.projectStatusView(this.projectStatus(project.statusId)),
+			lead: this.userView(this.user(project.leadId)),
+			members: (args) => connection(project.memberIds.map((id) => this.userView(this.user(id))), args),
+			teams: (args) => connection(project.teamIds.map((id) => this.teamView(this.team(id))), args),
+			labels: (args) => connection(project.labelIds.map((id) => ({ ...this.projectLabel(id) })), args),
+			// Linear documents no order; the highest sortOrder first keeps clients sorting milestones themselves. The
+			// only filter the plugin sends is `{ id: { eq } }` (the Issues tab's milestone filter).
+			projectMilestones: (args) =>
+				connection(
+					this.state_.projectMilestones
+						.filter((m) => m.projectId === project.id && m.archivedAt === null)
+						.filter((m) => args.filter?.id?.eq === undefined || m.id === args.filter.id.eq)
+						.sort((a, b) => b.sortOrder - a.sortOrder)
+						.map((m) => this.milestoneView(m)),
+					args,
+				),
+			// Newest first, like Linear's `first` pages.
+			projectUpdates: (args) =>
+				connection(
+					this.state_.projectUpdates
+						.filter((u) => u.projectId === project.id)
+						.sort((a, b) => b.createdAt - a.createdAt)
+						.map((u) => this.projectUpdateView(u, project)),
+					args,
+				),
+			history: (args) => {
+				const key = args.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
+				return connection(
+					this.state_.projectHistory
+						.filter((h) => h.projectId === project.id)
+						.sort((a, b) => b[key] - a[key])
+						.map((h) => ({ ...h, createdAt: iso(h.createdAt), updatedAt: iso(h.updatedAt), archivedAt: null })),
+					args,
+				);
+			},
+			// Project overview comments: the plugin does not read them (unused in the live workspace it was built against).
+			comments: (args) => connection([], args),
+		};
+	}
+
+	projectUpdateView(update, project) {
+		const comments = this.state_.updateComments.filter((c) => c.projectUpdateId === update.id);
+		return {
+			...update,
+			url: `https://linear.app/${this.state_.organization.urlKey}/project/${slugify(project.name)}-${project.slugId}/updates#${update.slugId}`,
+			createdAt: iso(update.createdAt),
+			updatedAt: iso(update.updatedAt),
+			editedAt: iso(update.editedAt),
+			archivedAt: null,
+			user: this.userView(this.user(update.userId)),
+			commentCount: comments.length,
+			// Newest first, like the other comment connections.
+			comments: (args) =>
+				connection(
+					comments.sort((a, b) => b.createdAt - a.createdAt).map((c) => this.commentView(c)),
+					args,
+				),
+		};
 	}
 
 	cycleView(id) {
@@ -403,7 +557,8 @@ class Database {
 			creator: this.userView(creator),
 			assignee: this.userView(this.user(issue.assigneeId)),
 			labels: (args) => connection(issue.labelIds.map((id) => ({ ...this.label(id) })), args),
-			project: this.project(issue.projectId),
+			project: issue.projectId ? this.projectView(this.project(issue.projectId)) : null,
+			projectMilestone: issue.projectMilestoneId ? this.milestoneView(this.projectMilestone(issue.projectMilestoneId)) : null,
 			cycle: this.cycleView(issue.cycleId),
 			parent: issue.parentId ? this.issueView(this.issue(issue.parentId)) : null,
 			subscribers: (args) => connection([this.userView(viewer)], args),
@@ -431,6 +586,7 @@ class Database {
 
 function buildRoot(db, now) {
 	const matcher = new IssueMatcher(db, now());
+	const projectMatcher = new ProjectMatcher(db, now());
 
 	const settle = (issue) => {
 		const state = db.state(issue.stateId);
@@ -456,6 +612,30 @@ function buildRoot(db, now) {
 			...db.userView(db.user(db.state_.viewerId)),
 			organization: { ...db.state_.organization },
 		}),
+
+		organization: () => ({
+			...db.state_.organization,
+			projectStatuses: db.state_.projectStatuses.map((s) => db.projectStatusView(s)),
+		}),
+
+		projects: ({ filter, first, after, orderBy, includeArchived }) => {
+			projectMatcher.now = now();
+			const key = orderBy === "createdAt" ? "createdAt" : "updatedAt";
+			const matching = db.state_.projects
+				.filter((project) => !project.deleted && (includeArchived || project.archivedAt === null))
+				.filter((project) => projectMatcher.match(project, filter))
+				.sort((a, b) => b[key] - a[key] || a.name.localeCompare(b.name));
+			return connection(
+				matching.map((project) => db.projectView(project)),
+				{ first, after },
+			);
+		},
+
+		project: ({ id }) => {
+			const project = db.project(id);
+			if (!project || project.deleted) throw notFound("Project");
+			return db.projectView(project);
+		},
 
 		teams: (args) => connection(db.state_.teams.map((t) => db.teamView(t)), args),
 
@@ -498,6 +678,7 @@ function buildRoot(db, now) {
 				labelIds: input.labelIds ?? [],
 				parentId: resolveRef(input.parentId, "Issue"),
 				projectId: input.projectId ?? null,
+				projectMilestoneId: input.projectMilestoneId ?? null,
 				cycleId: input.cycleId ?? null,
 				dueDate: input.dueDate ?? null,
 				sortOrder: -now_,
@@ -531,7 +712,7 @@ function buildRoot(db, now) {
 				if (input.assigneeId !== null && !db.user(input.assigneeId)) throw notFound("User");
 				issue.assigneeId = input.assigneeId;
 			}
-			for (const key of ["title", "description", "priority", "estimate", "dueDate", "projectId", "cycleId"]) {
+			for (const key of ["title", "description", "priority", "estimate", "dueDate", "projectId", "projectMilestoneId", "cycleId"]) {
 				if (has(key)) issue[key] = input[key];
 			}
 			if (has("parentId")) issue.parentId = resolveRef(input.parentId, "Issue");
@@ -584,6 +765,27 @@ function buildRoot(db, now) {
 			for (const issueId of [relation.issueId, relation.relatedIssueId]) db.issue(issueId).updatedAt = at;
 			return { success: true, entityId: id };
 		},
+
+		// Mutation.projectUpdate (the root shares the name with Query.projectUpdate, which the plugin never sends). Only
+		// `statusId` is applied: a move between status types sets or clears startedAt, completedAt and canceledAt.
+		projectUpdate: ({ id, input }) => {
+			const project = db.project(id);
+			if (!project || project.deleted) throw notFound("Project");
+			if (Object.hasOwn(input, "statusId")) {
+				const status = db.projectStatus(input.statusId);
+				if (!status || status.archivedAt !== null) throw notFound("ProjectStatus");
+				if (status.id !== project.statusId) {
+					project.statusId = status.id;
+					const at = db.tick();
+					const unstarted = status.type === "backlog" || status.type === "planned";
+					project.startedAt = unstarted ? null : (project.startedAt ?? at);
+					project.completedAt = status.type === "completed" ? (project.completedAt ?? at) : null;
+					project.canceledAt = status.type === "canceled" ? (project.canceledAt ?? at) : null;
+				}
+			}
+			project.updatedAt = db.tick();
+			return { success: true, project: db.projectView(project) };
+		},
 	};
 }
 
@@ -610,6 +812,28 @@ function snapshot(db) {
 			key: t.key,
 			states: t.states.map(({ id, name, type }) => ({ id, name, type })),
 		})),
+		projectStatuses: s.projectStatuses.map(({ id, name, type, archivedAt }) => ({ id, name, type, archived: archivedAt !== null })),
+		projects: s.projects.map((p) => ({
+			id: p.id,
+			name: p.name,
+			status: db.projectStatus(p.statusId).name,
+			statusType: db.projectStatus(p.statusId).type,
+			health: p.health,
+			leadId: p.leadId,
+			url: db.projectView(p).url,
+			updatedAt: iso(p.updatedAt),
+			startedAt: iso(p.startedAt),
+			completedAt: iso(p.completedAt),
+			canceledAt: iso(p.canceledAt),
+			targetDate: p.targetDate,
+			archivedAt: iso(p.archivedAt),
+		})),
+		projectMilestones: s.projectMilestones.map(({ id, projectId, name, archivedAt }) => ({
+			id,
+			projectId,
+			name,
+			archived: archivedAt !== null,
+		})),
 		issues: s.issues.map((i) => ({
 			id: i.id,
 			identifier: db.identifier(i),
@@ -620,6 +844,7 @@ function snapshot(db) {
 			stateId: i.stateId,
 			stateType: db.state(i.stateId).type,
 			assigneeId: i.assigneeId,
+			projectMilestoneId: i.projectMilestoneId,
 			updatedAt: iso(i.updatedAt),
 			completedAt: iso(i.completedAt),
 			canceledAt: iso(i.canceledAt),
@@ -645,7 +870,8 @@ const json = (body, init = {}) =>
 
 /**
  * Starts the mock on 127.0.0.1. `port: 0` picks a free port.
- * Returns `{ url, port, log, state(), reset(), stop() }`; `url` is the GraphQL endpoint.
+ * Returns `{ url, port, log, state(), reset(), stop(), deleteProject(id), rateLimitNext(operationName, seconds) }`;
+ * `url` is the GraphQL endpoint.
  */
 export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 	const schema = loadSchema();
@@ -653,12 +879,18 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 	let root_ = buildRoot(db, Date.now);
 	let log = [];
 	let requestsRemaining = 2500;
+	// operationName → retry-after seconds: the next request of that operation answers RATELIMITED.
+	const rateLimitedOps = new Map();
+	// Operation names whose next request answers HTTP 503 (one per entry): `failNext`.
+	let failures = [];
 
 	const reset = () => {
 		db = new Database(Date.now());
 		root_ = buildRoot(db, Date.now);
 		log = [];
 		requestsRemaining = 2500;
+		rateLimitedOps.clear();
+		failures = [];
 	};
 
 	const rateHeaders = () => ({
@@ -682,6 +914,21 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 			return json({ errors: [{ message: "Body must be JSON" }] }, { status: 400 });
 		}
 		const { query, variables, operationName } = body ?? {};
+		const retryAfter = rateLimitedOps.get(operationName);
+		if (retryAfter !== undefined) {
+			rateLimitedOps.delete(operationName);
+			log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 400 });
+			return json(
+				{ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED", type: "ratelimited" } }] },
+				{ status: 400, headers: { ...rateHeaders(), "retry-after": String(retryAfter) } },
+			);
+		}
+		const failing = failures.indexOf(operationName);
+		if (failing >= 0) {
+			failures.splice(failing, 1);
+			log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 503 });
+			return json({ errors: [{ message: "Service unavailable" }] }, { status: 503 });
+		}
 		log.push({ operationName: operationName ?? null, variables: variables ?? null, status: 200 });
 		requestsRemaining = Math.max(0, requestsRemaining - 1);
 		const result = await graphql({
@@ -720,6 +967,45 @@ export async function startMock({ port = 0, apiKey = TEST_API_KEY } = {}) {
 		},
 		state: () => snapshot(db),
 		reset,
+		/** The next request of `operationName` fails with HTTP 503 (a server failure the plugin shows and retries). */
+		failNext: (operationName) => {
+			failures.push(operationName);
+		},
+		/** Deletes a project: the list no longer returns it and `project(id)` answers "Entity not found". */
+		deleteProject: (id) => {
+			db.project(id).deleted = true;
+		},
+		/** The next request of `operationName` answers RATELIMITED with `retry-after: seconds`. */
+		rateLimitNext: (operationName, seconds = 1) => {
+			rateLimitedOps.set(operationName, seconds);
+		},
+		/** Deletes a milestone: its project no longer lists it and its issues belong to no milestone. */
+		deleteMilestone: (id) => {
+			db.projectMilestone(id).archivedAt = db.tick();
+			for (const issue of db.state_.issues) if (issue.projectMilestoneId === id) issue.projectMilestoneId = null;
+		},
+		/** Adds `count` milestones to a project, ahead of its others (a higher sortOrder): Linear's first page fills with them. */
+		addMilestones: (projectId, count) => {
+			const milestones = db.state_.projectMilestones;
+			const top = Math.max(0, ...milestones.map((m) => m.sortOrder));
+			const first = milestones.length;
+			for (let i = 1; i <= count; i += 1) {
+				const at = db.tick();
+				milestones.push({
+					id: uuid("milestone", first + i),
+					projectId,
+					name: `Filler ${i}`,
+					status: "unstarted",
+					progress: 0,
+					targetDate: null,
+					sortOrder: top + i,
+					description: null,
+					createdAt: at,
+					updatedAt: at,
+					archivedAt: null,
+				});
+			}
+		},
 		stop: () => server.stop(true),
 	};
 }

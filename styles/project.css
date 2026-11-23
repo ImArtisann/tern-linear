@@ -1,0 +1,196 @@
+/*
+ * Styles for lib/view_project.luau (the project page in the `main` region). Every rule is scoped to this plugin's
+ * main surface, colours come from Tern's theme variables only, and `.sf-layer` is never styled here.
+ */
+
+/* ── Header and tab bar ────────────────────────────────────────────────── */
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-header'] {
+	align-items: center;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-name'] {
+	font-size: 17px;
+	line-height: 1.3;
+	font-weight: 600;
+	color: var(--t1);
+	overflow-wrap: anywhere;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-status'] {
+	white-space: nowrap;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-tabs'] {
+	align-self: flex-start;
+}
+
+/* ── Overview ──────────────────────────────────────────────────────────── */
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-overview'] {
+	padding-top: 6px;
+	border-top: 1px solid var(--l2);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-content'] {
+	min-width: 0;
+}
+
+/* Long lines of the document stay readable on a wide pane. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-description'] {
+	max-width: 100ch;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-overview'][data-mark='wide'] > [data-role='linear.project-sidebar'] {
+	padding-left: 16px;
+	border-left: 1px solid var(--l2);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-summary'] {
+	font-size: 15px;
+	line-height: 1.4;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-heading'] {
+	padding-top: 4px;
+}
+
+/* Properties: a two-column grid so every value starts at the same edge. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-prop'] {
+	display: grid;
+	grid-template-columns: 11ch minmax(0, 1fr);
+	align-items: center;
+	column-gap: 8px;
+	min-height: 26px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-prop'] > :first-child {
+	font-size: 12px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-prop'] > :last-child {
+	justify-self: start;
+	max-width: 100%;
+	min-width: 0;
+}
+
+/* The progress meter spans the value column. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-prop'] > [data-role='linear.project-meter'] {
+	justify-self: stretch;
+}
+
+/* Milestones (sidebar): icon, the name over status and target date, progress at the end. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestones'] {
+	padding-top: 10px;
+}
+
+/* A milestone row is clickable: it shows the Issues tab filtered to the milestone. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone'] {
+	padding: 4px 4px 6px;
+	border-bottom: 1px solid var(--l1);
+	cursor: pointer;
+	transition: background 0.12s var(--ease);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone']:hover {
+	background: var(--raise);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-icon'] {
+	line-height: 18px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-name'] {
+	line-height: 18px;
+	overflow-wrap: anywhere;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-status'],
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-target'] {
+	font-size: 12px;
+	white-space: nowrap;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-progress'] {
+	line-height: 18px;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestones-empty'],
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-description-empty'] {
+	font-style: italic;
+}
+
+/* ── Activity: one feed, updates as cards between one-line history events ── */
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity'] {
+	max-width: 100ch;
+	padding-bottom: 12px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-update'] {
+	padding: 10px 12px;
+	border: 1px solid var(--l2);
+	border-radius: 8px;
+	background: var(--card);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-body'],
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comment'] [data-role='linear.comment-body'] {
+	line-height: 1.5;
+	overflow-wrap: anywhere;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comments-toggle'] {
+	align-self: flex-start;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comments'] {
+	padding-left: 12px;
+	border-left: 2px solid var(--l2);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-comment'] [data-role='linear.comment-head'] {
+	font-size: 12px;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-event'] {
+	padding: 2px 12px;
+	font-size: 13px;
+	color: var(--t2);
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-text'] {
+	overflow-wrap: anywhere;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-time'],
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-edited'] {
+	font-size: 12px;
+	white-space: nowrap;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-more'] {
+	align-self: flex-start;
+}
+
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.activity-empty'] {
+	font-style: italic;
+}
+
+/* ── Issues ────────────────────────────────────────────────────────────── */
+
+/* The tab's toolbar (view switch, search, layout toggle) lines up like the list's top bar; the filter row, board,
+ * table and cards below are styled by their shared `linear.*` roles in linear.css. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.project-issues-bar'] {
+	align-items: center;
+	row-gap: 8px;
+}
+
+/* A set milestone filter stands out from the quiet selects around it. */
+.sf-main[data-surface='plugin.linear.board'] [data-role='linear.milestone-filter'][data-mark='active'] {
+	border-radius: var(--r-ctl);
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}

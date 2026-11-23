@@ -15,9 +15,14 @@ local linear = {}
 
 local MAX_ISSUES = 250
 local ISSUES_PAGE_SIZE = 50
+local MAX_PROJECTS = 250
+local PROJECTS_PAGE_SIZE = 50
 -- Teams carry large nested connections: 5 per page keeps the query far below the 10000 complexity cap.
 local TEAMS_PAGE_SIZE = 5
 local COMMENTS_PAGE_SIZE = 50
+-- The Activity tab's page sizes (measured cost: docs/ARCHITECTURE.md).
+local UPDATES_PAGE_SIZE = 20
+local HISTORY_PAGE_SIZE = 25
 -- Upper bound on follow-up pages of any one listing; guards against a cursor that never ends.
 local MAX_PAGES = 40
 local REQUEST_TIMEOUT_MS = 20000
@@ -34,6 +39,18 @@ local STATE_RANK: { [string]: number } = {
 	duplicate = 7,
 }
 local UNKNOWN_RANK = 99
+
+-- Mirrors model.PROJECT_STATUS_TYPES.
+local PROJECT_STATUS_RANK: { [string]: number } = {
+	backlog = 1,
+	planned = 2,
+	started = 3,
+	paused = 4,
+	completed = 5,
+	canceled = 6,
+}
+
+local HEALTHS: { [string]: boolean } = { onTrack = true, atRisk = true, offTrack = true }
 
 -- Variables that must encode as JSON arrays even when empty.
 local ARRAY_INPUT_KEYS: { [string]: boolean } = {
@@ -432,6 +449,11 @@ local function normalizeIssue(raw: Json, detailed: boolean): types.Issue
 	if type(raw.project) == "table" and text(raw.project.id) ~= nil and text(raw.project.name) ~= nil then
 		project = { id = raw.project.id, name = raw.project.name }
 	end
+	local milestone: { id: string, name: string }? = nil
+	local rawMilestone: Json = raw.projectMilestone
+	if type(rawMilestone) == "table" and text(rawMilestone.id) ~= nil and text(rawMilestone.name) ~= nil then
+		milestone = { id = rawMilestone.id, name = rawMilestone.name }
+	end
 	local cycle: { id: string, number: number, name: string? }? = nil
 	if type(raw.cycle) == "table" and text(raw.cycle.id) ~= nil and number(raw.cycle.number) ~= nil then
 		cycle = { id = raw.cycle.id, number = raw.cycle.number, name = text(raw.cycle.name) }
@@ -462,6 +484,7 @@ local function normalizeIssue(raw: Json, detailed: boolean): types.Issue
 		creator = normalizeUser(raw.creator),
 		labels = labels,
 		project = project,
+		projectMilestone = milestone,
 		cycle = cycle,
 		parent = normalizeRef(raw.parent),
 		children = children,
@@ -719,16 +742,237 @@ function linear.issues(cfg: types.Config, filter: any, cb: types.Callback<types.
 	end)
 end
 
-function linear.changedSince(cfg: types.Config, filter: any, sinceIso: string?, cb: types.Callback<string?>)
+-- `filter AND {updatedAt: {gt: sinceIso}}`; either side may be absent.
+local function newerThan(filter: Json, sinceIso: string?): Json
 	local scope = usableFilter(filter)
-	local combined: Json = scope
-	if sinceIso ~= nil then
-		local newer = { updatedAt = { gt = sinceIso } }
-		combined = if scope == nil then newer else { ["and"] = { scope, newer } }
+	if sinceIso == nil then
+		return scope
 	end
-	run(cfg, "IssuesChanged", queries.IssuesChanged, { filter = combined }, function(data: Json): string?
-		local newest: Json = nodes(data.issues)[1]
+	local newer = { updatedAt = { gt = sinceIso } }
+	return if scope == nil then newer else { ["and"] = { scope, newer } }
+end
+
+function linear.changedSince(cfg: types.Config, filter: any, sinceIso: string?, cb: types.Callback<string?>)
+	run(
+		cfg,
+		"IssuesChanged",
+		queries.IssuesChanged,
+		{ filter = newerThan(filter, sinceIso) },
+		function(data: Json): string?
+			local newest: Json = nodes(data.issues)[1]
+			return if type(newest) == "table" then text(newest.updatedAt) else nil
+		end,
+		cb
+	)
+end
+
+-- ─── Projects ───────────────────────────────────────────────────────────────
+
+local function normalizeProjectStatus(raw: Json): types.ProjectStatus?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local name = text(raw.name)
+	local statusType = text(raw.type)
+	if id == nil or name == nil or statusType == nil then
+		return nil
+	end
+	return {
+		id = id,
+		name = name,
+		type = statusType,
+		color = text(raw.color) or "",
+		position = number(raw.position) or 0,
+	}
+end
+
+local function projectStatusOrder(a: types.ProjectStatus, b: types.ProjectStatus): boolean
+	local rankA = PROJECT_STATUS_RANK[a.type] or UNKNOWN_RANK
+	local rankB = PROJECT_STATUS_RANK[b.type] or UNKNOWN_RANK
+	if rankA ~= rankB then
+		return rankA < rankB
+	end
+	if a.position ~= b.position then
+		return a.position < b.position
+	end
+	return a.id < b.id
+end
+
+local function normalizeProject(raw: Json): types.Project
+	local id = text(raw.id)
+	local name = text(raw.name)
+	local status = normalizeProjectStatus(raw.status)
+	if id == nil or name == nil or status == nil then
+		error("malformed project")
+	end
+	local teams: { types.ProjectTeam } = {}
+	for _, node in nodes(raw.teams) do
+		local teamId = text(node.id)
+		local key = text(node.key)
+		if teamId ~= nil and key ~= nil then
+			table.insert(teams, { id = teamId, key = key, name = text(node.name) or key })
+		end
+	end
+	local health = text(raw.health)
+	local progress = number(raw.progress) or 0
+	return {
+		id = id,
+		name = name,
+		url = text(raw.url) or "",
+		slugId = text(raw.slugId) or "",
+		icon = text(raw.icon),
+		color = text(raw.color) or "",
+		summary = text(raw.description) or "",
+		status = status,
+		health = if health ~= nil and HEALTHS[health] then health else nil,
+		progress = math.clamp(progress, 0, 1),
+		lead = normalizeUser(raw.lead),
+		startDate = text(raw.startDate),
+		targetDate = text(raw.targetDate),
+		priority = number(raw.priority) or 0,
+		sortOrder = number(raw.sortOrder) or 0,
+		teams = teams,
+		createdAt = text(raw.createdAt) or "",
+		updatedAt = text(raw.updatedAt) or "",
+		startedAt = text(raw.startedAt),
+		completedAt = text(raw.completedAt),
+		canceledAt = text(raw.canceledAt),
+	}
+end
+
+-- The organization's statuses minus archived ones, sorted by type rank then position.
+function linear.projectStatuses(cfg: types.Config, cb: types.Callback<{ types.ProjectStatus }>)
+	run(cfg, "ProjectStatuses", queries.ProjectStatuses, nil, function(data: Json): { types.ProjectStatus }
+		local org: Json = data.organization
+		if type(org) ~= "table" or type(org.projectStatuses) ~= "table" then
+			error("malformed organization")
+		end
+		local statuses: { types.ProjectStatus } = {}
+		for _, node in org.projectStatuses do
+			local status = normalizeProjectStatus(node)
+			if status ~= nil and text(node.archivedAt) == nil then
+				table.insert(statuses, status)
+			end
+		end
+		table.sort(statuses, projectStatusOrder)
+		return statuses
+	end, cb)
+end
+
+function linear.projects(cfg: types.Config, filter: any, cb: types.Callback<types.ProjectPage>)
+	local projects: { types.Project } = {}
+	local seen: { [string]: boolean } = {}
+	local truncated = false
+
+	eachPage(cfg, {
+		opName = "Projects",
+		query = queries.Projects,
+		variables = { filter = usableFilter(filter), first = PROJECTS_PAGE_SIZE },
+		afterKey = "after",
+	}, function(data)
+		local connection: Json = data.projects
+		for _, node in nodes(connection) do
+			local project = normalizeProject(node)
+			if not seen[project.id] then
+				seen[project.id] = true
+				table.insert(projects, project)
+			end
+		end
+		if #projects >= MAX_PROJECTS then
+			while #projects > MAX_PROJECTS do
+				table.remove(projects)
+			end
+			truncated = type(connection.pageInfo) == "table" and connection.pageInfo.hasNextPage == true
+			return nil
+		end
+		return connection.pageInfo
+	end, function(err)
+		if err ~= nil then
+			cb(nil, err)
+			return
+		end
+		cb({ projects = projects, truncated = truncated }, nil)
+	end)
+end
+
+function linear.projectsChanged(cfg: types.Config, filter: any, sinceIso: string?, cb: types.Callback<string?>)
+	local query = queries.ProjectsChanged
+	run(cfg, "ProjectsChanged", query, { filter = newerThan(filter, sinceIso) }, function(data: Json): string?
+		local newest: Json = nodes(data.projects)[1]
 		return if type(newest) == "table" then text(newest.updatedAt) else nil
+	end, cb)
+end
+
+local function normalizeMilestone(raw: Json): types.ProjectMilestone?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local name = text(raw.name)
+	if id == nil or name == nil then
+		return nil
+	end
+	return {
+		id = id,
+		name = name,
+		status = text(raw.status) or "unstarted",
+		-- Linear sends a milestone's progress as a percentage (0..100), unlike Project.progress (0..1).
+		progress = math.clamp((number(raw.progress) or 0) / 100, 0, 1),
+		targetDate = text(raw.targetDate),
+		sortOrder = number(raw.sortOrder) or 0,
+	}
+end
+
+-- The project page's detail. Milestones come in the server's order (the caller sorts them); group labels are dropped.
+-- `milestoneId` (the Issues tab's milestone filter) is looked up by id too: when it exists but is not among the first
+-- 50, it joins `milestones`, so a milestone list without it means the milestone is gone.
+function linear.project(cfg: types.Config, id: string, milestoneId: string?, cb: types.Callback<types.ProjectDetail>)
+	local variables = { id = id, milestoneId = milestoneId, withMilestone = milestoneId ~= nil }
+	run(cfg, "Project", queries.Project, variables, function(data: Json): types.ProjectDetail
+		local raw: Json = data.project
+		if type(raw) ~= "table" then
+			error(failure("notfound", "Linear could not find that project."))
+		end
+		local members: { types.User } = {}
+		for _, node in nodes(raw.members) do
+			local member = normalizeUser(node)
+			if member ~= nil then
+				table.insert(members, member)
+			end
+		end
+		local labels: { types.Label } = {}
+		for _, node in nodes(raw.labels) do
+			local label = normalizeLabel(node)
+			if label ~= nil and label.isGroup ~= true then
+				table.insert(labels, label)
+			end
+		end
+		local milestones: { types.ProjectMilestone } = {}
+		local listed: { [string]: boolean } = {}
+		for _, connection in { raw.projectMilestones, raw.filterMilestone } do
+			for _, node in nodes(connection) do
+				local milestone = normalizeMilestone(node)
+				if milestone ~= nil and not listed[milestone.id] then
+					listed[milestone.id] = true
+					table.insert(milestones, milestone)
+				end
+			end
+		end
+		local milestoneInfo: Json = if type(raw.projectMilestones) == "table"
+			then raw.projectMilestones.pageInfo
+			else nil
+		return {
+			project = normalizeProject(raw),
+			content = text(raw.content) or "",
+			healthUpdatedAt = text(raw.healthUpdatedAt),
+			startDateResolution = text(raw.startDateResolution),
+			targetDateResolution = text(raw.targetDateResolution),
+			members = members,
+			labels = labels,
+			milestones = milestones,
+			milestonesTruncated = type(milestoneInfo) == "table" and milestoneInfo.hasNextPage == true,
+		}
 	end, cb)
 end
 
@@ -777,6 +1021,148 @@ function linear.issue(cfg: types.Config, id: string, cb: types.Callback<types.Is
 		loaded.comments = sortComments(comments)
 		cb(loaded, nil)
 	end)
+end
+
+-- ─── Project activity ───────────────────────────────────────────────────────
+
+local function normalizeUpdate(raw: Json): types.ProjectUpdate?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local createdAt = text(raw.createdAt)
+	if id == nil or createdAt == nil then
+		return nil
+	end
+	local comments: { types.Comment } = {}
+	for _, node in nodes(raw.comments) do
+		local comment = normalizeComment(node)
+		if comment ~= nil then
+			table.insert(comments, comment)
+		end
+	end
+	local health = text(raw.health)
+	return {
+		id = id,
+		body = text(raw.body) or "",
+		health = if health ~= nil and HEALTHS[health] then health else nil,
+		createdAt = createdAt,
+		editedAt = text(raw.editedAt),
+		commentCount = math.max(number(raw.commentCount) or 0, #comments),
+		url = text(raw.url) or "",
+		user = normalizeUser(raw.user),
+		comments = sortComments(comments),
+	}
+end
+
+local function normalizeHistoryRecord(raw: Json): types.ProjectHistoryRecord?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local id = text(raw.id)
+	local createdAt = text(raw.createdAt)
+	local updatedAt = text(raw.updatedAt)
+	if id == nil or createdAt == nil or updatedAt == nil then
+		return nil
+	end
+	local entries: { any } = {}
+	if type(raw.entries) == "table" then
+		for _, entry in ipairs(raw.entries) do
+			if type(entry) == "table" then
+				table.insert(entries, entry)
+			end
+		end
+	end
+	return { id = id, createdAt = createdAt, updatedAt = updatedAt, entries = entries }
+end
+
+-- One page of `project(id).<field>`, normalized; a missing project is `notfound`.
+local function activityPage<T>(data: Json, field: string, normalize: (Json) -> T?): types.ActivitySource<T>
+	local project: Json = data.project
+	if type(project) ~= "table" then
+		error(failure("notfound", "Linear could not find that project."))
+	end
+	local connection: Json = project[field]
+	local items: { T } = {}
+	for _, node in nodes(connection) do
+		local item = normalize(node)
+		if item ~= nil then
+			table.insert(items, item)
+		end
+	end
+	local info: Json = if type(connection) == "table" then connection.pageInfo else nil
+	local cursor = if type(info) == "table" and info.hasNextPage == true then text(info.endCursor) else nil
+	return { items = items, cursor = cursor, hasMore = cursor ~= nil }
+end
+
+local function noPage<T>(): types.ActivitySource<T>
+	return { items = {}, cursor = nil, hasMore = false }
+end
+
+-- Which failure of several side-by-side requests a callback reports: `auth` (back to setup), then `rate` (backoff),
+-- whatever order they arrived in; otherwise the first.
+local FAILURE_RANK: { [string]: number } = { auth = 1, rate = 2 }
+
+local function worseFailure(current: ApiError?, err: ApiError): ApiError
+	if current == nil or (FAILURE_RANK[err.kind] or 3) < (FAILURE_RANK[current.kind] or 3) then
+		return err
+	end
+	return current
+end
+
+-- The Activity tab's data: ProjectUpdates and ProjectHistory, sent side by side; `cb` runs once both responded.
+-- `after` nil asks for the first page of both; otherwise only the sources with a cursor are fetched (the others
+-- come back empty, without more).
+function linear.projectActivity(
+	cfg: types.Config,
+	id: string,
+	after: types.ActivityCursors?,
+	cb: types.Callback<types.ProjectActivity>
+)
+	local wantUpdates = after == nil or after.updates ~= nil
+	local wantHistory = after == nil or after.history ~= nil
+	local result: types.ProjectActivity = { updates = noPage(), history = noPage() }
+	local pending = (if wantUpdates then 1 else 0) + (if wantHistory then 1 else 0)
+	local failed: ApiError? = nil
+	local function settle(err: ApiError?)
+		pending -= 1
+		if err ~= nil then
+			failed = worseFailure(failed, err)
+		end
+		if pending == 0 then
+			if failed ~= nil then
+				cb(nil, failed)
+			else
+				cb(result, nil)
+			end
+		end
+	end
+	if pending == 0 then
+		cb(result, nil)
+		return
+	end
+	if wantUpdates then
+		local variables = { id = id, first = UPDATES_PAGE_SIZE, after = if after ~= nil then after.updates else nil }
+		run(cfg, "ProjectUpdates", queries.ProjectUpdates, variables, function(data: Json): any
+			return activityPage(data, "projectUpdates", normalizeUpdate)
+		end, function(page, err)
+			if page ~= nil then
+				result.updates = page
+			end
+			settle(err)
+		end)
+	end
+	if wantHistory then
+		local variables = { id = id, first = HISTORY_PAGE_SIZE, after = if after ~= nil then after.history else nil }
+		run(cfg, "ProjectHistory", queries.ProjectHistory, variables, function(data: Json): any
+			return activityPage(data, "history", normalizeHistoryRecord)
+		end, function(page, err)
+			if page ~= nil then
+				result.history = page
+			end
+			settle(err)
+		end)
+	end
 end
 
 function linear.lookup(cfg: types.Config, identifier: string, cb: types.Callback<types.IssueRef?>)
@@ -874,6 +1260,23 @@ function linear.deleteRelation(cfg: types.Config, relationId: string, cb: types.
 	run(cfg, "IssueRelationDelete", queries.IssueRelationDelete, { id = relationId }, function(data: Json): boolean
 		successfulPayload(data, "issueRelationDelete")
 		return true
+	end, cb)
+end
+
+-- Sets a project's status (ProjectStatusUpdate); the result is the project as `linear.projects` normalizes it.
+function linear.setProjectStatus(
+	cfg: types.Config,
+	projectId: string,
+	statusId: string,
+	cb: types.Callback<types.Project>
+)
+	local variables: { [string]: any } = { id = projectId, statusId = statusId }
+	run(cfg, "ProjectStatusUpdate", queries.ProjectStatusUpdate, variables, function(data: Json): types.Project
+		local payload = successfulPayload(data, "projectUpdate")
+		if type(payload.project) ~= "table" then
+			error(failure("server", "Linear did not return the updated project."))
+		end
+		return normalizeProject(payload.project)
 	end, cb)
 end
 

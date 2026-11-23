@@ -1,15 +1,19 @@
 --!strict
 -- The `main` region: setup screen, top bar, filters, board, table, empty and error states.
--- Pure: nothing here mutates state. The drawer and dialogs come from view_detail as the `layer`.
+-- Pure: nothing here mutates state. The drawer and dialogs come from view_detail as the `layer`; the issue list
+-- (filter row, board, table) comes from view_issues, shared with the project page's Issues tab.
 
 local detail = require("./view_detail")
+local issueList = require("./view_issues")
 local model = require("./model")
+local parts = require("./view_parts")
+local projectPage = require("./view_project")
 local types = require("./types")
 
 type BlockState = types.BlockState
-type Issue = types.Issue
+type Project = types.Project
 type Team = types.Team
-type Column = model.Column
+type ProjectColumn = model.ProjectColumn
 
 local ui = tern.ui
 
@@ -30,75 +34,38 @@ local KEY_URL = "https://linear.app/settings/account/security"
 
 -- ─── Look-up tables ─────────────────────────────────────────────────────────
 
--- Linear's state colours cannot be inline, so a state type maps to the nearest tone.
-local STATE_TONES: { [string]: string } = {
-	triage = "info",
-	backlog = "muted",
-	unstarted = "neutral",
-	started = "warning",
-	completed = "success",
-	canceled = "muted",
-	duplicate = "muted",
-}
+local PROJECT_STATUS_TONES = parts.PROJECT_STATUS_TONES
+local HEALTH_TONES = parts.HEALTH_TONES
 
-local PRIORITY_TONES: { [number]: string } = {
-	[1] = "error",
-	[2] = "warning",
-	[3] = "info",
-	[4] = "muted",
-}
-
-local SORT_COLUMNS: { { key: string, label: string } } = {
-	{ key = "identifier", label = "ID" },
-	{ key = "title", label = "Title" },
-	{ key = "state", label = "State" },
-	{ key = "priority", label = "Priority" },
-	{ key = "assignee", label = "Assignee" },
+local PROJECT_SORT_COLUMNS: { { key: string, label: string } } = {
+	{ key = "name", label = "Name" },
+	{ key = "status", label = "Status" },
+	{ key = "health", label = "Health" },
+	{ key = "lead", label = "Lead" },
+	{ key = "target", label = "Target" },
+	{ key = "progress", label = "Progress" },
 	{ key = "updated", label = "Updated" },
 }
 
-local VIEWS: { { id: string, label: string } } = {
-	{ id = "active", label = "Active" },
-	{ id = "backlog", label = "Backlog" },
-	{ id = "all", label = "All" },
+local MODES: { { id: string, label: string } } = {
+	{ id = "projects", label = "Projects" },
+	{ id = "issues", label = "Issues" },
 }
 
-local LAYOUTS: { { id: string, label: string, icon: string } } = {
-	{ id = "board", label = "Board", icon = "kanban" },
-	{ id = "table", label = "Table", icon = "list" },
-}
-
-local MAX_CARD_LABELS = 3
-local COLUMN_MIN_WIDTH = "30ch"
 -- Pane rows taken by the bar, filter row and column headers; the rest is card space (a row is one
 -- 18px line). The bar wraps onto a second line below BAR_WRAP_COLS, and each banner takes three rows.
 local BOARD_CHROME_ROWS = 12
-local BAR_WRAP_COLS = 120
+local BAR_WRAP_COLS = 140
 local BAR_WRAP_ROWS = 3
 local BANNER_ROWS = 3
-local MIN_COLUMN_LINES = 8
 
 -- ─── Helpers ────────────────────────────────────────────────────────────────
 
-local function with(node: Node, props: { [string]: any }): Node
-	local merged: { [string]: any } = node.p or {}
-	for name, value in props do
-		merged[name] = value
-	end
-	node.p = merged
-	return node
-end
-
-local function compact(nodes: { Node? }, count: number): { Node }
-	local out: { Node } = {}
-	for index = 1, count do
-		local node = nodes[index]
-		if node ~= nil then
-			table.insert(out, node)
-		end
-	end
-	return out
-end
+local with = parts.with
+local compact = parts.compact
+local banner = parts.banner
+local healthBadge = parts.healthBadge
+local syncedLabel = parts.syncedLabel
 
 local function selectedTeam(state: BlockState): Team?
 	if state.prefs.scope ~= "team" then
@@ -112,30 +79,28 @@ local function selectedTeam(state: BlockState): Team?
 	return nil
 end
 
-local function filtersActive(state: BlockState): boolean
+local function inProjects(state: BlockState): boolean
+	return state.prefs.mode == "projects"
+end
+
+-- The search text of the active mode.
+local function activeQuery(state: BlockState): types.Field
+	return if inProjects(state) then state.projects.query else state.query
+end
+
+-- Projects mode's client filters or search are set.
+local function projectFiltersActive(state: BlockState): boolean
 	local prefs = state.prefs
-	return prefs.priority ~= nil
-		or prefs.assignee ~= nil
-		or prefs.labelId ~= nil
-		or string.match(state.query.text, "%S") ~= nil
+	local query = string.match(state.projects.query.text, "%S") ~= nil
+	return prefs.projectLead ~= nil or prefs.projectHealth ~= nil or query
 end
 
-local function syncedLabel(fetchedAt: number?, now: number): string
-	if fetchedAt == nil then
-		return "Refresh"
-	end
-	local iso = os.date("!%Y-%m-%dT%H:%M:%SZ", fetchedAt) :: string
-	local relative = model.relativeTime(iso, now)
-	if relative == "now" then
-		return "Synced just now"
-	elseif string.match(relative, "^%d+[mhd]$") ~= nil then
-		return `Synced {relative} ago`
-	end
-	return `Synced {relative}`
+local function viewerIdOf(state: BlockState): string?
+	return if state.viewer ~= nil then state.viewer.user.id else nil
 end
 
-local function pluralIssues(count: number): string
-	return if count == 1 then "1 issue" else `{count} issues`
+local function pluralProjects(count: number): string
+	return if count == 1 then "1 project" else `{count} projects`
 end
 
 -- ─── Setup and loading ──────────────────────────────────────────────────────
@@ -205,16 +170,29 @@ local function loadingNode(): Node
 end
 
 -- Stands in for the board while a foreground load runs over an already-ready screen.
-local function reloadingNode(): Node
-	return ui.node("row", { key = "content", role = "linear.reloading", gap = "sm" }, {
-		ui.node("spinner", { key = "spinner", style = "braille" }),
-		ui.node("text", { key = "label", spans = { ui.span("Loading issues…", "muted") } }),
-	})
+local function reloadingNode(state: BlockState): Node
+	return parts.reloadingNode(if inProjects(state) then "Loading projects…" else "Loading issues…")
 end
 
 -- ─── Top bar ────────────────────────────────────────────────────────────────
 
-local function scopeSelect(state: BlockState): Node
+local function modeSwitcher(state: BlockState): Node
+	local buttons: { Node } = {}
+	for _, entry in MODES do
+		table.insert(
+			buttons,
+			ui.button(entry.label, {
+				key = `mode-{entry.id}`,
+				role = `linear.mode-{entry.id}`,
+				on = state.prefs.mode == entry.id,
+				actions = { click = `mode={entry.id}` },
+			})
+		)
+	end
+	return ui.node("buttons", { key = "modes" }, buttons)
+end
+
+local function issueScopeSelect(state: BlockState): Node
 	local options: { { value: string, label: string } } = { { value = "mine", label = "My issues" } }
 	for _, team in state.teams do
 		table.insert(options, { value = team.id, label = `{team.key} · {team.name}` })
@@ -232,47 +210,39 @@ local function scopeSelect(state: BlockState): Node
 	})
 end
 
-local function viewSwitcher(state: BlockState): Node
-	local buttons: { Node } = {}
-	for _, entry in VIEWS do
-		table.insert(
-			buttons,
-			ui.button(entry.label, {
-				key = `view-{entry.id}`,
-				role = `linear.view-{entry.id}`,
-				on = state.prefs.view == entry.id,
-				actions = { click = `view={entry.id}` },
-			})
-		)
+-- Same place and role as the issue scope select; its own key so switching modes remounts it.
+local function projectScopeSelect(state: BlockState): Node
+	local options: { { value: string, label: string } } = {
+		{ value = "all", label = "All projects" },
+		{ value = "mine", label = "My projects" },
+	}
+	for _, team in state.teams do
+		table.insert(options, { value = team.id, label = `{team.key} · {team.name}` })
 	end
-	return ui.node("buttons", { key = "views" }, buttons)
-end
-
-local function layoutSwitcher(state: BlockState): Node
-	local buttons: { Node } = {}
-	for _, entry in LAYOUTS do
-		table.insert(
-			buttons,
-			ui.button(entry.label, {
-				key = `layout-{entry.id}`,
-				role = `linear.layout-{entry.id}`,
-				icon = entry.icon,
-				on = state.prefs.layout == entry.id,
-				actions = { click = `layout={entry.id}` },
-			})
-		)
-	end
-	return ui.node("buttons", { key = "layouts" }, buttons)
+	local prefs = state.prefs
+	local value = if prefs.projectScope == "team" and prefs.projectTeamId ~= nil
+		then prefs.projectTeamId
+		else prefs.projectScope
+	return ui.node("select", {
+		key = detail.controlKey("project-scope-select", state.controlEpoch),
+		role = "linear.team-select",
+		value = value,
+		options = options,
+		variant = "field",
+		disabled = if state.busy then true else nil,
+		aria = "Project scope",
+	})
 end
 
 local function searchField(state: BlockState): Node
+	local query = activeQuery(state)
 	return ui.node("input", {
 		key = KEY_SEARCH,
 		role = "linear.search",
-		text = state.query.text,
-		cursor = state.query.cursor,
-		anchor = state.query.anchor,
-		placeholder = "Search issues",
+		text = query.text,
+		cursor = query.cursor,
+		anchor = query.anchor,
+		placeholder = if inProjects(state) then "Search projects" else "Search issues",
 		icon = "search",
 		keys = { "/" },
 		variant = "field",
@@ -283,7 +253,8 @@ local function searchField(state: BlockState): Node
 end
 
 local function refreshButton(state: BlockState, now: number): Node
-	return ui.button(syncedLabel(state.fetchedAt, now), {
+	local fetchedAt = if inProjects(state) then state.projects.fetchedAt else state.fetchedAt
+	return ui.button(syncedLabel(fetchedAt, now), {
 		key = "refresh",
 		role = "linear.refresh",
 		icon = "repeat",
@@ -296,14 +267,16 @@ end
 local function barActions(state: BlockState, now: number): Node
 	local children = compact({
 		refreshButton(state, now),
-		ui.button("New issue", {
-			key = "new",
-			role = "linear.new",
-			variant = "primary",
-			icon = "plus",
-			keys = { "n" },
-			actions = { click = "create" },
-		}),
+		if inProjects(state)
+			then nil
+			else ui.button("New issue", {
+				key = "new",
+				role = "linear.new",
+				variant = "primary",
+				icon = "plus",
+				keys = { "n" },
+				actions = { click = "create" },
+			}),
 		if state.keySource == "file"
 			then ui.button("Sign out", {
 				key = "sign-out",
@@ -318,56 +291,17 @@ end
 
 local function topBar(state: BlockState, now: number): Node
 	local children = compact({
-		scopeSelect(state),
-		viewSwitcher(state),
+		modeSwitcher(state),
+		if inProjects(state) then projectScopeSelect(state) else issueScopeSelect(state),
+		parts.viewSwitcher(if inProjects(state) then state.prefs.projectView else state.prefs.view),
 		searchField(state),
-		layoutSwitcher(state),
+		parts.layoutSwitcher(state.prefs.layout),
 		barActions(state, now),
-	}, 5)
+	}, 6)
 	return ui.node("row", { key = KEY_BAR, role = "linear.bar", gap = "sm", wrap = true }, children)
 end
 
 -- ─── Filter row ─────────────────────────────────────────────────────────────
-
-local function prioritySelect(state: BlockState): Node
-	local options: { { value: string, label: string } } = { { value = "", label = "Any priority" } }
-	for _, entry in model.PRIORITIES do
-		table.insert(options, { value = tostring(entry.value), label = entry.label })
-	end
-	local priority = state.prefs.priority
-	return ui.node("select", {
-		key = "filter-priority",
-		role = "linear.filter-priority",
-		value = if priority ~= nil then tostring(priority) else "",
-		options = options,
-		variant = "quiet",
-		aria = "Priority filter",
-	})
-end
-
-local function assigneeSelect(state: BlockState, team: Team?): Node
-	local options: { { value: string, label: string } } = {
-		{ value = "", label = "Any assignee" },
-		{ value = "me", label = "Me" },
-		{ value = "none", label = "Unassigned" },
-	}
-	local viewerId = if state.viewer ~= nil then state.viewer.user.id else nil
-	if team ~= nil then
-		for _, member in team.members do
-			if member.id ~= viewerId then
-				table.insert(options, { value = member.id, label = member.displayName })
-			end
-		end
-	end
-	return ui.node("select", {
-		key = "filter-assignee",
-		role = "linear.filter-assignee",
-		value = state.prefs.assignee or "",
-		options = options,
-		variant = "quiet",
-		aria = "Assignee filter",
-	})
-end
 
 -- Team scope lists the team's labels; "my issues" has no single team, so it lists the labels in use.
 local function availableLabels(state: BlockState, team: Team?): { types.Label }
@@ -390,164 +324,72 @@ local function availableLabels(state: BlockState, team: Team?): { types.Label }
 	return labels
 end
 
-local function labelSelect(state: BlockState, team: Team?): Node
-	local options: { { value: string, label: string } } = { { value = "", label = "Any label" } }
-	for _, label in availableLabels(state, team) do
-		table.insert(options, { value = label.id, label = label.name })
+-- Leads of the loaded projects (the viewer has "Me"), by name.
+local function projectLeads(state: BlockState): { types.User }
+	local viewerId = viewerIdOf(state)
+	local seen: { [string]: boolean } = {}
+	local leads: { types.User } = {}
+	for _, project in state.projects.items do
+		local lead = project.lead
+		if lead ~= nil and lead.id ~= viewerId and not seen[lead.id] then
+			seen[lead.id] = true
+			table.insert(leads, lead)
+		end
+	end
+	table.sort(leads, function(a, b)
+		return string.lower(a.name) < string.lower(b.name)
+	end)
+	return leads
+end
+
+local function leadSelect(state: BlockState): Node
+	local options: { { value: string, label: string } } = {
+		{ value = "", label = "Any lead" },
+		{ value = "me", label = "Me" },
+		{ value = "none", label = "No lead" },
+	}
+	for _, lead in projectLeads(state) do
+		table.insert(options, { value = lead.id, label = lead.displayName })
 	end
 	return ui.node("select", {
-		key = "filter-label",
-		role = "linear.filter-label",
-		value = state.prefs.labelId or "",
+		key = "filter-lead",
+		role = "linear.filter-lead",
+		value = state.prefs.projectLead or "",
 		options = options,
 		variant = "quiet",
-		aria = "Label filter",
+		aria = "Lead filter",
 	})
 end
 
-local function filterRow(state: BlockState, team: Team?, visibleCount: number): Node
-	local summary: { Span | string } = { ui.span(pluralIssues(visibleCount), "muted") }
-	if state.truncated then
-		table.insert(summary, ui.span(`  ·  Showing first {#state.issues}`, "warning"))
+local function healthSelect(state: BlockState): Node
+	local options: { { value: string, label: string } } = { { value = "", label = "Any health" } }
+	for _, entry in model.HEALTHS do
+		table.insert(options, { value = entry.value, label = entry.label })
 	end
-	local children = compact({
-		prioritySelect(state),
-		assigneeSelect(state, team),
-		labelSelect(state, team),
-		if filtersActive(state)
-			then ui.button("Clear filters", {
-				key = "clear-filters",
-				role = "linear.clear-filters",
-				variant = "quiet",
-				icon = "funnel-x",
-				actions = { click = "clear-filters" },
-			})
-			else nil,
-		ui.node("row", { key = "spacer", grow = 1 }),
-		-- Counts of a list that is being replaced would be wrong.
-		if state.reloading then nil else ui.node("text", { key = "count", role = "linear.count", spans = summary }),
-	}, 6)
-	return ui.node("row", { key = "filters", role = "linear.filters", gap = "sm", wrap = true }, children)
+	table.insert(options, { value = "none", label = "No update" })
+	return ui.node("select", {
+		key = "filter-health",
+		role = "linear.filter-health",
+		value = state.prefs.projectHealth or "",
+		options = options,
+		variant = "quiet",
+		aria = "Health filter",
+	})
 end
 
--- ─── Banners ────────────────────────────────────────────────────────────────
-
-local function banner(key: string, role: string, tone: string, icon: string, message: string): Node
-	return ui.node("row", { key = key, role = role, tone = tone, gap = "sm" }, {
-		ui.node("icon", { key = "icon", name = icon, tone = tone }),
-		ui.node("text", { key = "text", spans = { message }, grow = 1 }),
-	})
+local function projectFilterRow(state: BlockState, visibleCount: number): Node
+	local projects = state.projects
+	local truncatedAt = if projects.truncated then #projects.items else nil
+	return parts.filterRow(
+		{ leadSelect(state), healthSelect(state) },
+		pluralProjects(visibleCount),
+		truncatedAt,
+		projectFiltersActive(state),
+		not state.reloading
+	)
 end
 
 -- ─── Board ──────────────────────────────────────────────────────────────────
-
-local function stateDot(stateType: string): Node
-	return ui.node("text", {
-		key = "dot",
-		role = "linear.state-dot",
-		tone = STATE_TONES[stateType] or "muted",
-		mark = stateType,
-		spans = { "\u{00A0}" },
-	})
-end
-
-local function labelChips(issue: Issue): { Node }
-	local chips: { Node } = {}
-	for index, label in issue.labels do
-		if index > MAX_CARD_LABELS then
-			local more = ui.badge(`+{#issue.labels - MAX_CARD_LABELS}`, "muted")
-			table.insert(chips, with(more, { key = "more", mark = "label" }))
-			break
-		end
-		table.insert(chips, with(ui.badge(label.name, "neutral"), { key = `label-{label.id}`, mark = "label" }))
-	end
-	return chips
-end
-
-local function cardHead(issue: Issue): Node
-	local priorityTone = PRIORITY_TONES[issue.priority]
-	local blocked = model.isBlocked(issue)
-	local children = compact({
-		ui.node("text", { key = "id", spans = { ui.span(issue.identifier, "mono muted") } }),
-		ui.node("row", { key = "spacer", grow = 1 }),
-		if blocked then with(ui.badge("Blocked", "error"), { key = "blocked", mark = "blocked" }) else nil,
-		if priorityTone ~= nil
-			then with(ui.badge(model.priorityLabel(issue.priority), priorityTone), {
-				key = "priority",
-				mark = `priority-{issue.priority}`,
-			})
-			else nil,
-	}, 4)
-	return ui.node("row", { key = "head", gap = "xs" }, children)
-end
-
-local function cardFoot(issue: Issue): Node?
-	local chips = labelChips(issue)
-	local assignee = issue.assignee
-	if #chips == 0 and assignee == nil then
-		return nil
-	end
-	local children: { Node } = {}
-	children[1] = ui.node("row", { key = "labels", gap = "xs", wrap = true, grow = 1 }, chips)
-	if assignee ~= nil then
-		table.insert(
-			children,
-			ui.node("text", {
-				key = "assignee",
-				role = "linear.card-assignee",
-				title = assignee.name,
-				spans = { ui.span(assignee.displayName, "muted") },
-				max = { w = "14ch" },
-			})
-		)
-	end
-	return ui.node("row", { key = "foot", gap = "sm", align = "start" }, children)
-end
-
-local function issueCard(issue: Issue, selectedId: string?): Node
-	local children = compact({
-		cardHead(issue),
-		ui.node("text", { key = "title", role = "linear.card-title", max = { h = "2lines" }, spans = { issue.title } }),
-		cardFoot(issue),
-	}, 3)
-	return ui.node("col", {
-		key = issue.id,
-		role = "linear.card",
-		gap = "xs",
-		mark = if issue.id == selectedId then "selected" else nil,
-		actions = { click = `select={issue.id}` },
-	}, children)
-end
-
-local function boardColumn(column: Column, selectedId: string?, lines: number): Node
-	local cards: { Node } = {}
-	for _, issue in column.issues do
-		table.insert(cards, issueCard(issue, selectedId))
-	end
-	if #cards == 0 then
-		table.insert(
-			cards,
-			ui.node("text", { key = "none", role = "linear.column-empty", spans = { ui.span("No issues", "dim") } })
-		)
-	end
-	local head = ui.node("row", { key = "head", role = "linear.column-head", gap = "sm" }, {
-		stateDot(column.stateType),
-		ui.node("text", { key = "title", spans = { ui.span(column.title, "strong") } }),
-		ui.node("text", { key = "count", spans = { ui.span(tostring(#column.issues), "muted") } }),
-	})
-	return ui.node("col", {
-		key = column.id,
-		role = "linear.column",
-		mark = column.stateType,
-		gap = "sm",
-		grow = 1,
-		basis = 0,
-		min = { w = COLUMN_MIN_WIDTH },
-	}, {
-		head,
-		ui.node("scroll", { key = "cards", gap = "sm", max = { h = `{lines}lines` } }, cards),
-	})
-end
 
 local function chromeRows(state: BlockState, cx: BlockCx): number
 	local rows = BOARD_CHROME_ROWS
@@ -563,165 +405,225 @@ local function chromeRows(state: BlockState, cx: BlockCx): number
 	return rows
 end
 
-local function board(state: BlockState, cx: BlockCx, visible: { Issue }, team: Team?): Node
-	local columns = model.columns(visible, state.prefs, team)
-	local lines = math.max(MIN_COLUMN_LINES, cx.rows - chromeRows(state, cx))
+-- Issues mode's list for view_issues: the issues of the scope, Prefs' view, filters and table sort.
+local function issuesModeList(state: BlockState, cx: BlockCx, team: Team?): issueList.IssueList
+	local prefs = state.prefs
+	return {
+		items = state.issues,
+		truncated = state.truncated,
+		view = prefs.view,
+		filters = prefs,
+		query = state.query.text,
+		sort = prefs.sort,
+		sortAsc = prefs.sortAsc,
+		selectedId = state.selectedId,
+		team = team,
+		members = if team ~= nil then team.members else {},
+		labels = availableLabels(state, team),
+		reloading = state.reloading,
+		emptyHelp = if prefs.scope == "mine" then "mine" else "none",
+		milestones = false,
+		chromeRows = chromeRows(state, cx),
+	}
+end
+
+-- ─── Project board ──────────────────────────────────────────────────────────
+
+local function teamKeys(project: Project): string
+	local keys: { string } = {}
+	for _, team in project.teams do
+		table.insert(keys, team.key)
+	end
+	return table.concat(keys, " · ")
+end
+
+local function projectCardFoot(project: Project, now: number): Node
+	local lead = project.lead
+	local target = project.targetDate
+	local children = compact({
+		ui.node("text", {
+			key = "progress",
+			role = "linear.project-progress",
+			spans = { ui.span(model.progressLabel(project.progress), "muted") },
+		}),
+		if target ~= nil
+			then ui.node("row", { key = "target", role = "linear.project-target", gap = "xs", align = "center" }, {
+				ui.node("icon", { key = "icon", name = "calendar", tone = "muted" }),
+				ui.node("text", {
+					key = "date",
+					title = "Target date",
+					spans = { ui.span(model.shortDate(target, now), "muted") },
+				}),
+			})
+			else nil,
+		ui.node("row", { key = "spacer", grow = 1 }),
+		if lead ~= nil
+			then ui.node("text", {
+				key = "lead",
+				role = "linear.project-lead",
+				title = lead.name,
+				spans = { ui.span(lead.displayName, "muted") },
+				max = { w = "14ch" },
+			})
+			else nil,
+	}, 4)
+	return ui.node("row", { key = "foot", gap = "sm", align = "start" }, children)
+end
+
+local function projectCard(project: Project, selectedId: string?, now: number): Node
+	local head = ui.node(
+		"row",
+		{ key = "head", gap = "xs" },
+		compact({
+			ui.node("text", {
+				key = "teams",
+				role = "linear.project-teams",
+				spans = { ui.span(teamKeys(project), "mono muted") },
+			}),
+			ui.node("row", { key = "spacer", grow = 1 }),
+			healthBadge(project.health),
+		}, 3)
+	)
+	return ui.node("col", {
+		key = project.id,
+		role = "linear.project-card",
+		gap = "xs",
+		mark = if project.id == selectedId then "selected" else nil,
+		actions = { click = `open-project={project.id}` },
+	}, {
+		head,
+		ui.node("text", {
+			key = "title",
+			role = "linear.card-title",
+			max = { h = "2lines" },
+			spans = { project.name },
+		}),
+		projectCardFoot(project, now),
+	})
+end
+
+local function projectColumn(column: ProjectColumn, selectedId: string?, lines: number, now: number): Node
+	local cards: { Node } = {}
+	for _, project in column.projects do
+		table.insert(cards, projectCard(project, selectedId, now))
+	end
+	return parts.columnNode({
+		id = column.id,
+		title = column.title,
+		kind = column.statusType,
+		tone = PROJECT_STATUS_TONES[column.statusType] or "muted",
+		cards = cards,
+		none = "No projects",
+	}, lines)
+end
+
+local function projectBoard(state: BlockState, cx: BlockCx, visible: { Project }, now: number): Node
+	local columns = model.projectColumns(visible, state.prefs, state.projects.statuses)
+	local lines = parts.columnLines(cx, chromeRows(state, cx))
 	local children: { Node } = {}
 	for _, column in columns do
-		table.insert(children, boardColumn(column, state.selectedId, lines))
+		table.insert(children, projectColumn(column, state.projects.selectedId, lines, now))
 	end
-	return ui.node("row", { key = "content", role = "linear.board", gap = "md", align = "start" }, children)
+	return parts.boardRow(children)
 end
 
 -- ─── Table ──────────────────────────────────────────────────────────────────
 
-local TABLE_COLUMNS: { Col } = {
-	{ id = "id", head = "ID", mono = true, priority = 8 },
-	{ id = "title", head = "Title", grow = 1, priority = 9 },
-	{ id = "state", head = "State", priority = 6 },
-	{ id = "priority", head = "Priority", priority = 5 },
-	{ id = "assignee", head = "Assignee", priority = 3 },
+local PROJECT_TABLE_COLUMNS: { Col } = {
+	{ id = "name", head = "Name", grow = 1, priority = 9 },
+	{ id = "status", head = "Status", priority = 7 },
+	{ id = "health", head = "Health", priority = 6 },
+	{ id = "lead", head = "Lead", priority = 4 },
+	{ id = "target", head = "Target", priority = 3 },
+	{ id = "progress", head = "Progress", align = "end", priority = 5 },
 	{ id = "updated", head = "Updated", align = "end", priority = 2 },
 }
 
-local function priorityCell(issue: Issue): Cell
-	local tone = PRIORITY_TONES[issue.priority]
-	if tone == nil then
-		return ""
-	end
-	return { badge = { text = model.priorityLabel(issue.priority), tone = tone } }
-end
-
-local function tableRow(issue: Issue, now: number): TableRow
-	local assignee = issue.assignee
+local function projectTableRow(project: Project, now: number): TableRow
+	local lead = project.lead
+	local health = project.health
+	local healthTone = if health ~= nil then HEALTH_TONES[health] else nil
+	local target = project.targetDate
 	return {
-		id = issue.id,
+		id = project.id,
 		cells = {
-			issue.identifier,
-			issue.title,
-			{ text = issue.state.name, dot = STATE_TONES[issue.state.type] or "muted" },
-			priorityCell(issue),
-			if assignee ~= nil then assignee.displayName else "",
-			model.relativeTime(issue.updatedAt, now),
+			project.name,
+			{ text = project.status.name, dot = PROJECT_STATUS_TONES[project.status.type] or "muted" },
+			if health ~= nil and healthTone ~= nil
+				then { badge = { text = model.healthLabel(health), tone = healthTone } }
+				else "",
+			if lead ~= nil then lead.displayName else "",
+			if target ~= nil then model.shortDate(target, now) else "",
+			model.progressLabel(project.progress),
+			model.relativeTime(project.updatedAt, now),
 		},
 	}
 end
 
-local function sortBar(state: BlockState): Node
-	local children: { Node } = { ui.node("text", { key = "label", spans = { ui.span("Sort", "muted") } }) }
-	for _, entry in SORT_COLUMNS do
-		local active = state.prefs.sort == entry.key
-		local arrow = if not active then "" elseif state.prefs.sortAsc then " ↑" else " ↓"
-		table.insert(
-			children,
-			ui.button(entry.label .. arrow, {
-				key = `sort-{entry.key}`,
-				role = `linear.sort-{entry.key}`,
-				variant = "quiet",
-				size = "sm",
-				on = active,
-				actions = { click = `sort={entry.key}` },
-			})
-		)
-	end
-	return ui.node("row", { key = "sort", role = "linear.sort", gap = "xs", wrap = true }, children)
-end
-
-local function issueTable(state: BlockState, visible: { Issue }, now: number): Node
-	local sorted = model.sortTable(visible, state.prefs.sort, state.prefs.sortAsc)
+local function projectTable(state: BlockState, visible: { Project }, now: number): Node
+	local prefs = state.prefs
 	local rows: { TableRow } = {}
-	for _, issue in sorted do
-		table.insert(rows, tableRow(issue, now))
+	for _, project in model.sortProjects(visible, prefs.projectSort, prefs.projectSortAsc) do
+		table.insert(rows, projectTableRow(project, now))
 	end
-	local node = ui.table(TABLE_COLUMNS, rows, { selectable = true, selected = state.selectedId })
+	local node = ui.table(PROJECT_TABLE_COLUMNS, rows, { selectable = true, selected = state.projects.selectedId })
 	return with(node, { key = "table", role = "linear.table" })
 end
 
 -- ─── Content ────────────────────────────────────────────────────────────────
 
-local function emptyState(state: BlockState): { Node }
-	local filtered = filtersActive(state)
-	local prefs = state.prefs
-	local nodes: { Node } = {
-		ui.node("empty", {
-			key = "content",
-			role = "linear.empty",
-			variant = "center",
-			icon = if filtered then "funnel-x" else "inbox",
-			title = if filtered then "No matching issues" else "No issues in this view",
-		}),
-	}
+local function projectEmptyState(state: BlockState): { Node }
+	local filtered = projectFiltersActive(state)
 	local buttons: { Node } = {}
 	if filtered then
-		table.insert(
-			buttons,
-			ui.button("Clear filters", {
-				key = "empty-clear-filters",
-				role = "linear.empty-clear-filters",
-				icon = "funnel-x",
-				actions = { click = "clear-filters" },
-			})
-		)
-	elseif prefs.scope == "mine" and prefs.view == "active" then
-		table.insert(
-			nodes,
-			ui.node("text", {
-				key = "empty-hint",
-				role = "linear.empty-hint",
-				spans = { ui.span("Nothing assigned to you is active.", "muted") },
-			})
-		)
-		table.insert(
-			buttons,
-			ui.button("All", { key = "empty-all", role = "linear.empty-all", actions = { click = "view=all" } })
-		)
-		if #state.teams > 0 then
-			table.insert(
-				buttons,
-				ui.button("Choose team", {
-					key = "empty-team",
-					role = "linear.empty-team",
-					actions = { click = "focus-team" },
-				})
-			)
-		end
+		table.insert(buttons, parts.clearFiltersEmptyButton())
+	elseif state.prefs.projectView ~= "all" then
+		table.insert(buttons, parts.emptyAllButton())
 	end
-	if #buttons > 0 then
-		table.insert(
-			nodes,
-			ui.node("row", { key = "empty-actions", role = "linear.empty-actions", gap = "sm" }, buttons)
-		)
-	end
-	return nodes
+	return parts.withEmptyActions({ parts.emptyNode(filtered, "projects") }, buttons)
 end
 
-local function content(state: BlockState, cx: BlockCx, visible: { Issue }, team: Team?, now: number): { Node }
+local function projectContent(state: BlockState, cx: BlockCx, visible: { Project }, now: number): { Node }
 	if state.reloading then
-		return { reloadingNode() }
+		return { reloadingNode(state) }
 	end
 	if #visible == 0 then
-		return emptyState(state)
+		return projectEmptyState(state)
 	end
-	if state.prefs.layout == "table" then
-		return { sortBar(state), issueTable(state, visible, now) }
+	local prefs = state.prefs
+	if prefs.layout == "table" then
+		return {
+			parts.sortBar(PROJECT_SORT_COLUMNS, prefs.projectSort, prefs.projectSortAsc),
+			projectTable(state, visible, now),
+		}
 	end
-	return { board(state, cx, visible, team) }
+	return { projectBoard(state, cx, visible, now) }
 end
 
 local function readyChildren(state: BlockState, cx: BlockCx): { Node }
 	local now = os.time()
-	local team = selectedTeam(state)
-	local viewerId = if state.viewer ~= nil then state.viewer.user.id else nil
-	local visible = model.visible(state.issues, state.prefs, state.query.text, viewerId)
+	local viewerId = viewerIdOf(state)
+	local filters: Node
+	local body: { Node }
+	if inProjects(state) then
+		local visible = model.visibleProjects(state.projects.items, state.prefs, state.projects.query.text, viewerId)
+		filters = projectFilterRow(state, #visible)
+		body = projectContent(state, cx, visible, now)
+	else
+		local list = issuesModeList(state, cx, selectedTeam(state))
+		local visible = issueList.visible(state, list)
+		filters = issueList.filterRow(state, list, #visible)
+		body = issueList.content(state, cx, list, visible, now)
+	end
 	local failure = state.error
 	local notice = state.notice
 	local children = compact({
 		topBar(state, now),
-		filterRow(state, team, #visible),
+		filters,
 		if failure ~= nil then banner("error", "linear.error", "error", "x-circle", failure) else nil,
 		if notice ~= nil then banner("notice", "linear.notice", "success", "check", notice) else nil,
 	}, 4)
-	for _, node in content(state, cx, visible, team, now) do
+	for _, node in body do
 		table.insert(children, node)
 	end
 	return children
@@ -731,16 +633,26 @@ end
 
 function view.render(state: BlockState, cx: BlockCx): BlockView
 	local children: { Node }
+	local page = if inProjects(state) then state.projectPage else nil
 	if state.phase == "setup" then
 		children = { setupCard(state) }
 	elseif state.phase == "loading" then
 		children = { loadingNode() }
+	elseif page ~= nil then
+		-- The project page replaces the list (top bar and filter row included).
+		children = projectPage.render(state, page, cx)
 	else
 		children = readyChildren(state, cx)
 	end
 	return {
 		main = ui.node("col", { role = "linear.app", gap = "md" }, children),
-		layer = detail.layer(state, cx),
+		-- The issue drawer and create dialog belong to issues mode; in projects mode the drawer opens only over the
+		-- project page's Issues tab.
+		layer = if state.phase == "ready"
+				and inProjects(state)
+				and model.issuesTab(state) == nil
+			then nil
+			else detail.layer(state, cx),
 	}
 end
 
@@ -750,7 +662,7 @@ function view.fieldId(name: string): string
 	elseif name == "setup" then
 		return SETUP_FIELD_ID
 	end
-	return detail.fieldId(name) or ""
+	return projectPage.fieldId(name) or detail.fieldId(name) or ""
 end
 
 function view.fieldName(id: string): string?
@@ -759,7 +671,7 @@ function view.fieldName(id: string): string?
 	elseif id == SETUP_FIELD_ID then
 		return "setup"
 	end
-	return detail.fieldName(id)
+	return projectPage.fieldName(id) or detail.fieldName(id)
 end
 
 return view

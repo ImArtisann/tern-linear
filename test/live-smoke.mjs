@@ -1,6 +1,10 @@
 // Smoke test against the real Linear API (no mock).
-//   bun test/live-smoke.mjs            read-only: board, table, detail drawer
+//   bun test/live-smoke.mjs            read-only: projects board, table, a project page with its Activity and Issues tabs,
+//                                      then the issue board, table, detail drawer
 //   bun test/live-smoke.mjs --write    also creates, comments on and completes one issue
+//
+// It also sends the read-only project queries once directly and prints Linear's `x-complexity` for each
+// (Linear rejects a query above 10000).
 //
 // The key comes from LINEAR_API_KEY, else ~/.config/tern-linear-dev/api-key. It is never printed or written to the report.
 // Screenshots and the report go to e2e-artifacts/live/.
@@ -8,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createRunner, repoRoot, startTern, waitFor } from "./harness.mjs";
+import { extractQueries } from "./validate-queries.mjs";
 
 const write = process.argv.includes("--write");
 const artifacts = join(repoRoot, "e2e-artifacts/live");
@@ -23,11 +28,106 @@ function readKey() {
 	process.exit(2);
 }
 
+const LINEAR_ENDPOINT = "https://api.linear.app/graphql";
+const MAX_COMPLEXITY = 10_000;
+
+/**
+ * Sends each read-only project operation of lib/queries.luau once, with the variables the plugin uses, and returns
+ * `{ operation, request, complexity, nodes }` per request. `Project` (the project page) asks for the first project of
+ * the unfiltered list; so do the Issues tab's `Issues` and `IssuesChanged`, unfiltered and filtered to that project's
+ * first milestone (when it has one). Throws on a GraphQL error or a cost above the cap.
+ */
+async function measureComplexity(key) {
+	const docs = Object.fromEntries(
+		extractQueries(readFileSync(join(repoRoot, "lib/queries.luau"), "utf8")).map((q) => [q.key, q.text]),
+	);
+	const active = { and: [{ status: { type: { in: ["planned", "started", "paused"] } } }] };
+	const requests = [
+		["ProjectStatuses", {}, "organization statuses"],
+		["Projects", { first: 50, filter: active }, "first 50, Active view"],
+		["Projects", { first: 50 }, "first 50, All projects / All view (no filter)"],
+		["ProjectsChanged", { filter: active }, "change check, Active view"],
+	];
+	const results = [];
+	const send = async (operation, variables, request) => {
+		const response = await fetch(LINEAR_ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: key.startsWith("lin_oauth_") ? `Bearer ${key}` : key },
+			body: JSON.stringify({ query: docs[operation], operationName: operation, variables }),
+		});
+		const body = await response.json();
+		if (body.errors?.length) throw new Error(`${operation}: ${body.errors[0].message}`);
+		const complexity = Number(response.headers.get("x-complexity"));
+		if (!(complexity <= MAX_COMPLEXITY)) throw new Error(`${operation}: complexity ${complexity} over ${MAX_COMPLEXITY}`);
+		const nodes =
+			body.data.projects?.nodes?.length ??
+			body.data.issues?.nodes?.length ??
+			body.data.organization?.projectStatuses?.length ??
+			body.data.project?.projectUpdates?.nodes?.length ??
+			body.data.project?.history?.nodes?.length ??
+			body.data.project?.projectMilestones?.nodes?.length;
+		results.push({ operation, request, complexity, nodes });
+		return body.data;
+	};
+	let firstProject;
+	for (const [operation, variables, request] of requests) {
+		const data = await send(operation, variables, request);
+		if (operation === "Projects" && !variables.filter) firstProject = data.projects.nodes[0]?.id;
+	}
+	if (firstProject) {
+		const detail = await send("Project", { id: firstProject }, "project page detail (nodes: milestones)");
+		// The Issues tab: model.projectIssueFilter (the project AND the Active view), first page of 50 as linear.issues
+		// sends it, and the poll's change check.
+		const tabFilter = {
+			and: [{ project: { id: { eq: firstProject } } }, { state: { type: { in: ["triage", "unstarted", "started"] } } }],
+		};
+		await send("Issues", { filter: tabFilter, first: 50 }, "Issues tab, first 50, Active view");
+		const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+		await send("IssuesChanged", { filter: { and: [tabFilter, { updatedAt: { gt: since } }] } }, "Issues tab change check");
+		// The milestone filter (model.projectIssueFilter with a milestone): the project, the milestone, then the view.
+		const milestone = detail.project?.projectMilestones?.nodes?.[0]?.id;
+		if (milestone) {
+			// The page's detail with the tab's milestone filter: the milestone looked up by id beside the capped list.
+			const filtered = await send(
+				"Project",
+				{ id: firstProject, milestoneId: milestone, withMilestone: true },
+				"project page detail with the milestone filter (nodes: milestones)",
+			);
+			const found = filtered.project?.filterMilestone?.nodes ?? [];
+			if (found.length !== 1 || found[0].id !== milestone) throw new Error(`filterMilestone did not find ${milestone}`);
+			// A deleted milestone: no node and no error, so the plugin drops the filter.
+			const gone = await send(
+				"Project",
+				{ id: firstProject, milestoneId: "00000000-0000-4000-8000-000000000000", withMilestone: true },
+				"project page detail with an unknown milestone filter (nodes: milestones)",
+			);
+			if ((gone.project?.filterMilestone?.nodes ?? []).length !== 0) throw new Error("filterMilestone found an unknown id");
+			const milestoneFilter = { and: [tabFilter.and[0], { projectMilestone: { id: { eq: milestone } } }, tabFilter.and[1]] };
+			await send("Issues", { filter: milestoneFilter, first: 50 }, "Issues tab filtered to a milestone, first 50, Active view");
+			await send(
+				"IssuesChanged",
+				{ filter: { and: [milestoneFilter, { updatedAt: { gt: since } }] } },
+				"Issues tab change check, milestone filter",
+			);
+		} else {
+			results.noMilestone = true;
+		}
+		// The Activity tab's first pages, with the plugin's page sizes (the documents' defaults).
+		await send("ProjectUpdates", { id: firstProject }, "Activity tab, first 20 updates with 10 comments each");
+		const history = await send("ProjectHistory", { id: firstProject }, "Activity tab, first 25 history records");
+		// Only the event kinds, never their content.
+		const kinds = new Set(history.project.history.nodes.flatMap((record) => (Array.isArray(record.entries) ? record.entries : []).map((entry) => entry?.type)));
+		results.historyKinds = [...kinds].filter((kind) => typeof kind === "string").sort();
+	}
+	return results;
+}
+
 rmSync(artifacts, { recursive: true, force: true });
 mkdirSync(artifacts, { recursive: true });
 
+const apiKey = readKey();
 // Never point the plugin at the mock: LINEAR_API_URL is stripped from the child environment by the harness.
-const t = await startTern({ env: { LINEAR_API_KEY: readKey() }, out: ternOut, size: "1440 900" });
+const t = await startTern({ env: { LINEAR_API_KEY: apiKey }, out: ternOut, size: "1440 900" });
 const runner = createRunner(t, { dir: artifacts, title: write ? "tern-linear live smoke (write)" : "tern-linear live smoke" });
 
 const role = (name) => `[data-role='linear.${name}']`;
@@ -81,7 +181,7 @@ let hasIssues = false;
 const report = runner.report;
 
 async function scenario() {
-	await runner.step("board-loads", async (label) => {
+	await runner.step("projects-load", async (label) => {
 		await t.openBlock();
 		// Loaded = the loading screen is gone and something else (board, empty state, setup or error) shows.
 		await waitFor(
@@ -94,6 +194,161 @@ async function scenario() {
 		);
 		if (await exists(role("setup"))) throw new Error("the plugin shows the setup screen; the API key was not picked up");
 		if (await exists(role("error"))) throw new Error(`error banner: ${(await t.text(role("error"))).slice(0, 300)}`);
+		if (!(await exists(`${role("mode-projects")}`))) throw new Error("no mode switch in the top bar");
+		const count = (await t.tree(role("project-card"))).nodes?.length ?? 0;
+		const columns = ((await t.tree(role("column-head"))).nodes ?? []).map((node) => (node.text ?? "").replace(/\d+$/, ""));
+		console.log(`note: projects board (All projects, Active): ${count} cards in ${columns.length} columns: ${columns.join(", ")}`);
+		report.projects = { cards: count, columns };
+		await runner.shot(label);
+	});
+
+	await runner.step("projects-table", async (label) => {
+		await t.key("3");
+		await waitFor(async () => (await t.wait(150), !(await exists(role("reloading")))), { what: "the All view", timeout: 45_000, interval: 0 });
+		if (!(await exists(role("project-card")))) {
+			console.log("note: the workspace has no projects; the projects table is skipped");
+			await t.key("1");
+			return;
+		}
+		await t.key("v");
+		await present(role("table"));
+		await runner.shot(label);
+		await t.key("v");
+		await present(role("board"));
+		await t.key("1");
+	});
+
+	// Read-only: opens the first project of the Active view (else of the All view) on its page, then goes back.
+	await runner.step("project-page", async (label) => {
+		await waitFor(async () => (await t.wait(150), !(await exists(role("reloading")))), { what: "the Active view", timeout: 45_000, interval: 0 });
+		let allView = false;
+		if (!(await exists(role("project-card")))) {
+			allView = true;
+			await t.key("3");
+			await waitFor(async () => (await t.wait(150), !(await exists(role("reloading")))), { what: "the All view", timeout: 45_000, interval: 0 });
+		}
+		if (!(await exists(role("project-card")))) {
+			console.log("note: the workspace has no projects; the project page is skipped");
+			await t.key("1");
+			return;
+		}
+		await t.key("j");
+		await t.key("Enter");
+		await present(role("project-header"));
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("project-error"))) throw new Error(`project page error: ${(await t.text(role("project-error"))).slice(0, 300)}`);
+				return (await exists(role("project-description"))) || (await exists(role("project-description-empty")));
+			},
+			{ what: "the project detail", timeout: 45_000, interval: 0 },
+		);
+		if (await exists(role("error"))) throw new Error(`error banner: ${(await t.text(role("error"))).slice(0, 300)}`);
+		const milestones = ((await t.tree(role("milestone"))).nodes ?? []).length;
+		const described = await exists(role("project-description"));
+		console.log(`note: project page: ${described ? "with" : "without"} a description, ${milestones} milestones`);
+		report.projectPage = { described, milestones };
+		await runner.shot(label);
+
+		// Read-only: the Activity tab of the same project.
+		await t.click(role("project-tab-activity"));
+		await present(role("activity"));
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("activity-error"))) throw new Error(`activity error: ${(await t.text(role("activity-error"))).slice(0, 300)}`);
+				return (await exists(role("activity-update"))) || (await exists(role("activity-event"))) || (await exists(role("activity-empty"))) || (await exists(role("activity-more")));
+			},
+			{ what: "the project activity", timeout: 45_000, interval: 0 },
+		);
+		const updates = ((await t.tree(role("activity-update"))).nodes ?? []).length;
+		const events = ((await t.tree(role("activity-event"))).nodes ?? []).length;
+		const more = await exists(role("activity-more"));
+		console.log(`note: activity tab: ${updates} updates, ${events} history events${more ? ", Load more offered" : ""}`);
+		report.projectActivity = { updates, events, more };
+		await runner.shot("project-activity");
+
+		// Read-only: the Issues tab of the same project, and the issue drawer over the page for its first card.
+		await t.click(role("project-tab-issues"));
+		await present(role("project-issues"));
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("project-issues-error"))) {
+					throw new Error(`issues tab error: ${(await t.text(role("project-issues-error"))).slice(0, 300)}`);
+				}
+				if (await exists(role("reloading"))) return false;
+				return (await exists(`${role("project-issues")} ${role("board")}`)) || (await exists(`${role("project-issues")} ${role("empty")}`));
+			},
+			{ what: "the project's issues", timeout: 45_000, interval: 0 },
+		);
+		const issueCards = ((await t.tree(role("card"))).nodes ?? []).length;
+		const issueColumns = ((await t.tree(role("column-head"))).nodes ?? []).map((node) => (node.text ?? "").replace(/\d+$/, ""));
+		const count = (await t.text(`${role("project-issues")} ${role("count")}`)).split("\n")[0];
+		console.log(`note: issues tab (Active): ${issueCards} cards in columns ${issueColumns.join(", ")}; count "${count}"`);
+		report.projectIssues = { cards: issueCards, columns: issueColumns, count };
+		await runner.shot("project-issues");
+		if (issueCards > 0) {
+			await t.click(role("card"));
+			await present(role("drawer"));
+			await t.waitFor(role("drawer"), "Comments", { timeout: 30_000 });
+			if (!(await exists(role("project-header")))) throw new Error("the drawer did not open over the project page");
+			await runner.shot("project-issues-drawer");
+			await t.key("Escape");
+			await absent(role("drawer"));
+			// The next Escape clears the selection; the one after that goes back.
+			await t.key("Escape");
+			await present(role("project-issues"));
+		}
+		// Read-only: a milestone row of the Overview shows the Issues tab filtered to it.
+		if (milestones > 0) {
+			await t.click(role("project-tab-overview"));
+			await present(role("milestone"));
+			await t.click(role("milestone"));
+			await present(`${role("milestone-filter")}[data-mark='active']`, 45_000);
+			await waitFor(
+				async () => {
+					await t.wait(150);
+					if (await exists(role("project-issues-error"))) {
+						throw new Error(`filtered issues tab error: ${(await t.text(role("project-issues-error"))).slice(0, 300)}`);
+					}
+					if (await exists(role("reloading"))) return false;
+					return (await exists(`${role("project-issues")} ${role("board")}`)) || (await exists(`${role("project-issues")} ${role("empty")}`));
+				},
+				{ what: "the milestone's issues", timeout: 45_000, interval: 0 },
+			);
+			const milestoneCards = ((await t.tree(role("card"))).nodes ?? []).length;
+			console.log(`note: issues tab filtered to the first milestone: ${milestoneCards} cards`);
+			report.projectIssues.milestoneCards = milestoneCards;
+			await runner.shot("project-issues-milestone");
+		}
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await present(role("board"));
+		if (allView) await t.key("1");
+	});
+
+	await runner.step("project-query-complexity", async () => {
+		report.complexity = await measureComplexity(apiKey);
+		for (const { operation, request, complexity, nodes } of report.complexity) {
+			console.log(`complexity: ${operation} (${request}): ${complexity} of ${MAX_COMPLEXITY}, ${nodes} nodes`);
+		}
+		report.historyKinds = report.complexity.historyKinds ?? [];
+		console.log(`note: history event kinds in the first project's first page: ${report.historyKinds.join(", ") || "none"}`);
+	});
+
+	await runner.step("issues-mode", async (label) => {
+		await t.key("i");
+		await waitFor(
+			async () => {
+				await t.wait(150);
+				if (await exists(role("reloading"))) return false;
+				return (await exists(role("board"))) || (await exists(role("empty"))) || (await exists(role("error")));
+			},
+			{ what: "the issue board to load", timeout: 45_000, interval: 0 },
+		);
+		if (await exists(role("error"))) throw new Error(`error banner: ${(await t.text(role("error"))).slice(0, 300)}`);
+		await t.waitFor(role("search"), "Search issues");
 		await runner.shot(label);
 	});
 
