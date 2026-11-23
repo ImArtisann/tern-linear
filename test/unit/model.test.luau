@@ -645,6 +645,66 @@ check(
 local doingColumn = model.projectColumns({ apollo, borealis }, activeView, ORG_STATUSES)[2]
 check("cards in a column order by priority", names(doingColumn.projects) == "Borealis Apollo")
 
+-- status steps (`[` / `]`) and the page's status select
+
+local function statusId(status: types.ProjectStatus?): string
+	return if status ~= nil then status.id else "nil"
+end
+local function statusNames(statuses: { types.ProjectStatus }): string
+	local out: { string } = {}
+	for _, status in statuses do
+		table.insert(out, status.name)
+	end
+	return table.concat(out, ",")
+end
+
+check(
+	"status choices: every status in board order",
+	statusNames(model.projectStatusChoices(ORG_STATUSES, P_DOING))
+		== "Backlog,Planned,In Progress,QA,Paused,Completed,Canceled"
+)
+local retired = pstatus("ps-retired", "Retired", "started", 0.5)
+check(
+	"status choices: a status missing from the list joins it in board order",
+	statusNames(model.projectStatusChoices(ORG_STATUSES, retired))
+		== "Backlog,Planned,In Progress,Retired,QA,Paused,Completed,Canceled"
+)
+check(
+	"the page steps through every status: next of Paused is Completed",
+	statusId(model.adjacentProjectStatus(ORG_STATUSES, P_PAUSED, 1, nil)) == "ps-done"
+)
+check(
+	"a step follows position within a type: next of In Progress is QA",
+	statusId(model.adjacentProjectStatus(ORG_STATUSES, P_DOING, 1, nil)) == "ps-qa"
+)
+check("previous of QA is In Progress", statusId(model.adjacentProjectStatus(ORG_STATUSES, P_QA, -1, nil)) == "ps-doing")
+check(
+	"no status before the first or after the last",
+	model.adjacentProjectStatus(ORG_STATUSES, P_BACKLOG, -1, nil) == nil
+		and model.adjacentProjectStatus(ORG_STATUSES, P_CANCELED, 1, nil) == nil
+)
+check(
+	"the Active board's steps stay within its columns",
+	model.adjacentProjectStatus(ORG_STATUSES, P_PAUSED, 1, "active") == nil
+		and model.adjacentProjectStatus(ORG_STATUSES, P_PLANNED, -1, "active") == nil
+		and statusId(model.adjacentProjectStatus(ORG_STATUSES, P_PLANNED, 1, "active")) == "ps-doing"
+)
+check(
+	"the All board steps through every column",
+	statusId(model.adjacentProjectStatus(ORG_STATUSES, P_PAUSED, 1, "all")) == "ps-done"
+)
+check(
+	"a status outside the view's columns steps through every status",
+	statusId(model.adjacentProjectStatus(ORG_STATUSES, P_DONE, -1, "active")) == "ps-paused"
+		and statusId(model.adjacentProjectStatus(ORG_STATUSES, P_BACKLOG, 1, "active")) == "ps-planned"
+)
+check(
+	"a status missing from the list steps from its place in board order",
+	statusId(model.adjacentProjectStatus(ORG_STATUSES, retired, 1, nil)) == "ps-qa"
+		and statusId(model.adjacentProjectStatus(ORG_STATUSES, retired, -1, "active")) == "ps-doing"
+)
+check("with no statuses loaded there is nowhere to step", model.adjacentProjectStatus({}, P_DOING, 1, nil) == nil)
+
 -- table sorting
 
 local prows = { apollo, borealis, cosmos, delta, eon }

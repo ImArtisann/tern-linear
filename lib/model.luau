@@ -972,6 +972,63 @@ function model.projectColumns(visible: { Project }, prefs: Prefs, statuses: { Pr
 	return columns
 end
 
+-- The statuses of `statuses` whose type is in `statusTypes` (nil: every type), in board order (type rank, then
+-- position), with `current` among them when its type is: a list that lacks it (an archived or stale status) still
+-- places it.
+local function statusChoices(
+	statuses: { ProjectStatus },
+	current: ProjectStatus,
+	statusTypes: { string }?
+): { ProjectStatus }
+	local out: { ProjectStatus } = {}
+	local listed = false
+	for _, status in statuses do
+		if statusTypes == nil or inList(statusTypes, status.type) then
+			table.insert(out, status)
+			listed = listed or status.id == current.id
+		end
+	end
+	if not listed and (statusTypes == nil or inList(statusTypes, current.type)) then
+		table.insert(out, current)
+	end
+	table.sort(out, statusOrder)
+	return out
+end
+
+-- The project page's status select: every organization status in board order, the project's own included.
+function model.projectStatusChoices(statuses: { ProjectStatus }, current: ProjectStatus): { ProjectStatus }
+	return statusChoices(statuses, current, nil)
+end
+
+-- `[` / `]` on projects: the status before (delta < 0) or after (delta > 0) `current` in board order, or nil at the
+-- edge. `view` (the list's Prefs.projectView) limits the steps to the statuses the board shows as columns; nil (the
+-- project page) steps through every status, and so does a project whose status is outside the view's types.
+function model.adjacentProjectStatus(
+	statuses: { ProjectStatus },
+	current: ProjectStatus,
+	delta: number,
+	view: string?
+): ProjectStatus?
+	local function indexIn(list: { ProjectStatus }): number?
+		for index, status in list do
+			if status.id == current.id then
+				return index
+			end
+		end
+		return nil
+	end
+	local candidates = statusChoices(statuses, current, if view ~= nil then model.projectViewTypes(view) else nil)
+	local index = indexIn(candidates)
+	if index == nil then
+		candidates = statusChoices(statuses, current, nil)
+		index = indexIn(candidates)
+	end
+	if index == nil then
+		return nil
+	end
+	return candidates[index + (if delta < 0 then -1 else 1)]
+end
+
 local function healthRank(health: string?): number
 	return if health ~= nil then HEALTH_RANK[health] or NO_HEALTH_RANK else NO_HEALTH_RANK
 end

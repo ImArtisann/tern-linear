@@ -1,4 +1,4 @@
-// A stateful fake of the Linear GraphQL API for the eighteen operations in lib/queries.luau.
+// A stateful fake of the Linear GraphQL API for the nineteen operations in lib/queries.luau.
 //
 // Requests are executed by graphql-js against Linear's real SDL (.cache/linear-schema.graphql), so variable coercion,
 // validation errors and the shape of every response follow the documents the plugin sends. Resolvers read and mutate an
@@ -765,6 +765,27 @@ function buildRoot(db, now) {
 			for (const issueId of [relation.issueId, relation.relatedIssueId]) db.issue(issueId).updatedAt = at;
 			return { success: true, entityId: id };
 		},
+
+		// Mutation.projectUpdate (the root shares the name with Query.projectUpdate, which the plugin never sends). Only
+		// `statusId` is applied: a move between status types sets or clears startedAt, completedAt and canceledAt.
+		projectUpdate: ({ id, input }) => {
+			const project = db.project(id);
+			if (!project || project.deleted) throw notFound("Project");
+			if (Object.hasOwn(input, "statusId")) {
+				const status = db.projectStatus(input.statusId);
+				if (!status || status.archivedAt !== null) throw notFound("ProjectStatus");
+				if (status.id !== project.statusId) {
+					project.statusId = status.id;
+					const at = db.tick();
+					const unstarted = status.type === "backlog" || status.type === "planned";
+					project.startedAt = unstarted ? null : (project.startedAt ?? at);
+					project.completedAt = status.type === "completed" ? (project.completedAt ?? at) : null;
+					project.canceledAt = status.type === "canceled" ? (project.canceledAt ?? at) : null;
+				}
+			}
+			project.updatedAt = db.tick();
+			return { success: true, project: db.projectView(project) };
+		},
 	};
 }
 
@@ -791,6 +812,7 @@ function snapshot(db) {
 			key: t.key,
 			states: t.states.map(({ id, name, type }) => ({ id, name, type })),
 		})),
+		projectStatuses: s.projectStatuses.map(({ id, name, type, archivedAt }) => ({ id, name, type, archived: archivedAt !== null })),
 		projects: s.projects.map((p) => ({
 			id: p.id,
 			name: p.name,
@@ -800,6 +822,9 @@ function snapshot(db) {
 			leadId: p.leadId,
 			url: db.projectView(p).url,
 			updatedAt: iso(p.updatedAt),
+			startedAt: iso(p.startedAt),
+			completedAt: iso(p.completedAt),
+			canceledAt: iso(p.canceledAt),
 			targetDate: p.targetDate,
 			archivedAt: iso(p.archivedAt),
 		})),

@@ -1,6 +1,6 @@
 --!strict
--- The project page in the `main` region: a header (Back, name, status, health, Open in Linear, refresh), the tab bar
--- and the open tab's content. It replaces the list while `BlockState.projectPage` is set.
+-- The project page in the `main` region: a header (Back, name, status select, health, Open in Linear, refresh), the tab
+-- bar and the open tab's content. It replaces the list while `BlockState.projectPage` is set.
 -- Pure: reads the block state, never mutates it. The tab bar lists model.PROJECT_TABS; TAB_CONTENT renders each tab.
 -- The Issues tab renders its list with view_issues, the issue list of issues mode.
 
@@ -9,6 +9,7 @@ local model = require("./model")
 local parts = require("./view_parts")
 local text = require("./text")
 local types = require("./types")
+local viewDetail = require("./view_detail")
 
 type BlockState = types.BlockState
 type Project = types.Project
@@ -91,7 +92,25 @@ local function tabLoading(page: ProjectPageState): boolean
 	return page.loading
 end
 
-local function header(page: ProjectPageState, project: Project?, now: number): Node
+-- The project's status as a select of the organization's statuses (board order); a pick sets it in Linear. The key
+-- carries the control epoch, so a pick that was not applied remounts to the project's status.
+local function statusSelect(state: BlockState, project: Project): Node
+	local options: { { value: string, label: string } } = {}
+	for _, status in model.projectStatusChoices(state.projects.statuses, project.status) do
+		table.insert(options, { value = status.id, label = status.name })
+	end
+	return ui.node("select", {
+		key = viewDetail.controlKey("project-status-select", state.controlEpoch),
+		role = "linear.project-status-select",
+		value = project.status.id,
+		options = options,
+		variant = "quiet",
+		disabled = if state.busy then true else nil,
+		aria = "Status",
+	})
+end
+
+local function header(state: BlockState, page: ProjectPageState, project: Project?, now: number): Node
 	local nameNode: Node
 	local statusNode: Node? = nil
 	local linkButtons: { Node } = {}
@@ -104,7 +123,7 @@ local function header(page: ProjectPageState, project: Project?, now: number): N
 		})
 		statusNode = ui.node("row", { key = "status", role = "linear.project-status", gap = "xs", align = "center" }, {
 			parts.statusDot(parts.PROJECT_STATUS_TONES[project.status.type] or "muted", project.status.type),
-			ui.node("text", { key = "label", spans = { ui.span(project.status.name, "muted") } }),
+			statusSelect(state, project),
 		})
 		linkButtons = {
 			ui.button("Open in Linear", {
@@ -795,7 +814,7 @@ function projectPage.render(state: BlockState, page: ProjectPageState, cx: Block
 	local notice = state.notice
 	local pageError = page.error
 	local children = compact({
-		header(page, project, now),
+		header(state, page, project, now),
 		tabBar(page),
 		if failure ~= nil then parts.banner("error", "linear.error", "error", "x-circle", failure) else nil,
 		if pageError ~= nil and pageError ~= failure

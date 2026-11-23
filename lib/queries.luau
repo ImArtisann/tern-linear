@@ -180,6 +180,21 @@ queries.ProjectsChanged = [[query ProjectsChanged($filter: ProjectFilter) {
   }
 }]]
 
+-- The project page's status select and `[` / `]` on projects: only `statusId` can change (the input is built here, not
+-- by the caller). The project comes back with the `Projects` list's selection, so it replaces the list item as is.
+queries.ProjectStatusUpdate = [[mutation ProjectStatusUpdate($id: String!, $statusId: String!) {
+  projectUpdate(id: $id, input: { statusId: $statusId }) {
+    success
+    project {
+      id name url slugId icon color description priority sortOrder progress health
+      startDate targetDate createdAt updatedAt startedAt completedAt canceledAt
+      status { id name type color position }
+      lead { id name displayName avatarUrl }
+      teams(first: 5) { nodes { id key name } }
+    }
+  }
+}]]
+
 -- The project page: the list fields (teams up to 10) plus the overview's document, date precisions, members, labels
 -- and milestones. `Query.project` also returns archived projects. IssueConnection has no count, so milestones carry no
 -- issue count: counting would need a nested `issues` page per milestone, multiplying the cost. `filterMilestone` (only

@@ -1263,6 +1263,23 @@ function linear.deleteRelation(cfg: types.Config, relationId: string, cb: types.
 	end, cb)
 end
 
+-- Sets a project's status (ProjectStatusUpdate); the result is the project as `linear.projects` normalizes it.
+function linear.setProjectStatus(
+	cfg: types.Config,
+	projectId: string,
+	statusId: string,
+	cb: types.Callback<types.Project>
+)
+	local variables: { [string]: any } = { id = projectId, statusId = statusId }
+	run(cfg, "ProjectStatusUpdate", queries.ProjectStatusUpdate, variables, function(data: Json): types.Project
+		local payload = successfulPayload(data, "projectUpdate")
+		if type(payload.project) ~= "table" then
+			error(failure("server", "Linear did not return the updated project."))
+		end
+		return normalizeProject(payload.project)
+	end, cb)
+end
+
 function linear.rate(): types.RateInfo
 	return lastRate
 end

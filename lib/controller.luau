@@ -2434,6 +2434,68 @@ local function moveColumn(state: BlockState, run: Run, delta: number): boolean
 	return true
 end
 
+-- ─── Project status ─────────────────────────────────────────────────────────
+-- The project page's status select and `[` / `]` on projects (one table: the controller's top level is close to Luau's
+-- 200-local limit).
+local projectStatus = {}
+
+-- Applies a mutation's project at once: the list item, and the open page's project, which keeps its own teams (the
+-- page loads up to 10, the mutation returns the list's 5).
+function projectStatus.apply(state: BlockState, project: Project)
+	local items = state.projects.items
+	for index, existing in items do
+		if existing.id == project.id then
+			items[index] = project
+			break
+		end
+	end
+	local page = state.projectPage
+	local detail = if page ~= nil then page.detail else nil
+	if detail ~= nil and detail.project.id == project.id then
+		local merged = table.clone(project)
+		merged.teams = detail.project.teams
+		detail.project = merged
+	end
+end
+
+-- Sets the project's status in Linear: a foreground mutation, refused while busy. Success applies the returned
+-- project, then reloads the list (a status outside the view drops the project from it) and the open page's detail in
+-- the background. Failures show in the page's banner while a page is open, else in `state.error`.
+function projectStatus.set(state: BlockState, project: Project, status: types.ProjectStatus)
+	if status.id == project.status.id then
+		return
+	end
+	runMutation(state, function(message: string)
+		local page = state.projectPage
+		if page ~= nil then
+			page.error = message
+		else
+			state.error = message
+		end
+	end, function(cfg: types.Config, done: types.Callback<Project>)
+		linear.setProjectStatus(cfg, project.id, status.id, done)
+	end, function(updated: Project, run: Run)
+		projectStatus.apply(state, updated)
+		setNotice(state, run, "Status set to " .. updated.status.name)
+		reloadProjects(state, run)
+		if state.projectPage ~= nil then
+			fetchProjectPage(state, run, false)
+		end
+	end)
+end
+
+-- `[` / `]`: the previous / next status in board order (model.adjacentProjectStatus). `view` is the list's (the steps
+-- follow its board's columns); nil on the project page (every status).
+function projectStatus.step(state: BlockState, run: Run, project: Project, delta: number, view: string?)
+	local target = model.adjacentProjectStatus(state.projects.statuses, project.status, delta, view)
+	if target == nil then
+		local edge = if delta < 0 then "first" else "last"
+		setNotice(state, run, if view ~= nil then `Already in the {edge} column` else `Already at the {edge} status`)
+		return
+	end
+	projectStatus.set(state, project, target)
+end
+
 -- ─── Projects navigation ────────────────────────────────────────────────────
 
 local function visibleProjects(state: BlockState): { Project }
@@ -3087,6 +3149,20 @@ local SELECTS: { [string]: SelectHandler } = {
 			projectIssues.showMilestone(state, run, if value == "" then nil else value)
 		end
 	end,
+	-- The project page's header: the page's project (the list item until its detail loads).
+	["project-status-select"] = function(state, _run, value)
+		local page = state.projectPage
+		local project = if page ~= nil then knownProject(state, page.projectId) else nil
+		if project == nil then
+			return
+		end
+		for _, status in state.projects.statuses do
+			if status.id == value then
+				projectStatus.set(state, project, status)
+				return
+			end
+		end
+	end,
 }
 
 -- Where each select applies (see Gate): the filter row's and the drawer's issue selects follow the issue list on
@@ -3103,6 +3179,7 @@ local SELECT_MODES: { [string]: Gate } = {
 	["filter-lead"] = "projects",
 	["filter-health"] = "projects",
 	["milestone-select"] = "projects",
+	["project-status-select"] = "projects",
 }
 
 -- ─── Keys ───────────────────────────────────────────────────────────────────
@@ -3335,7 +3412,8 @@ local function selectedProjectAction(use: (BlockState, Run, Project) -> ()): Key
 	end
 end
 
--- Projects mode: the issue keys without an issue to act on (n e c a x [ ]) are absent; `enter` opens the project page.
+-- Projects mode: the issue keys without an issue to act on (n e c a x) are absent; `enter` opens the project page and
+-- `[` / `]` move the selected project to the previous / next status of the board's columns.
 local PROJECT_KEYS: { [string]: KeyHandler } = {
 	["/"] = KEYS["/"],
 	["1"] = KEYS["1"],
@@ -3388,6 +3466,12 @@ local PROJECT_KEYS: { [string]: KeyHandler } = {
 		openLinearUrl(state, run, project.url)
 	end),
 	["y"] = selectedProjectAction(copyProject),
+	["["] = selectedProjectAction(function(state, run, project)
+		projectStatus.step(state, run, project, -1, state.prefs.projectView)
+	end),
+	["]"] = selectedProjectAction(function(state, run, project)
+		projectStatus.step(state, run, project, 1, state.prefs.projectView)
+	end),
 }
 
 -- The project page's Issues tab: issues mode's keys for the tab's list, selection and drawer. Absent: `n` (no
@@ -3424,7 +3508,7 @@ end
 
 -- The project page hides the list, so none of the list's keys apply. On the Issues tab its issue keys come first:
 -- `escape` closes the form, the link input, the drawer, then clears the selection, and only then goes back; `o` /
--- `y` act on the selected issue, and on the project when nothing is selected.
+-- `y` act on the selected issue, and on the project when nothing is selected; so do `[` / `]` (the project's status).
 local function handlePageKey(state: BlockState, run: Run, page: types.ProjectPageState, k: Key): boolean
 	local name = k.name
 	if page.tab == "issues" then
@@ -3464,6 +3548,13 @@ local function handlePageKey(state: BlockState, run: Run, page: types.ProjectPag
 		else
 			copyProject(state, run, project)
 		end
+		return true
+	elseif name == "[" or name == "]" then
+		local project = knownProject(state, page.projectId)
+		if project == nil then
+			return false
+		end
+		projectStatus.step(state, run, project, if name == "[" then -1 else 1, nil)
 		return true
 	end
 	return false
@@ -3579,6 +3670,7 @@ local REMOUNTING_SELECTS: { [string]: boolean } = {
 	["state-select"] = true,
 	["assignee-select"] = true,
 	["priority-select"] = true,
+	["project-status-select"] = true,
 }
 
 -- Select keys carry the control epoch (`state-select-e2`); dispatch is on the key without it.

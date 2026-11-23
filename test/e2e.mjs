@@ -187,6 +187,28 @@ async function pageOpen(name) {
 	});
 }
 
+/** Selects `name` on the projects board (from no selection, `j` by `j`) and opens its page. */
+async function openProject(name) {
+	await t.key("Escape");
+	await absent(SELECTED_CARD);
+	for (let i = 0; i < 12 && !(await t.text(SELECTED_CARD)).includes(name); i += 1) {
+		await t.key("j");
+		await t.wait(150);
+	}
+	await t.waitFor(SELECTED_CARD, name);
+	await t.key("Enter");
+	await pageOpen(name);
+}
+
+/** The status the project page's header select shows. */
+const headerStatus = async () => ((await nodesOf(role("project-status-select")))[0]?.text ?? "").trim();
+
+/** The id of the organization's (non-archived) project status named `name`. */
+const statusIdNamed = (name) => mock.state().projectStatuses.find((status) => status.name === name && !status.archived).id;
+
+/** The text of the board column titled `title` ("" when the board has none). */
+const columnText = async (title) => (await nodesOf(role("column"))).find((node) => (node.text ?? "").startsWith(title))?.text ?? "";
+
 // The Activity tab of Desktop app, newest first: [kind, text the row contains]. The fixture's unknown kind
 // (`externalSync`), its entry with a string `at` and its empty record never show.
 const DESKTOP_ACTIVITY = [
@@ -1212,6 +1234,214 @@ async function scenario() {
 		await runner.shot(label);
 		await t.key("1");
 		await see("Desktop app");
+	});
+
+	// The project page's status select: the organization's statuses in board order; a pick sets the status in Linear,
+	// shows at once in the header and the Overview, and reloads the list and the page.
+	await runner.step("project-status-select", async (label) => {
+		const desktop = projectNamed("Desktop app").id;
+		await openProject("Desktop app");
+		await waitFor(async () => (await t.wait(150), (await headerStatus()) === "In Progress"), { what: "the header's status select on In Progress", interval: 0 });
+		await runner.shot("project-status-select");
+		await t.click(role("project-status-select"));
+		await present(SELECT_MENU);
+		const options = (await nodesOf(`${SELECT_MENU} .sf-select-opt`)).map((node) => node.text).join(",");
+		assertEqual(options, "Backlog,Planned,In Progress,Paused,Completed,Canceled", "status options (board order, no archived status)");
+		await runner.shot("project-status-menu");
+		const before = mark();
+		await t.click(`${SELECT_MENU} .sf-select-opt:nth-child(4)`);
+		const update = await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0], { what: "a ProjectStatusUpdate" });
+		assertEqual(JSON.stringify(update.variables), JSON.stringify({ id: desktop, statusId: statusIdNamed("Paused") }), "mutation variables");
+		await t.waitFor(role("notice"), "Status set to Paused");
+		await waitFor(async () => (await t.wait(150), (await headerStatus()) === "Paused"), { what: "the header on Paused", interval: 0 });
+		await t.waitFor(`${role("project-props")} ${role("project-prop")}`, "Paused");
+		await waitFor(() => opsSince(before, "Projects").length > 0 && opsSince(before, "Project").length > 0, {
+			what: "the list and the page reloaded after the change",
+		});
+		await settle();
+		assertEqual(projectNamed("Desktop app").status, "Paused", "status stored by the mock");
+		assertEqual(await headerStatus(), "Paused", "header after the reloads");
+		await runner.shot(label);
+		await backToList("Desktop app");
+		if (!(await columnText("Paused")).includes("Desktop app")) throw new Error(`Desktop app is not in the Paused column: ${await columnText("Paused")}`);
+	});
+
+	// `[` / `]` on the list move the selected project through the board's columns; the edges say so and send nothing.
+	await runner.step("project-status-keys", async (label) => {
+		let before = mark();
+		await t.key("]");
+		await t.waitFor(role("notice"), "Already in the last column");
+		await t.wait(300);
+		assertEqual(opsSince(before, "ProjectStatusUpdate").length, 0, "mutations at the last column");
+		before = mark();
+		await t.key("[");
+		const back = await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0], { what: "a ProjectStatusUpdate from [" });
+		assertEqual(back.variables.statusId, statusIdNamed("In Progress"), "status after [");
+		await t.waitFor(role("notice"), "Status set to In Progress");
+		await waitFor(async () => (await t.wait(150), (await columnText("In Progress")).includes("Desktop app")), {
+			what: "Desktop app in the In Progress column",
+			interval: 0,
+		});
+		await settle();
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await runner.shot(label);
+		// The table: the same keys on the selected row.
+		await t.key("v");
+		await present(role("table"));
+		before = mark();
+		await t.key("]");
+		await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0]?.variables.statusId === statusIdNamed("Paused"), { what: "] in the table" });
+		await t.waitFor(role("notice"), "Status set to Paused");
+		await settle();
+		before = mark();
+		await t.key("[");
+		await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0]?.variables.statusId === statusIdNamed("In Progress"), { what: "[ in the table" });
+		await t.waitFor(role("notice"), "Status set to In Progress");
+		await settle();
+		await t.key("v");
+		await present(role("board"));
+		// The first column's edge: Search revamp is Planned.
+		await t.key("Escape");
+		await absent(SELECTED_CARD);
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Search revamp");
+		before = mark();
+		await t.key("[");
+		await t.waitFor(role("notice"), "Already in the first column");
+		await t.wait(300);
+		assertEqual(opsSince(before, "ProjectStatusUpdate").length, 0, "mutations at the first column");
+		assertEqual(projectNamed("Desktop app").status, "In Progress", "Desktop app back in progress");
+	});
+
+	// On the page `[` / `]` step through every status: Completed leaves the Active view. The page stays open; after
+	// Back the reloaded list no longer holds the project.
+	await runner.step("project-status-leaves-view", async (label) => {
+		await openProject("Desktop app");
+		const step = async (key, name) => {
+			const before = mark();
+			await t.key(key);
+			await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0]?.variables.statusId === statusIdNamed(name), { what: `${key} to ${name}` });
+			await t.waitFor(role("notice"), `Status set to ${name}`);
+			await settle();
+		};
+		await step("]", "Paused");
+		await step("]", "Completed");
+		await present(role("project-header"));
+		assertEqual(await headerStatus(), "Completed", "header after ] ]");
+		if (projectNamed("Desktop app").completedAt === null) throw new Error("the mock did not set completedAt");
+		await step("]", "Canceled");
+		const before = mark();
+		await t.key("]");
+		await t.waitFor(role("notice"), "Already at the last status");
+		await t.wait(300);
+		assertEqual(opsSince(before, "ProjectStatusUpdate").length, 0, "mutations at the last status");
+		await step("[", "Completed");
+		await t.waitFor(`${role("project-props")} ${role("project-prop")}`, "Completed");
+		await runner.shot(label);
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await present(role("board"));
+		await gone("Desktop app");
+		if (await exists(SELECTED_CARD)) throw new Error("a card is selected after the project left the view");
+		// The All view holds it in Completed; `[` twice puts it back in progress.
+		await t.key("3");
+		await see("Legacy importer");
+		await waitFor(async () => (await t.wait(150), (await columnText("Completed")).includes("Desktop app")), {
+			what: "Desktop app in the Completed column",
+			interval: 0,
+		});
+		await search("desktop");
+		await t.key("j");
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		await step("[", "Paused");
+		await step("[", "In Progress");
+		await clearSearch("desktop".length);
+		await t.key("1");
+		await see("Desktop app");
+		const restored = projectNamed("Desktop app");
+		assertEqual(restored.status, "In Progress", "Desktop app back in progress");
+		if (restored.completedAt !== null || restored.canceledAt !== null || restored.startedAt === null) {
+			throw new Error(`the mock's dates after moving back: ${JSON.stringify(restored)}`);
+		}
+	});
+
+	// A failed change shows its error (the page's banner on the page, the list's banner on the list) and the select
+	// shows the project's real status again.
+	await runner.step("project-status-failure", async (label) => {
+		await openProject("Desktop app");
+		mock.failNext("ProjectStatusUpdate");
+		let before = mark();
+		await pick("project-status-select", "Paused");
+		await waitFor(() => opsSince(before, "ProjectStatusUpdate").length > 0, { what: "the failing ProjectStatusUpdate" });
+		await t.waitFor(role("project-error"), "Service unavailable");
+		await waitFor(async () => (await t.wait(150), (await headerStatus()) === "In Progress"), {
+			what: "the select back on In Progress",
+			interval: 0,
+		});
+		assertEqual(projectNamed("Desktop app").status, "In Progress", "status after the failure");
+		await runner.shot(label);
+		await runner.shot("project-status-failure");
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		mock.failNext("ProjectStatusUpdate");
+		before = mark();
+		await t.key("]");
+		await waitFor(() => opsSince(before, "ProjectStatusUpdate").length > 0, { what: "the failing ProjectStatusUpdate from ]" });
+		await t.waitFor(role("error"), "Service unavailable");
+		if (!(await columnText("In Progress")).includes("Desktop app")) throw new Error("Desktop app moved although the change failed");
+		await t.key("r");
+		await absent(role("error"));
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+	});
+
+	// On the Issues tab `[` / `]` move the selected issue; with no issue selected they move the project.
+	await runner.step("project-status-issues-tab", async (label) => {
+		const issue = issueNamed("ENG-139");
+		await openProject("Desktop app");
+		await t.click(role("project-tab-issues"));
+		await present(`${role("project-issues")} ${role("board")}`);
+		await waitFor(async () => (await t.wait(150), (await cardIds()) === DESKTOP_ACTIVE), { what: "the tab's cards", interval: 0 });
+		await t.click(role("card"));
+		await present(role("drawer"));
+		await t.waitFor(role("drawer"), "Drag cards between board columns");
+		await settle();
+		let before = mark();
+		await t.key("]");
+		await waitFor(() => opsSince(before, "IssueUpdate").find((op) => op.variables.input?.stateId === teamState("ENG", "In Progress").id), {
+			what: "] to move ENG-139",
+		});
+		await settle();
+		before = mark();
+		await t.key("[");
+		await waitFor(() => opsSince(before, "IssueUpdate").find((op) => op.variables.input?.stateId === issue.stateId), { what: "[ to move ENG-139 back" });
+		await settle();
+		assertEqual(opsSince(before, "ProjectStatusUpdate").length, 0, "project changes while an issue is selected");
+		assertEqual(issueById(issue.id).stateId, issue.stateId, "ENG-139 back in Todo");
+		// The drawer, then the selection: with no issue selected the keys act on the project.
+		await t.key("Escape");
+		await absent(role("drawer"));
+		await t.key("Escape");
+		await absent(`${role("card")}[data-mark='selected']`);
+		await present(role("project-issues"));
+		before = mark();
+		await t.key("]");
+		await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0]?.variables.statusId === statusIdNamed("Paused"), { what: "] to move the project" });
+		await t.waitFor(role("notice"), "Status set to Paused");
+		await waitFor(async () => (await t.wait(150), (await headerStatus()) === "Paused"), { what: "the header on Paused", interval: 0 });
+		await present(role("project-issues"));
+		await settle();
+		await runner.shot(label);
+		assertEqual(opsSince(before, "IssueUpdate").length, 0, "issue changes with no issue selected");
+		before = mark();
+		await t.key("[");
+		await waitFor(() => opsSince(before, "ProjectStatusUpdate")[0]?.variables.statusId === statusIdNamed("In Progress"), { what: "[ to move the project back" });
+		await t.waitFor(role("notice"), "Status set to In Progress");
+		await settle();
+		await t.key("Escape");
+		await absent(role("project-header"));
+		await t.waitFor(SELECTED_CARD, "Desktop app");
+		assertEqual(projectNamed("Desktop app").status, "In Progress", "Desktop app back in progress");
 	});
 
 	// From here on the original issue scenario runs in issues mode.
